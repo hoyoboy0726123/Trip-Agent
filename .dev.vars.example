@@ -1,0 +1,5 @@
+# 本機測試用：複製成 .dev.vars 並填入（.dev.vars 不會進 git）
+SESSION_SECRET=至少16個字的隨機字串
+INVITE_CODE=邀請碼
+OWNER_PASSWORD=擁有者後台密碼
+GEMINI_API_KEY=

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>擁有者後台｜旅伴 AI</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <section class="screen">
+    <div class="screen-inner">
+      <div class="hero"><div class="hero-logo">🛠</div><h1>擁有者後台</h1><p class="muted">所有朋友建立的旅程</p></div>
+      <form id="login" class="card form">
+        <label class="field">擁有者密碼（OWNER_PASSWORD）<input id="pw" type="password" autocomplete="current-password" required /></label>
+        <button class="primary">查看旅程</button>
+        <p id="err" class="error" hidden></p>
+      </form>
+      <div id="list" class="stack"></div>
+    </div>
+  </section>
+  <script>
+    // 密碼只放在這個分頁的記憶體裡，不存進瀏覽器
+    let pw = "";
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const when = (ts) => (ts ? new Date(ts).toLocaleString("zh-TW", { hour12: false }) : "");
+    const STATUS = { initializing: "初始化中", review: "等待確認", active: "使用中" };
+
+    async function load() {
+      const err = document.querySelector("#err");
+      err.hidden = true;
+      const res = await fetch("/api/owner/rooms", { headers: { "x-owner-password": pw } });
+      const d = await res.json().catch(() => ({}));
+      if (!d.ok) {
+        err.textContent = d.error || "讀取失敗";
+        err.hidden = false;
+        return;
+      }
+      const list = document.querySelector("#list");
+      list.innerHTML = d.rooms.length
+        ? `<div class="small muted center" style="color:#fff">共 ${d.rooms.length} 個旅程</div>` +
+          d.rooms.map((r) => `<div class="card">
+            <div class="row between"><b>${esc(r.flag)} ${esc(r.title)}</b><span class="tag">${esc(STATUS[r.status] || r.status)}</span></div>
+            <div class="small muted">${esc(r.country)}${r.city ? "・" + esc(r.city) : ""}｜${esc(r.startDate)} – ${esc(r.endDate)}｜建立者 ${esc(r.creator)}</div>
+            <div class="small muted">建立 ${when(r.created)}｜最後使用 ${when(r.lastActive)}</div>
+            <div class="row" style="gap:6px;margin-top:8px">
+              <a class="btn small" href="/t/${esc(r.id)}" target="_blank" rel="noopener">打開</a>
+              <button class="btn small danger" data-del="${esc(r.id)}" data-title="${esc(r.title)}">刪除</button>
+            </div></div>`).join("")
+        : `<div class="card small muted">還沒有任何旅程</div>`;
+      list.querySelectorAll("[data-del]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          if (prompt(`刪除「${b.dataset.title}」的所有資料（聊天、照片、金鑰），無法復原。\n確定的話請輸入「刪除」`) !== "刪除") return;
+          const r = await fetch("/api/owner/delete", { method: "POST", headers: { "content-type": "application/json", "x-owner-password": pw }, body: JSON.stringify({ room: b.dataset.del }) });
+          const j = await r.json().catch(() => ({}));
+          if (!j.ok) return alert(j.error || "刪除失敗");
+          load();
+        }),
+      );
+    }
+
+    document.querySelector("#login").addEventListener("submit", (e) => {
+      e.preventDefault();
+      pw = document.querySelector("#pw").value;
+      load();
+    });
+  </script>
+</body>
+</html>

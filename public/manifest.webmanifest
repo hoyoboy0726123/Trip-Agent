@@ -1,0 +1,9 @@
+{
+  "name": "旅伴 AI",
+  "short_name": "旅伴 AI",
+  "description": "家族旅行的 AI 群組助理",
+  "display": "standalone",
+  "background_color": "#1d4ed8",
+  "theme_color": "#1d4ed8",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

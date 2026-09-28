@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trip-agent",
+  // Line-bot-Media 帳號（免費方案）：Workers AI 額度獨立，不會用到東京旅伴的額度
+  "account_id": "e88351a4fbf5a31abebeca4066f56d82",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/ws"],
+    // /t/<旅程代碼> 這類網址都交給同一個頁面處理
+    "not_found_handling": "single-page-application"
+  },
+  "ai": { "binding": "AI" },
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "TripRoom" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TripRoom", "Registry"] }],
+  "vars": {
+    "GEMINI_MODEL": "gemini-3.5-flash-lite",
+    "GEMINI_RPM": "15",
+    "GEMINI_TPM": "250000",
+    "GEMINI_RPD": "500",
+    "WORKERS_AI_MODEL": "@cf/google/gemma-4-26b-a4b-it"
+  },
+  "observability": { "enabled": true }
+}

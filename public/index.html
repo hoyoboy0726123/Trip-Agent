@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
+  <title>旅伴 AI</title>
+  <meta name="description" content="家族旅行群組的 AI 旅遊助理：多人群聊、記帳分帳、翻譯、找附近、提醒、旅遊日記" />
+  <meta name="theme-color" content="#1d4ed8" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="旅伴 AI" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
+  <link rel="stylesheet" href="/style.css" />
+  <script src="/vendor/marked.min.js" defer></script>
+  <script src="/vendor/purify.min.js" defer></script>
+  <script src="/common.js" defer></script>
+  <script src="/onboard.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <!-- 首頁、引導設置、登入、初始化進度、確認頁都畫在這裡 -->
+  <section id="screen" class="screen" hidden></section>
+
+  <!-- 聊天主畫面 -->
+  <section id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="topbar-main">
+        <div class="day-badge" id="day-badge">Day –</div>
+        <div class="topbar-text">
+          <div class="today-title" id="today-title">旅伴 AI</div>
+          <div class="online" id="online"></div>
+        </div>
+      </div>
+      <nav class="topbar-actions">
+        <button data-panel="itinerary" title="行程">📅</button>
+        <button data-panel="expenses" title="記帳">💰</button>
+        <button data-panel="hub" title="工具箱">🧰</button>
+        <button data-panel="settings" title="設定">⚙️</button>
+      </nav>
+    </header>
+
+    <div id="conn" class="conn" hidden>連線中…</div>
+    <div id="sos-banner" class="sos-banner" hidden></div>
+
+    <main id="messages" class="messages" aria-live="polite">
+      <button id="load-more" class="load-more" hidden>載入更早的訊息</button>
+    </main>
+
+    <footer class="composer">
+      <div class="chips" id="chips"></div>
+      <div id="attach" class="attach" hidden>
+        <img id="attach-img" alt="" />
+        <span id="attach-loc"></span>
+        <button id="attach-clear" class="icon" title="移除">✕</button>
+      </div>
+      <form id="send-form" class="send-row">
+        <label class="icon" title="拍照／上傳照片">📷<input id="photo-input" type="file" accept="image/*" hidden /></label>
+        <button type="button" id="loc-btn" class="icon" title="附上目前位置">📍</button>
+        <button type="button" id="tr-open" class="icon" title="翻譯">🌏</button>
+        <textarea id="input" rows="1" placeholder="問旅伴 AI 任何事…" enterkeyhint="send"></textarea>
+        <button type="submit" class="send" id="send-btn" title="送出">➤</button>
+      </form>
+    </footer>
+  </section>
+
+  <!-- 面板 -->
+  <dialog id="panel" class="panel">
+    <div class="panel-head">
+      <h2 id="panel-title"></h2>
+      <button class="icon" id="panel-close">✕</button>
+    </div>
+    <div id="panel-body" class="panel-body"></div>
+  </dialog>
+
+  <dialog id="viewer" class="viewer"><img id="viewer-img" alt="" /></dialog>
+
+  <!-- 翻譯 -->
+  <dialog id="translator" class="translator">
+    <div class="tr-head">
+      <button class="icon" id="tr-close" title="回到聊天">✕</button>
+      <div class="tr-tabs" id="tr-tabs">
+        <button data-tab="phrases">常用句</button>
+        <button data-tab="live">即時翻譯</button>
+        <button data-tab="history">紀錄</button>
+      </div>
+    </div>
+    <div id="tr-body" class="tr-body"></div>
+  </dialog>
+
+  <!-- 全螢幕給對方看 -->
+  <dialog id="showcase" class="showcase">
+    <div class="showcase-ja" id="showcase-local"></div>
+    <div class="showcase-kana" id="showcase-reading"></div>
+    <div class="showcase-zh" id="showcase-zh"></div>
+    <div class="showcase-actions">
+      <button class="btn" id="showcase-speak">🔊 再念一次</button>
+      <button class="btn" id="showcase-close">關閉</button>
+    </div>
+  </dialog>
+</body>
+</html>

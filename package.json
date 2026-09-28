@@ -1,0 +1,21 @@
+{
+  "name": "trip-agent",
+  "version": "1.0.0",
+  "description": "家族旅行 AI 群聊助理（任何國家）",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "setup": "node scripts/setup.mjs"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260928.1",
+    "dompurify": "^3.4.16",
+    "marked": "^15.0.12",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.142.0"
+  },
+  "private": true
+}

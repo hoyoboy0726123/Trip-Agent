@@ -196,7 +196,7 @@ export function isQuotaError(e: unknown): boolean {
  * Workers AI 偶爾暫時塞車（4002 could not route、3040 capacity），等一下再試一次通常就好。
  * 塞車時也可能一直不回應，所以每次最多等 timeoutMs，逾時就交給下一個模型（初始化不會卡住）
  */
-async function runAi(env: Env, model: string, input: Record<string, unknown>, timeoutMs = 60_000): Promise<any> {
+export async function runAi(env: Env, model: string, input: Record<string, unknown>, timeoutMs = 60_000): Promise<any> {
   for (let i = 0; ; i++) {
     let timer: any;
     try {

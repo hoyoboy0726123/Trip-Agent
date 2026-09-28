@@ -1,4 +1,5 @@
 import type { TripProfile } from "./profile";
+import { runAi } from "./providers";
 import type { Env } from "./types";
 
 /** zh = 中文 → 當地語言；local = 當地語言 → 中文 */
@@ -52,11 +53,11 @@ export async function translate(env: Env, ask: JsonAsk, p: TripProfile, text: st
     console.error("ai translate failed", e);
   }
   const local = M2M[p.langCode.slice(0, 2).toLowerCase()] ?? "english";
-  const out: any = await env.AI.run("@cf/meta/m2m100-1.2b" as any, {
+  const out: any = await runAi(env, "@cf/meta/m2m100-1.2b", {
     text: input,
     source_lang: from === "zh" ? "chinese" : local,
     target_lang: from === "zh" ? local : "chinese",
-  } as any);
+  }, 30_000);
   if (!out?.translated_text) throw new Error("翻譯服務暫時無法使用");
   return { translation: String(out.translated_text).trim(), engine: "m2m100" };
 }

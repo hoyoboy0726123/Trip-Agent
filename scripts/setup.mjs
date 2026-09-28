@@ -56,4 +56,4 @@ if (Object.keys(secrets).length) {
 }
 
 console.log("\n🎉 完成！打開上面部署顯示的網址，把網址和邀請碼給朋友就可以建立旅程。");
-console.log("   擁有者後台：<網址>/owner.html");
+console.log("   擁有者後台：<網址>/owner");

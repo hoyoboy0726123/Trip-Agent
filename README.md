@@ -57,7 +57,7 @@ npm run setup
 | --- | --- |
 | `SESSION_SECRET` | 自動產生。簽登入 Cookie 與加密朋友的金鑰，**設定後不要更換**（換了大家要重新登入、已存的金鑰要重填） |
 | `INVITE_CODE` | 建立新旅程要輸入的邀請碼 |
-| `OWNER_PASSWORD` | 擁有者後台（`/owner.html`）密碼：看所有旅程、刪除旅程 |
+| `OWNER_PASSWORD` | 擁有者後台（`/owner`）密碼：看所有旅程、刪除旅程 |
 | `GEMINI_API_KEY` | 選填，你的 Gemini 金鑰（https://aistudio.google.com/apikey） |
 
 `wrangler.jsonc` 裡的 `account_id` 決定部署到哪個 Cloudflare 帳號（Workers AI 額度以帳號計算）。
@@ -94,6 +94,6 @@ public/
   common.js      共用（當地時間、金額、API）
   onboard.js     首頁、引導設置、登入、初始化進度、確認頁
   app.js         聊天室、面板、工具箱、翻譯
-  owner.html     擁有者後台
+  owner.html     擁有者後台（網址 /owner）
 scripts/setup.mjs 一鍵部署
 ```

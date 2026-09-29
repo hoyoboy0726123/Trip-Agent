@@ -347,14 +347,14 @@ export const TOOLS: Tool[] = [
       },
     }),
     async run(args, { tavilyKey }) {
-      if (!tavilyKey) return { error: "這個旅程還沒設定 Tavily 金鑰，無法搜尋網路（管理員可在 ⚙️ 設定補上）" };
+      if (!tavilyKey) return { error: "這個旅程還沒設定 Tavily 金鑰，無法搜尋網路（管理員可在 「設定」補上）" };
       const res = await fetch("https://api.tavily.com/search", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${tavilyKey}` },
         body: JSON.stringify({ query: args.query, max_results: Math.min(Number(args.max_results) || 5, 8), include_answer: "basic", search_depth: "basic" }),
         signal: AbortSignal.timeout(20_000),
       });
-      if (res.status === 432 || res.status === 433) return { error: "Tavily 本月的免費搜尋額度用完了，請管理員到 ⚙️ 設定換一組金鑰" };
+      if (res.status === 432 || res.status === 433) return { error: "Tavily 本月的免費搜尋額度用完了，請管理員到 「設定」換一組金鑰" };
       if (!res.ok) return { error: `搜尋失敗 ${res.status}` };
       const d: any = await res.json();
       return {
@@ -389,7 +389,7 @@ export const TOOLS: Tool[] = [
     decl: (p) => ({
       name: "find_images",
       description:
-        "上網找照片（餐廳外觀、料理、景點、商品），找到的圖片會自動顯示在你的回答下方。只有成員明確要求看照片／圖片時才使用。" +
+        "上網找圖片（餐廳外觀、料理、景點、商品、捷運／地鐵路線圖、平面圖、菜單），找到的圖片會自動顯示在你的回答下方。只有成員明確要求看照片／圖片時才使用。" +
         "要看好幾個地方（例如剛才推薦的幾家店）就把每個地方放進 queries 一次查完。",
       parameters: {
         type: "object",
@@ -1084,7 +1084,7 @@ export const TOOLS: Tool[] = [
     async run(args, { room, attachImage }) {
       const docs = room.documentFind(args.keyword);
       for (const d of docs.slice(0, 6)) attachImage?.({ src: `/api/photo/${d.photo_id}`, caption: d.note, label: d.title, source: `${d.author} 存的` });
-      if (!docs.length) return { found: 0, note: "保管箱裡沒有符合的票券；可以在 🧰 工具箱 → 🎫 票券 上傳，或傳照片並說「存成票券」" };
+      if (!docs.length) return { found: 0, note: "保管箱裡沒有符合的票券；可以在 下方「工具箱」→ 票券保管箱 上傳，或傳照片並說「存成票券」" };
       return { found: docs.length, documents: docs.map((d) => ({ id: d.id, title: d.title, note: d.note, by: d.author })), note: "票券照片已顯示在回答下方" };
     },
   },

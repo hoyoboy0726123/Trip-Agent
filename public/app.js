@@ -1,8 +1,9 @@
 // 旅伴 AI 聊天室：即時群聊（WebSocket）、照片、定位、行程／記帳／記憶面板、工具箱、翻譯
 const els = {
   app: $("#app"), messages: $("#messages"), loadMore: $("#load-more"), conn: $("#conn"),
-  dayBadge: $("#day-badge"), todayTitle: $("#today-title"), online: $("#online"), chips: $("#chips"),
-  input: $("#input"), sendForm: $("#send-form"), sendBtn: $("#send-btn"), photoInput: $("#photo-input"), locBtn: $("#loc-btn"), trOpen: $("#tr-open"),
+  dayBadge: $("#day-badge"), todayTitle: $("#today-title"), online: $("#online"), avatars: $("#avatars"), chips: $("#chips"),
+  nextCard: $("#next-card"), tabbar: $("#tabbar"), more: $("#more"), moreActions: $("#more-actions"), moreAsks: $("#more-asks"),
+  input: $("#input"), sendForm: $("#send-form"), sendBtn: $("#send-btn"), photoInput: $("#photo-input"),
   attach: $("#attach"), attachImg: $("#attach-img"), attachLoc: $("#attach-loc"), attachClear: $("#attach-clear"),
   panel: $("#panel"), panelTitle: $("#panel-title"), panelBody: $("#panel-body"), panelClose: $("#panel-close"),
   viewer: $("#viewer"), viewerImg: $("#viewer-img"),
@@ -14,6 +15,34 @@ const COLORS = ["#e4572e", "#2e86ab", "#7b2cbf", "#f29e4c", "#17a398", "#d81159"
 const colorFor = (name) => COLORS[[...name].reduce((a, c) => a + c.charCodeAt(0), 0) % COLORS.length];
 const lang = () => S.trip?.language || "當地語言";
 const hasTranslator = () => !!S.trip && !/^zh/i.test(S.trip.langCode || "");
+
+// 方案 A 的線條圖示（路徑取自 Lucide）
+const ICONS = {
+  luggage: '<path d="M6 20a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2"/><path d="M8 18V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v14"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2"/>',
+  pin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/>',
+  receipt: '<path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z"/><path d="M8 8h8M8 12h8"/>',
+  lang: '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/>',
+  plus: '<path d="M5 12h14M12 5v14"/>',
+  camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>',
+  utensils: '<path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2"/><path d="M7 2v20"/><path d="M21 15V2a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3Zm0 0v7"/>',
+  exchange: '<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>',
+  home: '<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  train: '<rect width="16" height="16" x="4" y="3" rx="2"/><path d="M4 11h16M12 3v8M8 19l-2 3M18 22l-2-3"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  msg: '<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>',
+  calendar: '<rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  compass: '<circle cx="12" cy="12" r="10"/><path d="m16.24 7.76-2.12 6.36-6.36 2.12 2.12-6.36 6.36-2.12z"/>',
+  ticket: '<path d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"/><path d="M13 5v2M13 17v2M13 11v2"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  list: '<path d="m3 17 2 2 4-4M3 7l2 2 4-4M13 6h8M13 12h8M13 18h8"/>',
+  bell: '<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+  book: '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
+  bookmark: '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
+  help: '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>',
+  chev: '<path d="m9 18 6-6-6-6"/>',
+};
+const svg = (name, cls = "") => `<svg viewBox="0 0 24 24" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>${ICONS[name] ?? ""}</svg>`;
 
 // ================= 進入旅程 =================
 
@@ -30,7 +59,7 @@ async function checkSession() {
       applyTrip(trip);
       showApp();
       els.conn.hidden = false;
-      els.conn.textContent = "📴 離線中：常用句（🌏）與票券（🎫）仍可使用";
+      els.conn.textContent = "📴 離線中：翻譯常用句與票券仍可使用";
       setTimeout(connect, 5000);
       return;
     }
@@ -56,9 +85,6 @@ function showApp() {
   screenEl.hidden = true;
   els.app.hidden = false;
   renderChips();
-  els.trOpen.hidden = !hasTranslator();
-  els.trOpen.textContent = S.trip?.flag || "🌏";
-  els.trOpen.title = `中文 ↔ ${lang()} 翻譯`;
 }
 
 function applyTrip(trip) {
@@ -161,7 +187,7 @@ function handle(m) {
       prependMessages(m.messages);
       break;
     case "presence":
-      els.online.textContent = `🟢 ${m.online.join("、")}`;
+      renderPresence(m.online);
       break;
     case "settings":
       S.settings = m.settings;
@@ -190,13 +216,13 @@ function handle(m) {
       const live = S.live.get(m.id);
       if (live) {
         live.text = "";
-        live.node.querySelector(".ai-text").innerHTML = `<span class="typing"><span></span><span></span><span></span></span>`;
+        live.node.querySelector(".ai-body").innerHTML = TYPING;
       }
       break;
     }
     case "ai_note": {
       const live = S.live.get(m.id);
-      if (live) live.node.querySelector(".meta").textContent = m.text;
+      if (live) live.node.querySelector(".ai-time").textContent = m.text;
       break;
     }
     case "ai_done":
@@ -235,13 +261,22 @@ function providerName(meta) {
   return meta.providerLabel || (meta.provider === "workers-ai" ? "Workers AI" : "Gemini");
 }
 
+const TYPING = `<span class="typing"><span></span><span></span><span></span></span>`;
+
+/** 工具標籤原本帶 emoji（🌤 查天氣），方案 A 只留文字 */
+const toolBadge = (label) => `<span class="tool-chip">${escapeHtml(String(label).replace(/^[^\p{L}\p{N}]+/u, ""))}</span>`;
+
+function renderPresence(online) {
+  els.online.textContent = online.length ? `${online.join("、")}在線` : "";
+  els.avatars.innerHTML = online.slice(0, 3).map((n) => `<span style="background:${colorFor(n)}">${escapeHtml([...n][0])}</span>`).join("");
+}
+
 function messageNode(msg) {
   const isAI = msg.role === "assistant";
   const isMe = !isAI && msg.author === S.me?.name;
   const node = document.createElement("div");
   node.className = `msg ${isAI ? "ai" : isMe ? "me" : "other"}`;
   node.dataset.id = msg.id;
-  const avatar = isAI ? `<div class="avatar" style="background:var(--red)">🧳</div>` : `<div class="avatar" style="background:${colorFor(msg.author)}">${escapeHtml([...msg.author][0])}</div>`;
   let body = "";
   if (msg.photo) body += `<img class="photo" src="${msg.photo}" loading="lazy" alt="照片" />`;
   if (msg.location) {
@@ -262,14 +297,20 @@ function messageNode(msg) {
       })
       .join("")}</div>${webImages ? `<div class="small muted">🖼 網路圖片，僅供參考</div>` : ""}`;
   }
-  const tools = msg.meta?.tools?.length ? msg.meta.tools.map((t) => `<span class="tool-chip">${escapeHtml(t)}</span>`).join("") : "";
-  const provider = isAI ? providerName(msg.meta) : "";
-  node.innerHTML = `${isMe ? "" : avatar}
-    <div class="bubble-wrap">
-      ${isMe ? "" : `<div class="name">${escapeHtml(msg.author)}</div>`}
-      <div class="bubble">${body}</div>
-      <div class="meta">${timeText(msg.ts)}${provider ? ` · ${escapeHtml(provider)}` : ""} ${tools}</div>
+  if (isAI) {
+    const provider = providerName(msg.meta);
+    node.innerHTML = `<div class="ai-card">
+      <div class="ai-head"><span class="ai-avatar">${svg("luggage")}</span><span class="ai-name">${escapeHtml(msg.author)}</span>
+        <span class="ai-tools">${(msg.meta?.tools ?? []).map(toolBadge).join("")}</span>
+        <span class="ai-time">${timeText(msg.ts)}${provider ? ` · ${escapeHtml(provider)}` : ""}</span></div>
+      <div class="ai-body rich">${body}</div>
     </div>`;
+  } else if (isMe) {
+    node.innerHTML = `<div class="bubble-wrap"><div class="bubble rich">${body}</div><div class="meta">${timeText(msg.ts)}</div></div>`;
+  } else {
+    node.innerHTML = `<div class="avatar" style="background:${colorFor(msg.author)}">${escapeHtml([...msg.author][0])}</div>
+      <div class="bubble-wrap"><div class="name">${escapeHtml(msg.author)}・${timeText(msg.ts)}</div><div class="bubble rich">${body}</div></div>`;
+  }
   node.querySelectorAll("img.photo").forEach((img) => img.addEventListener("click", () => openViewer(img.src)));
   return node;
 }
@@ -335,8 +376,7 @@ function aiStart(m) {
   if (!live) {
     const stick = nearBottom();
     const node = messageNode({ id: m.id, ts: Date.now(), author: S.aiName, role: "assistant", text: "", meta: null });
-    const bubble = node.querySelector(".bubble");
-    bubble.innerHTML = `<div class="tools-live"></div><div class="ai-text"><span class="typing"><span></span><span></span><span></span></span></div>`;
+    node.querySelector(".ai-body").innerHTML = TYPING;
     const sep = daySeparator(Date.now());
     if (sep) els.messages.appendChild(sep);
     els.messages.appendChild(node);
@@ -344,16 +384,13 @@ function aiStart(m) {
     S.live.set(m.id, live);
     scrollToBottom(stick);
   }
-  live.node.querySelector(".meta").textContent = `${m.label || "AI"} 思考中…`;
+  live.node.querySelector(".ai-time").textContent = `${m.label || "AI"} 思考中…`;
 }
 
 function aiTool(m) {
   const live = S.live.get(m.id);
   if (!live) return;
-  const chip = document.createElement("span");
-  chip.className = "tool-chip";
-  chip.textContent = m.label;
-  live.node.querySelector(".tools-live").appendChild(chip);
+  live.node.querySelector(".ai-tools").insertAdjacentHTML("beforeend", toolBadge(m.label));
   scrollToBottom(false);
 }
 
@@ -365,7 +402,7 @@ function aiDelta(m) {
   live.raf = requestAnimationFrame(() => {
     live.raf = 0;
     const stick = nearBottom();
-    live.node.querySelector(".ai-text").innerHTML = md(live.text);
+    live.node.querySelector(".ai-body").innerHTML = md(live.text);
     scrollToBottom(stick);
   });
 }
@@ -374,7 +411,7 @@ function aiRetry(m) {
   const live = S.live.get(m.id);
   if (!live) return;
   live.text = "";
-  live.node.querySelector(".ai-text").innerHTML = m.rateLimited
+  live.node.querySelector(".ai-body").innerHTML = m.rateLimited
     ? `<span class="muted small">這個模型的額度用完或冷卻中，改用下一個模型回答…</span>`
     : `<span class="muted small">模型出錯，改用下一個模型…</span>`;
 }
@@ -434,38 +471,73 @@ els.sendForm.addEventListener("submit", async (e) => {
   }
 });
 
-/** 輸入框上方的捷徑：問句按鈕（送出問題）＋工具箱捷徑（打開頁面） */
+/** 送出一句問題；問「附近／回住宿」要先附上位置 */
+function ask(q, withLocation = false) {
+  els.input.value = q;
+  if (withLocation) attachLocation(true);
+  else els.sendForm.requestSubmit();
+}
+
+/** 收據記帳：先選照片，文字幫忙填好，確認後按送出 */
+function receiptFlow() {
+  els.input.value = "幫我把這張收據記帳（我付的）";
+  els.photoInput.click();
+}
+
+/** 輸入框上方的快捷列：最常用的 4 個＋「更多」 */
 function renderChips() {
+  const chips = [
+    ["sun", "今天", () => ask("今天的行程和天氣？")],
+    ["pin", "附近", () => ask("我附近有什麼好吃的？", true)],
+    ["receipt", "收據", receiptFlow],
+    ...(hasTranslator() ? [["lang", "翻譯", openTranslator]] : []),
+    ["plus", "更多", openMore],
+  ];
+  els.chips.innerHTML = chips.map(([icon, label], i) => `<button type="button" data-i="${i}">${svg(icon)}${label}</button>`).join("");
+  els.chips.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => chips[Number(b.dataset.i)][2]()));
+}
+
+// ---------- 「更多」：傳給 AI 的動作與常用問法 ----------
+
+const MORE_ASKS = ["明天的行程和天氣？", "目前花了多少錢？大家要怎麼分？", "最近有地震或颱風嗎？會影響行程嗎？"];
+
+function moreActions() {
   const t = S.trip || {};
   const cur = t.currency || "";
-  const ask = [
-    ["📅 今天", "今天的行程和天氣？"],
-    ["🍜 附近美食", "我附近有什麼好吃的？"],
-    ["🧾 收據記帳", null],
-    ...(t.countryCode === "JP" ? [["🚆 電車狀況", "我們附近的電車現在有延誤或停駛嗎？"]] : []),
-    ...(cur && cur !== "TWD" ? [["💱 匯率", `現在 ${cur} 匯率多少？1000 ${cur} 等於多少台幣？`]] : []),
-    ["💰 帳目", "目前花了多少錢？大家要怎麼分？"],
-    ["🏠 回住宿", "我要怎麼回住宿？"],
+  return [
+    ["camera", "拍照問", () => els.photoInput.click()],
+    ["pin", "附上位置", () => attachLocation(false)],
+    ["receipt", "收據記帳", receiptFlow],
+    ...(hasTranslator() ? [["lang", "翻譯", openTranslator]] : []),
+    ["sun", "今天", () => ask("今天的行程和天氣？")],
+    ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
+    ...(cur && cur !== "TWD" ? [["exchange", "匯率", () => ask(`現在 ${cur} 匯率多少？1000 ${cur} 等於多少台幣？`)]] : []),
+    ["home", "回住宿", () => ask("我要怎麼回住宿？", true)],
+    ...(t.countryCode === "JP" ? [["train", "電車狀況", () => ask("我們附近的電車現在有延誤或停駛嗎？")]] : []),
+    ["clock", "樂園排隊", () => ask("附近樂園現在哪些設施排隊最少？")],
   ];
-  const panels = [["tickets", "🎫 票券"], ["map", "🗺 家人位置"], ["checklist", "✅ 清單"], ["reminders", "⏰ 提醒"], ["travel", "📘 旅遊指南"], ["diary", "📔 旅遊日記"], ["memories", "🧠 長期記憶"], ["guide", "📖 使用說明"]];
-  els.chips.innerHTML =
-    ask.map(([label, q]) => (q ? `<button data-q="${escapeHtml(q)}">${label}</button>` : `<button data-receipt>${label}</button>`)).join("") +
-    panels.map(([id, label]) => `<button data-open="${id}" class="chip-panel">${label}</button>`).join("");
-  els.chips.querySelectorAll("button").forEach((b) =>
+}
+
+function openMore() {
+  const actions = moreActions();
+  els.moreActions.innerHTML = actions.map(([icon, label], i) => `<button type="button" data-i="${i}"><span class="ag-icon">${svg(icon)}</span>${label}</button>`).join("");
+  els.moreAsks.innerHTML = MORE_ASKS.map((q, i) => `<button type="button" data-q="${i}">${svg("msg")}${escapeHtml(q)}</button>`).join("");
+  els.moreActions.querySelectorAll("button").forEach((b) =>
     b.addEventListener("click", () => {
-      if (b.dataset.open) return openPanel(b.dataset.open);
-      if (b.hasAttribute("data-receipt")) {
-        // 先選收據照片，文字幫忙填好，確認後按送出
-        els.input.value = "幫我把這張收據記帳（我付的）";
-        els.photoInput.click();
-        return;
-      }
-      els.input.value = b.dataset.q;
-      if (/附近|回住宿/.test(b.dataset.q)) attachLocation(true);
-      else els.sendForm.requestSubmit();
+      els.more.close();
+      actions[Number(b.dataset.i)][2]();
     }),
   );
+  els.moreAsks.querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => {
+      els.more.close();
+      ask(MORE_ASKS[Number(b.dataset.q)]);
+    }),
+  );
+  if (!els.more.open) els.more.showModal();
 }
+$("#more-close").addEventListener("click", () => els.more.close());
+els.more.addEventListener("click", (e) => e.target === els.more && els.more.close());
 
 // ---------- 照片 ----------
 
@@ -511,7 +583,6 @@ function getPosition() {
 }
 
 async function attachLocation(thenSend) {
-  els.locBtn.classList.add("active");
   els.attachLoc.textContent = "📍 定位中…";
   els.attach.hidden = false;
   try {
@@ -520,21 +591,14 @@ async function attachLocation(thenSend) {
     if (thenSend) els.sendForm.requestSubmit();
   } catch (err) {
     els.attachLoc.textContent = "";
-    els.locBtn.classList.remove("active");
     if (!S.pending.photo) els.attach.hidden = true;
     alert(err.message);
     if (thenSend && els.input.value) els.sendForm.requestSubmit();
   }
 }
 
-els.locBtn.addEventListener("click", () => {
-  if (S.pending.location) return clearLocation();
-  attachLocation(false);
-});
-
 function clearLocation() {
   S.pending.location = null;
-  els.locBtn.classList.remove("active");
   els.attachLoc.textContent = "";
   if (!S.pending.photo) els.attach.hidden = true;
 }
@@ -582,21 +646,37 @@ function setState(state) {
   const t = state.trip;
   const now = todayLocal();
   const day = Math.floor((Date.parse(now + "T00:00:00Z") - Date.parse(t.startDate + "T00:00:00Z")) / 86400e3) + 1;
-  const today = state.itinerary.find((d) => d.date === now);
-  if (day < 1) {
-    els.dayBadge.textContent = `倒數 ${1 - day} 天`;
-    els.todayTitle.textContent = `${t.flag} ${t.title}`;
-  } else if (now <= t.endDate) {
-    els.dayBadge.textContent = `Day ${day}`;
-    els.todayTitle.textContent = today?.title || `${t.flag} ${t.title}`;
-  } else {
-    els.dayBadge.textContent = "🏠";
-    els.todayTitle.textContent = "旅程結束，歡迎回家！";
-  }
+  els.todayTitle.textContent = t.title;
+  els.dayBadge.textContent = day < 1 ? `倒數 ${1 - day} 天` : now <= t.endDate ? `Day ${day}` : "旅程結束";
+  renderNextCard(state, now);
   if (S.panel && !["settings", "tripedit", "keys"].includes(S.panel)) renderPanel();
   const usage = $("#gemini-usage");
   if (usage) usage.textContent = geminiUsageText(state.gemini);
 }
+
+/** 「下一站」票券卡：出發前顯示出發日與航班，旅途中顯示今天的行程，回國後隱藏 */
+function renderNextCard(state, now) {
+  const t = state.trip;
+  const it = state.itinerary || [];
+  let label, title, sub;
+  if (now < t.startDate) {
+    const first = it.find((d) => d.date === t.startDate);
+    label = "下一站";
+    title = `${dateLabel(t.startDate)} 出發`;
+    sub = String(t.flights || "").split("\n")[0] || [first?.title, first?.detail].filter(Boolean).join("｜") || t.accommodation?.name || "";
+  } else if (now <= t.endDate) {
+    const today = it.find((d) => d.date === now);
+    label = `今天・${dateLabel(now)}`;
+    title = today?.title || "自由活動";
+    sub = today?.detail || today?.status || "";
+  } else {
+    els.nextCard.hidden = true;
+    return;
+  }
+  els.nextCard.innerHTML = `<span class="nc-main"><span class="nc-label">${escapeHtml(label)}</span><span class="nc-title">${escapeHtml(title)}</span>${sub ? `<span class="nc-sub">${escapeHtml(sub)}</span>` : ""}</span><span class="nc-side">${svg("calendar")}行程</span>`;
+  els.nextCard.hidden = false;
+}
+els.nextCard.addEventListener("click", () => openPanel("itinerary"));
 
 function geminiUsageText(g) {
   if (!g) return "";
@@ -605,16 +685,40 @@ function geminiUsageText(g) {
   return s;
 }
 
-document.querySelectorAll("[data-panel]").forEach((b) => b.addEventListener("click", () => openPanel(b.dataset.panel)));
+// ---------- 底部分頁列：聊天以外的分頁是蓋在聊天上方的整頁面板 ----------
+
+const TAB_OF = { itinerary: "itinerary", expenses: "expenses", settings: "settings", tripedit: "settings", keys: "settings" };
+
+function setTab(tab) {
+  els.tabbar.querySelectorAll("button").forEach((b) => {
+    if (b.dataset.tab === tab) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
+}
+
+els.tabbar.querySelectorAll("button").forEach((b) =>
+  b.addEventListener("click", () => {
+    if (b.dataset.tab === "chat") {
+      if (els.panel.open) els.panel.close();
+      else scrollToBottom(true);
+      return;
+    }
+    openPanel(b.dataset.tab);
+  }),
+);
 els.panelClose.addEventListener("click", () => els.panel.close());
-els.panel.addEventListener("close", () => (S.panel = null));
-els.panel.addEventListener("click", (e) => e.target === els.panel && els.panel.close());
+els.panel.addEventListener("close", () => {
+  S.panel = null;
+  setTab("chat");
+});
 
 function openPanel(name) {
   S.panel = name;
   renderPanel();
+  setTab(TAB_OF[name] ?? "hub");
   if (name === "settings" && S.ws?.readyState === 1) S.ws.send(JSON.stringify({ type: "get_state" }));
-  if (!els.panel.open) els.panel.showModal();
+  if (!els.panel.open) els.panel.show();
+  els.panel.scrollTop = 0;
 }
 
 function openViewer(src) {
@@ -625,13 +729,19 @@ els.viewer.addEventListener("click", () => els.viewer.close());
 
 const OFFLINE_OK = ["hub", "tickets", "guide", "travel"];
 
+/** 分頁標題用霞鶩文楷，不帶 emoji（各頁面原本的標題有 emoji，在這裡統一拿掉） */
 function renderPanel() {
+  renderPanelInner();
+  els.panelTitle.textContent = els.panelTitle.textContent.replace(/^[^\p{L}\p{N}]+/u, "");
+}
+
+function renderPanelInner() {
   const st = S.state;
   const b = els.panelBody;
   if (!st || S.offline) {
     if (OFFLINE_OK.includes(S.panel)) return renderToolPanel(null, b);
     els.panelTitle.textContent = "📴 離線中";
-    b.innerHTML = `<div class="card small muted">目前沒有網路，這個功能暫時不能用。常用句（🌏）、票券、旅遊指南離線也能看。</div>`;
+    b.innerHTML = `<div class="card small muted">目前沒有網路，這個功能暫時不能用。翻譯常用句、票券、旅遊指南離線也能看。</div>`;
     return;
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary"].includes(S.panel)) return renderToolPanel(st, b);
@@ -694,7 +804,7 @@ function renderPanel() {
             <div class="checks">${members.map((m) => `<label><input type="checkbox" name="split" value="${escapeHtml(m)}" checked /> ${escapeHtml(m)}</label>`).join("")}</div>
             <button class="btn primary-sm">記下來</button>
           </form>
-          <p class="small muted">也可以直接在聊天說「晚餐 ${t.currencySymbol || ""}3000 我付的」，或按 🧾 收據記帳拍收據。</p>
+          <p class="small muted">也可以直接在聊天說「晚餐 ${t.currencySymbol || ""}3000 我付的」，或按快捷列的「收據」拍收據。</p>
         </div>
         <div class="card"><h3>明細</h3><div class="list">
           ${ex.items.slice().reverse().map((it) => `<div class="item small"><div><b>${escapeHtml(it.description)}</b><div class="muted">${String(it.date).slice(5)}｜${escapeHtml(it.category)}｜${escapeHtml(it.payer)} 付｜分給 ${it.split_among.map(escapeHtml).join("、")}</div></div>
@@ -915,25 +1025,40 @@ function renderSettingsPanel(st, b) {
   });
 }
 
-// ================= 🧰 工具箱 =================
+// ================= 工具箱分頁 =================
 
-const TOOL_TILES = [
-  ["travel", "📘", "旅遊指南", "入境、插座、交通、退稅"],
-  ["map", "🗺", "家人位置", "看大家在哪、走散求救"],
-  ["checklist", "✅", "清單", "購物、行李、待辦"],
-  ["tickets", "🎫", "票券", "門票、訂位憑證，離線可看"],
-  ["reminders", "⏰", "提醒", "時間到在群組通知"],
-  ["diary", "📔", "旅遊日記", "每晚自動寫、匯出相簿"],
-  ["memories", "🧠", "長期記憶", "AI 記得的事"],
-];
+function toolCards() {
+  return [
+    ["tickets", "ticket", "票券保管箱", "門票、訂位憑證，離線可看"],
+    ["map", "users", "家人位置", "看大家在哪、走散求救"],
+    ["checklist", "list", "共用清單", "行李、購物、待辦"],
+    ["reminders", "bell", "提醒", "時間到在群組通知"],
+    ...(hasTranslator() ? [["translator", "lang", "翻譯常用句", "念給對方聽、放大給對方看"]] : []),
+    ["diary", "book", "旅遊日記", "每晚自動寫、匯出相簿"],
+  ];
+}
 
 function renderToolPanel(st, b) {
   switch (S.panel) {
     case "hub": {
-      els.panelTitle.textContent = "🧰 工具箱";
-      b.innerHTML = `<button class="guide-btn" data-go="guide">📖 功能使用說明<span class="small muted">每個功能怎麼用、可以怎麼問</span></button>
-        <div class="tile-grid">${TOOL_TILES.map(([id, icon, name, desc]) => `<button class="tile" data-go="${id}"><span class="tile-icon">${icon}</span><b>${name}</b><span class="small muted">${desc}</span></button>`).join("")}</div>`;
-      b.querySelectorAll("[data-go]").forEach((x) => x.addEventListener("click", () => openPanel(x.dataset.go)));
+      const t = S.trip || {};
+      els.panelTitle.textContent = "工具箱";
+      // 旅遊指南卡片直接露出幾個重點：時差、貨幣、緊急電話（取前兩個號碼）
+      const sos = (String(t.emergency || "").match(/\d{3,4}/g) || []).slice(0, 2).join("／");
+      const facts = [t.diff, t.currency && `${t.currency}（${t.currencySymbol}）`, sos && `緊急 ${sos}`].filter(Boolean);
+      b.innerHTML = `
+        <button class="tb-feature" data-go="travel">
+          <span class="tb-feature-top"><span class="tb-icon-big">${svg("compass")}</span>
+            <span style="flex:1;min-width:0"><span class="tb-feature-title">${escapeHtml(t.country || "")}旅遊指南</span><span class="small muted" style="display:block">入境、插座、交通、退稅、緊急電話</span></span>
+            <span class="muted">${svg("chev")}</span></span>
+          ${facts.length ? `<span class="tb-chips">${facts.map((f) => `<span>${escapeHtml(f)}</span>`).join("")}</span>` : ""}
+        </button>
+        <div class="tb-grid">${toolCards().map(([id, icon, name, desc]) => `<button class="tb-card" data-go="${id}"><span class="tb-icon">${svg(icon)}</span><b>${name}</b><span class="small muted">${desc}</span></button>`).join("")}</div>
+        <div class="tb-list">
+          <button data-go="memories">${svg("bookmark")}<span>長期記憶 <span class="small muted">AI 記得的偏好與決定</span></span><span class="chev">${svg("chev")}</span></button>
+          <button data-go="guide">${svg("help")}<span>使用說明 <span class="small muted">每個功能怎麼用</span></span><span class="chev">${svg("chev")}</span></button>
+        </div>`;
+      b.querySelectorAll("[data-go]").forEach((x) => x.addEventListener("click", () => (x.dataset.go === "translator" ? openTranslator() : openPanel(x.dataset.go))));
       break;
     }
     case "guide":
@@ -1000,7 +1125,7 @@ function guideItems() {
     ], ["今天的行程和天氣？"]],
     ["⏰", "提醒", "時間到在群組通知全家", [
       "在聊天說「<b>幾月幾號 幾點 提醒大家…</b>」，AI 會設好提醒。",
-      "也可以到 🧰 → ⏰ 提醒，選日期時間、打內容。",
+      "也可以到下方「工具箱」→ 提醒，選日期時間、打內容。",
       `時間一律是<b>當地時間</b>（${escapeHtml(t.diff || "")}）。`,
     ], ["明天早上 9:30 提醒大家出門", "有哪些提醒？"]],
     ["🆘", "災害警報", "有狀況自動通知，不用操作", [
@@ -1012,7 +1137,7 @@ function guideItems() {
       "AI 會回答距離、車程時間、大概的車資範圍（依建立旅程時查到的當地費率）。",
     ], ["從住宿叫車到市中心要多少錢？"]],
     ...(t.countryCode === "JP" ? [["🚆", "電車狀況", "出門前查有沒有延誤、停駛", [
-      "按輸入框上方的「<b>🚆 電車狀況</b>」，或直接問某條線。",
+      "按快捷列的「更多」→「<b>電車狀況</b>」，或直接問某條線。",
       "查的是 Yahoo!路線 的即時運行資訊。",
     ], ["山手線現在有延誤嗎？"]]] : []),
     ["🎢", "樂園排隊", "迪士尼、環球影城等即時等待時間", [
@@ -1020,29 +1145,29 @@ function guideItems() {
       "資料來自 Queue-Times，全球有上百座樂園。",
     ], ["附近有哪些樂園可以查排隊？"]],
     ["🧾", "收據記帳", "拍收據，AI 幫你記帳", [
-      "按「<b>🧾 收據記帳</b>」→ 拍照或選收據照片，確認後送出。",
+      "按快捷列的「<b>收據</b>」→ 拍照或選收據照片，確認後送出。",
       "如果是別人付的，把「我付的」改成「媽媽付的」。",
       `AI 會讀出店名、金額，用${escapeHtml(t.currency || "當地貨幣")}記帳並換算台幣，按 💰 可以看誰該給誰多少。`,
     ], [`午餐 ${sym}3000，${who}付的`, "目前花了多少錢？大家要怎麼分？"]],
     ["✅", "共用清單", "購物、行李、待辦，全家同步", [
-      "到 🧰 → ✅ 清單，分成<b>購物、行李、待辦</b>三頁；打勾全家同步。",
+      "到下方「工具箱」→ 共用清單，分成<b>行李、購物、待辦</b>三頁；打勾全家同步。",
       "在聊天請 AI 加：要明確說「<b>加入清單</b>」才會加。",
     ], ["把紀念品加入購物清單", "護照已經帶好了，幫我打勾"]],
     ["🎫", "票券保管箱", "門票、訂位確認，沒網路也能看", [
-      "到 🧰 → 🎫 票券上傳，或在聊天傳照片說「存成票券」。",
+      "到下方「工具箱」→ 票券保管箱上傳，或在聊天傳照片說「存成票券」。",
       "<b>打開過一次之後，沒網路也能看</b>。建議出發前先把每張都點開一次。",
     ], ["給我看博物館的門票"]],
     ...(hasTranslator() ? [["🌏", "翻譯", `中文 ↔ ${escapeHtml(lang())}`, [
-      `按輸入框左邊的 ${escapeHtml(t.flag || "🌏")}，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。`,
+      "按快捷列的「<b>翻譯</b>」，或到「工具箱」→ 翻譯常用句，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。",
       "點常用句就會念出來；📺 可以放大給司機、店員看。",
     ], []]] : []),
     ["🗺", "家人位置地圖", "看大家在哪，走散一鍵求救", [
-      "到 🧰 → 🗺 家人位置，地圖上會顯示每個人最後的位置和住宿 🏠。",
+      "到下方「工具箱」→ 家人位置，地圖上會顯示每個人最後的位置和住宿 🏠。",
       "走散了就按「<b>🆘 我走散了</b>」，你的位置會傳到群組，全家畫面會跳出紅色提示。",
     ], ["大家現在在哪裡？"]],
     ["📔", "旅遊日記", "每晚自動寫，可匯出相簿", [
       "旅程期間每晚<b>當地時間 22:00</b>，AI 會用當天的聊天和照片寫一篇日記。",
-      "到 🧰 → 📔 旅遊日記 按「📖 打開相簿」，可以列印或存成 PDF。",
+      "到下方「工具箱」→ 旅遊日記，按「📖 打開相簿」可以列印或存成 PDF。",
     ], []],
   ];
 }
@@ -1101,7 +1226,7 @@ function renderMapPanel(st, b) {
     <div class="list card">
       ${locs.length
         ? locs.map((l) => `<div class="item small"><span><b>${escapeHtml(l.name)}</b>　${escapeHtml(l.area || "")}</span><span class="muted">${Math.max(0, Math.round((Date.now() - l.ts) / 60000))} 分鐘前</span></div>`).join("")
-        : `<div class="small muted">還沒有人分享位置。按下面的按鈕分享，或在 ⚙️ 設定開啟「自動分享位置」。</div>`}
+        : `<div class="small muted">還沒有人分享位置。按下面的按鈕分享，或在下方「設定」開啟「自動分享位置」。</div>`}
     </div>
     <div class="row" style="gap:8px">
       <button class="btn" id="map-share" style="flex:1">📍 更新我的位置</button>
@@ -1349,10 +1474,10 @@ $("#showcase-close").addEventListener("click", () => els.showcase.close());
 
 // ---------- 開關與分頁 ----------
 
-els.trOpen.addEventListener("click", () => {
+function openTranslator() {
   renderTranslator();
   if (!els.translator.open) els.translator.showModal();
-});
+}
 $("#tr-close").addEventListener("click", () => {
   TR.rec?.stop();
   els.translator.close();

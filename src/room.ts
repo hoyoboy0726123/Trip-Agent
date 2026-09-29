@@ -65,7 +65,8 @@ function newId(): string {
 const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolean; alt?: string[] }[] = [
   { tool: "save_document", test: (t, p) => p && /存成票券|存起來|存進票券|收進票券|保存這張|存下來/.test(t) },
   { tool: "find_documents", test: (t) => /(給我看|找出|叫出|拿出).{0,12}(票|門票|票券|訂位|確認信|QR|登機證)/.test(t) },
-  { tool: "find_images", test: (t) => /照片|圖片|相片|看圖|附圖|長什麼樣|photo|picture/i.test(t) && !/存|票券/.test(t) },
+  // 「路線圖」「傳圖給我」也算要看圖；自己附了照片時是要 AI 看那張照片，不是上網找圖
+  { tool: "find_images", test: (t, p) => !p && /照片|圖片|相片|看圖|附圖|長什麼樣|路線圖|地鐵圖|捷運圖|平面圖|示意圖|菜單圖|(傳|給|找|看).{0,6}圖(?!書)|photo|picture|image/i.test(t) && !/存|票券|地圖/.test(t) },
   {
     tool: "add_expense",
     test: (t, p) => (p && /收據|發票|記帳/.test(t)) || /(我付了|付了|花了|請客|記帳).{0,20}\d/.test(t) || /\d.{0,12}(元|圓|円|幣|銖|盾|塊|€|\$|₩|฿|£).{0,12}(我付|付的|記帳)/.test(t),
@@ -533,7 +534,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         if (first) {
           this.postAiMessage(
             `🎉 **${p.title}** 準備好了！\n\n我是${AI_NAME}，可以幫大家查景點美食和照片、找附近、估計程車、記帳分帳、翻譯${p.language}、設提醒…有問題直接在這裡問我就好。\n\n` +
-              `👉 先按上方 🧰 → 📖 使用說明，看看每個功能怎麼用\n👉 ${p.country}的入境、插座、交通、退稅整理在 🧰 → 📘 旅遊指南\n👉 管理員可以到 ⚙️ 設定 → 📤 邀請家人，把網址傳給大家`,
+              `👉 先按下方「工具箱」→ 使用說明，看看每個功能怎麼用\n👉 ${p.country}的入境、插座、交通、退稅整理在 「工具箱」→ 旅遊指南\n👉 管理員可以到 下方「設定」→ 邀請家人，把網址傳給大家`,
             { kind: "welcome" },
           );
           await this.ctx.storage.setAlarm(Date.now() + 60_000);
@@ -1076,7 +1077,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   documentSave(title: string, note: string, photoId: string, author: string) {
     const row = this.sql.exec("INSERT INTO documents (ts, author, title, note, photo_id) VALUES (?, ?, ?, ?, ?) RETURNING id, title", Date.now(), author, title, note, photoId).one();
     this.broadcastState();
-    return { saved: row, note: "已存進 🧰 工具箱 → 🎫 票券，打開過一次之後沒網路也看得到" };
+    return { saved: row, note: "已存進 下方「工具箱」→ 票券保管箱，打開過一次之後沒網路也看得到" };
   }
 
   documentFind(keyword?: string) {
@@ -1194,7 +1195,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       date, Date.now(), text, JSON.stringify(photos),
     );
     const images: AttachedImage[] = photos.map((id) => ({ src: `/api/photo/${id}`, caption: "", source: "今天的照片" }));
-    this.postAiMessage(`📔 **${date.slice(5).replace("-", "/")} 旅遊日記**\n\n${text}\n\n（🧰 工具箱 → 📔 日記 可以看全部、匯出相簿）`, { kind: "diary", images });
+    this.postAiMessage(`📔 **${date.slice(5).replace("-", "/")} 旅遊日記**\n\n${text}\n\n（下方「工具箱」→ 旅遊日記 可以看全部、匯出相簿）`, { kind: "diary", images });
     this.broadcastState();
   }
 
@@ -1454,7 +1455,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 問路：用 plan_route 給 Google Maps 連結，必要時用 web_search 補充轉乘與票價。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
 - 每次有人問「附近」都要重新呼叫工具查詢，不可以沿用之前的回答。
-- 成員要求看照片／圖片時，一定要用 find_images（店名或景點名稱加地名；好幾個地方就放進 queries 一次查完）；圖片會自動顯示在回答下方。絕對不要自己產生圖片網址或圖片搜尋連結，並提醒是網路圖片、僅供參考。沒有要求就不要找圖片。
+- 你可以用 find_images 把網路上的圖片直接顯示給成員（照片、捷運／地鐵路線圖、平面圖、菜單…），絕對不要說「無法傳送圖片」。
+- 成員要求看照片／圖片／路線圖時，一定要用 find_images（店名或景點名稱加地名；好幾個地方就放進 queries 一次查完）；圖片會自動顯示在回答下方。絕對不要自己產生圖片網址或圖片搜尋連結，並提醒是網路圖片、僅供參考。沒有要求就不要找圖片。
 - 問「我附近有什麼」：直接用 find_nearby，near 留空（系統會自動用發問者的 GPS），回答時列出實際店名、距離、步行分鐘與地圖連結；需要評價再用 web_search 補充。問「我在哪」用 get_member_locations，說出區域與最近的車站。
 - 問計程車多少錢、要多久 → taxi_fare；問地震、颱風、天氣會不會影響行程 → disaster_alerts；問樂園排隊 → theme_park_wait_times。${hasTool("train_status") ? "問電車有沒有延誤、停駛 → train_status。" : ""}
 - 收到收據照片（或說「記帳這張收據」）：讀出店名、總金額、幣別與主要品項，用 add_expense 記帳（description 寫「店名：品項」），付款人預設是發問者；若可能達退稅門檻，順便提醒。
@@ -1510,7 +1512,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     if (!order.length) {
       const row = this.insertMessage({
         id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true }),
-        text: "抱歉，今天的免費 AI 額度用完了 🙇\n\n管理員可以到 ⚙️ 設定 → 🔑 API 金鑰，填入自己的 Gemini 金鑰（免費申請）就能繼續使用；或等台灣時間早上 8 點額度重置。",
+        text: "抱歉，今天的免費 AI 額度用完了 🙇\n\n管理員可以到 下方「設定」→ API 金鑰，填入自己的 Gemini 金鑰（免費申請）就能繼續使用；或等台灣時間早上 8 點額度重置。",
       });
       this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
       return;
@@ -1616,7 +1618,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const noOwn = !(await this.keys()).gemini;
     const row = this.insertMessage({
       id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true }),
-      text: `抱歉，AI 暫時無法回答 🙇${noOwn ? "\n\n如果常常遇到，管理員可以到 ⚙️ 設定 → 🔑 API 金鑰填入自己的 Gemini 金鑰。" : ""}\n\n\`${lastError.slice(0, 200)}\``,
+      text: `抱歉，AI 暫時無法回答 🙇${noOwn ? "\n\n如果常常遇到，管理員可以到 下方「設定」→ API 金鑰填入自己的 Gemini 金鑰。" : ""}\n\n\`${lastError.slice(0, 200)}\``,
     });
     this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
   }

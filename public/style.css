@@ -95,6 +95,7 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .sticky-nav { position: sticky; bottom: calc(env(safe-area-inset-bottom) + 8px); background: var(--card); padding: 10px; border-radius: 16px; box-shadow: 0 6px 24px rgba(0,0,0,.25); }
 /* 藍色背景上的主要按鈕改用黃色才看得出來 */
 .primary.on-blue { background: #ffd166; color: #1a1a1a; }
+.intro-link { color: #fff; text-align: center; font-size: 15px; padding: 10px; text-decoration: underline; text-underline-offset: 3px; }
 .trav-list { display: grid; gap: 8px; margin-bottom: 8px; }
 .trav-row { display: grid; grid-template-columns: 1fr 78px auto auto; gap: 6px; align-items: center; }
 .trav-row select { padding: 10px 6px; }

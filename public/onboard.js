@@ -30,6 +30,7 @@ function renderLanding() {
     <div class="stack">
       <button class="primary on-blue" id="go-new">✨ 建立新旅程</button>
       <button class="btn big-btn" id="go-join">🔗 我有旅程連結</button>
+      <a class="intro-link" href="/intro">第一次用？看完整介紹與使用方式 →</a>
     </div>
     ${trips.length ? `<h3 class="section-title">最近的旅程</h3><div class="stack">${trips.map((t) => `
       <a class="trip-link card" href="/t/${escapeHtml(t.id)}"><span class="trip-flag">${escapeHtml(t.flag || "🌏")}</span>

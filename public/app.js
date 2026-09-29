@@ -2,7 +2,7 @@
 const els = {
   app: $("#app"), messages: $("#messages"), loadMore: $("#load-more"), conn: $("#conn"),
   dayBadge: $("#day-badge"), todayTitle: $("#today-title"), online: $("#online"), avatars: $("#avatars"), chips: $("#chips"),
-  nextCard: $("#next-card"), tabbar: $("#tabbar"), more: $("#more"), moreActions: $("#more-actions"), moreAsks: $("#more-asks"),
+  nextCard: $("#next-card"), ncToggle: $("#nc-toggle"), chipsToggle: $("#chips-toggle"), tabbar: $("#tabbar"), more: $("#more"), moreActions: $("#more-actions"), moreAsks: $("#more-asks"),
   input: $("#input"), sendForm: $("#send-form"), sendBtn: $("#send-btn"), photoInput: $("#photo-input"),
   attach: $("#attach"), attachImg: $("#attach-img"), attachLoc: $("#attach-loc"), attachClear: $("#attach-clear"),
   panel: $("#panel"), panelTitle: $("#panel-title"), panelBody: $("#panel-body"), panelClose: $("#panel-close"),
@@ -497,6 +497,21 @@ function renderChips() {
   els.chips.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => chips[Number(b.dataset.i)][2]()));
 }
 
+// 快捷列預設收起，讓聊天區多一點空間；按「＋」展開，展開與否記在這支手機
+function showChips(show) {
+  els.chips.hidden = !show;
+  els.chipsToggle.setAttribute("aria-expanded", String(show));
+  els.chipsToggle.setAttribute("aria-label", show ? "收起快捷功能" : "展開快捷功能");
+}
+showChips(store("ta-show-chips") === true);
+els.chipsToggle.addEventListener("click", () => {
+  const show = els.chips.hidden;
+  const stick = nearBottom();
+  store("ta-show-chips", show);
+  showChips(show);
+  scrollToBottom(stick);
+});
+
 // ---------- 「更多」：傳給 AI 的動作與常用問法 ----------
 
 const MORE_ASKS = ["明天的行程和天氣？", "目前花了多少錢？大家要怎麼分？", "最近有地震或颱風嗎？會影響行程嗎？"];
@@ -670,12 +685,24 @@ function renderNextCard(state, now) {
     title = today?.title || "自由活動";
     sub = today?.detail || today?.status || "";
   } else {
-    els.nextCard.hidden = true;
+    els.nextCard.hidden = els.ncToggle.hidden = true;
     return;
   }
   els.nextCard.innerHTML = `<span class="nc-main"><span class="nc-label">${escapeHtml(label)}</span><span class="nc-title">${escapeHtml(title)}</span>${sub ? `<span class="nc-sub">${escapeHtml(sub)}</span>` : ""}</span><span class="nc-side">${svg("calendar")}行程</span>`;
-  els.nextCard.hidden = false;
+  els.ncToggle.hidden = false;
+  showNextCard(store("ta-show-next") === true);
 }
+
+// 「下一站」卡片預設收起，按標題列的「下一站」才顯示，再按一次收起
+function showNextCard(show) {
+  els.nextCard.hidden = !show;
+  els.ncToggle.setAttribute("aria-pressed", String(show));
+}
+els.ncToggle.addEventListener("click", () => {
+  const show = els.nextCard.hidden;
+  store("ta-show-next", show);
+  showNextCard(show);
+});
 els.nextCard.addEventListener("click", () => openPanel("itinerary"));
 
 function geminiUsageText(g) {
@@ -838,7 +865,7 @@ function renderPanelInner() {
             <div class="checks">${members.map((m) => `<label><input type="checkbox" name="split" value="${escapeHtml(m)}" checked /> ${escapeHtml(m)}</label>`).join("")}</div>
             <button class="btn primary-sm">記下來</button>
           </form>
-          <p class="small muted">也可以直接在聊天說「晚餐 ${t.currencySymbol || ""}3000 我付的」，或按快捷列的「收據」拍收據。</p>
+          <p class="small muted">也可以直接在聊天說「晚餐 ${t.currencySymbol || ""}3000 我付的」，或按輸入框左邊的「＋」→「收據」拍收據。</p>
         </div>
         <div class="card"><h3>明細</h3><div class="list">
           ${ex.items.slice().reverse().map((it) => `<div class="item small"><div><b>${escapeHtml(it.description)}</b><div class="muted">${String(it.date).slice(5)}｜${escapeHtml(it.category)}｜${escapeHtml(it.payer)} 付｜分給 ${it.split_among.map(escapeHtml).join("、")}</div></div>
@@ -1171,7 +1198,7 @@ function guideItems() {
       "AI 會回答距離、車程時間、大概的車資範圍（依建立旅程時查到的當地費率）。",
     ], ["從住宿叫車到市中心要多少錢？"]],
     ...(t.countryCode === "JP" ? [["🚆", "電車狀況", "出門前查有沒有延誤、停駛", [
-      "按快捷列的「更多」→「<b>電車狀況</b>」，或直接問某條線。",
+      "按輸入框左邊的「＋」→「更多」→「<b>電車狀況</b>」，或直接問某條線。",
       "查的是 Yahoo!路線 的即時運行資訊。",
     ], ["山手線現在有延誤嗎？"]]] : []),
     ["🎢", "樂園排隊", "迪士尼、環球影城等即時等待時間", [
@@ -1179,7 +1206,7 @@ function guideItems() {
       "資料來自 Queue-Times，全球有上百座樂園。",
     ], ["附近有哪些樂園可以查排隊？"]],
     ["🧾", "收據記帳", "拍收據，AI 幫你記帳", [
-      "按快捷列的「<b>收據</b>」→ 拍照或選收據照片，確認後送出。",
+      "按輸入框左邊的「＋」→「<b>收據</b>」→ 拍照或選收據照片，確認後送出。",
       "如果是別人付的，把「我付的」改成「媽媽付的」。",
       `AI 會讀出店名、金額，用${escapeHtml(t.currency || "當地貨幣")}記帳並換算台幣，按 💰 可以看誰該給誰多少。`,
     ], [`午餐 ${sym}3000，${who}付的`, "目前花了多少錢？大家要怎麼分？"]],
@@ -1192,7 +1219,7 @@ function guideItems() {
       "<b>打開過一次之後，沒網路也能看</b>。建議出發前先把每張都點開一次。",
     ], ["給我看博物館的門票"]],
     ...(hasTranslator() ? [["🌏", "翻譯", `中文 ↔ ${escapeHtml(lang())}`, [
-      "按快捷列的「<b>翻譯</b>」，或到「工具箱」→ 翻譯常用句，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。",
+      "按輸入框左邊的「＋」→「<b>翻譯</b>」，或到「工具箱」→ 翻譯常用句，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。",
       "點常用句就會念出來；📺 可以放大給司機、店員看。",
     ], []]] : []),
     ["🗺", "家人位置地圖", "看大家在哪，走散一鍵求救", [

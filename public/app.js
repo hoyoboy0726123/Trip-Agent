@@ -664,6 +664,8 @@ function setState(state) {
   els.todayTitle.textContent = t.title;
   els.dayBadge.textContent = day < 1 ? `倒數 ${1 - day} 天` : now <= t.endDate ? `Day ${day}` : "旅程結束";
   renderNextCard(state, now);
+  els.tabbar.querySelector('[data-tab="translator"]').hidden = !hasTranslator();
+  els.tabbar.querySelector('[data-tab="itinerary"]').hidden = hasTranslator();
   if (S.panel && !["settings", "tripedit", "keys"].includes(S.panel)) renderPanel();
   const usage = $("#gemini-usage");
   if (usage) usage.textContent = geminiUsageText(state.gemini);
@@ -717,7 +719,10 @@ function geminiUsageText(g) {
 const TAB_OF = { itinerary: "itinerary", expenses: "expenses", settings: "settings", tripedit: "settings", keys: "settings" };
 
 function setTab(tab) {
-  els.tabbar.querySelectorAll("button").forEach((b) => {
+  const buttons = [...els.tabbar.querySelectorAll("button")];
+  // 分頁列上沒有的頁面（例如行程）算在工具箱底下
+  if (!buttons.some((b) => b.dataset.tab === tab && !b.hidden)) tab = "hub";
+  buttons.forEach((b) => {
     if (b.dataset.tab === tab) b.setAttribute("aria-current", "page");
     else b.removeAttribute("aria-current");
   });
@@ -730,6 +735,7 @@ els.tabbar.querySelectorAll("button").forEach((b) =>
       else scrollToBottom(true);
       return;
     }
+    if (b.dataset.tab === "translator") return openTranslator();
     openPanel(b.dataset.tab);
   }),
 );
@@ -1090,11 +1096,11 @@ function renderSettingsPanel(st, b) {
 
 function toolCards() {
   return [
+    ["itinerary", "calendar", "行程", "每天的安排，可以修改"],
     ["tickets", "ticket", "票券保管箱", "門票、訂位憑證，離線可看"],
     ["map", "users", "家人位置", "看大家在哪、走散求救"],
     ["checklist", "list", "共用清單", "行李、購物、待辦"],
     ["reminders", "bell", "提醒", "時間到在群組通知"],
-    ...(hasTranslator() ? [["translator", "lang", "翻譯常用句", "念給對方聽、放大給對方看"]] : []),
     ["diary", "book", "旅遊日記", "每晚自動寫、匯出相簿"],
   ];
 }
@@ -1219,7 +1225,7 @@ function guideItems() {
       "<b>打開過一次之後，沒網路也能看</b>。建議出發前先把每張都點開一次。",
     ], ["給我看博物館的門票"]],
     ...(hasTranslator() ? [["🌏", "翻譯", `中文 ↔ ${escapeHtml(lang())}`, [
-      "按輸入框左邊的「＋」→「<b>翻譯</b>」，或到「工具箱」→ 翻譯常用句，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。",
+      "按最下方的「<b>翻譯</b>」，有常用句、即時翻譯（可語音輸入）和翻譯紀錄。",
       "點常用句就會念出來；📺 可以放大給司機、店員看。",
     ], []]] : []),
     ["🗺", "家人位置地圖", "看大家在哪，走散一鍵求救", [

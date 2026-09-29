@@ -7,7 +7,7 @@ import {
 } from "./profile";
 import { parseArgs, providerFor, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
-import { disasterAlerts, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
+import { disasterAlerts, DRAFT_TOOLS, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
 
@@ -90,6 +90,21 @@ function requiredTool(text: string, used: string[], hasPhoto: boolean, available
   return null;
 }
 
+function expenseBrief(r: Record<string, SqlStorageValue>) {
+  return { id: r.id as number, date: r.date as string, description: r.description as string, amount: r.amount as number, currency: r.currency as string, payer: r.payer as string };
+}
+
+/** 回答裡說下方有確認卡片（用來抓「沒呼叫工具卻說有卡片」） */
+function claimsCard(text: string): boolean {
+  return /(下方|下面)的?.{0,8}(卡片|內容)|按\s*\**\s*「\s*確認|［卡片|確認卡片/.test(text);
+}
+
+/** 回答結尾在問成員問題（而且沒有謊稱已經寫入） */
+function isAskingBack(text: string): boolean {
+  const t = text.trim();
+  return /[？?]/.test(t.slice(-80)) && !/已(經)?(幫你|幫您)?(記好|記下|記帳|記入|寫入|更新|修改|刪除)/.test(t);
+}
+
 function distanceMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371000, rad = (x: number) => (x * Math.PI) / 180;
   const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
@@ -148,6 +163,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, due INTEGER, message TEXT, author TEXT, created INTEGER, sent INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, note TEXT, photo_id TEXT);
       CREATE TABLE IF NOT EXISTS diaries (date TEXT PRIMARY KEY, ts INTEGER, text TEXT, photo_ids TEXT);
+    `);
+    // AI 要寫入的資料（記帳、改行程、刪除）先做成確認卡片，成員按確認才寫入
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, payload TEXT, preview TEXT, author TEXT, message_id TEXT, status TEXT DEFAULT 'pending', resolved_by TEXT, resolved_at INTEGER);
     `);
   }
 
@@ -622,6 +641,12 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         if (r?.error) return reply(false, r.error);
         break;
       }
+      case "draft_confirm":
+      case "draft_cancel": {
+        const err = this.draftResolve(Number(msg.id), user.name, msg.action === "draft_confirm");
+        if (err) return reply(false, err);
+        break;
+      }
       case "checklist_add": {
         const items = String(msg.item ?? "").split(/\n/).map((s) => s.trim()).filter(Boolean);
         if (!items.length) return reply(false, "請輸入項目");
@@ -700,6 +725,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         const cleared: string[] = [];
         if (msg.chat) {
           this.sql.exec("DELETE FROM messages");
+          this.sql.exec("DELETE FROM drafts");
           this.sql.exec("DELETE FROM photos");
           this.sql.exec("DELETE FROM locations");
           this.sql.exec("DELETE FROM translations");
@@ -837,6 +863,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   }
 
   private publicMessage(m: MessageRow) {
+    const meta = m.meta ? JSON.parse(m.meta) : null;
     return {
       id: m.id,
       ts: m.ts,
@@ -845,8 +872,96 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       text: m.text,
       photo: m.photo_id ? `/api/photo/${m.photo_id}` : null,
       location: m.lat != null && m.lon != null ? { lat: m.lat, lon: m.lon } : null,
-      meta: m.meta ? JSON.parse(m.meta) : null,
+      meta,
+      ...(meta?.drafts?.length ? { drafts: this.draftsPublic(meta.drafts) } : {}),
     };
+  }
+
+  // ================= 確認卡片（AI 要寫入的資料，成員按確認才寫） =================
+
+  /** AI 呼叫會寫入的工具時：存成卡片，回給模型的說明要它請成員核對 */
+  private propose(d: DraftInput, author: string, messageId: string, drafts: number[]) {
+    if (d.replaces) this.draftSettle(d.replaces, "superseded", author);
+    const id = this.sql
+      .exec(
+        "INSERT INTO drafts (ts, kind, payload, preview, author, message_id) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        Date.now(), d.kind, JSON.stringify(d.payload), JSON.stringify(d.preview), author, messageId,
+      )
+      .one().id as number;
+    drafts.push(id);
+    return {
+      draft_id: id,
+      status: "等待成員按確認，還沒寫入",
+      preview: d.preview.rows,
+      ...(d.warning ? { warning: d.warning } : {}),
+      note: `已產生確認卡片 #${id}，會顯示在你的回答下方。請用一兩句話說明你從照片或訊息看到什麼、準備寫入什麼，請成員核對卡片後按「${d.preview.confirm}」，有錯直接跟你說要改哪裡。${d.warning ? `一定要提醒成員：${d.warning}。` : ""}卡片上已經有換算好的金額，說明裡不要自己換算。這段說明要寫在你這次的回覆裡（之前寫的字成員看不到）。成員按確認前不可以說「已記好／已更新／已刪除」。`,
+    };
+  }
+
+  private draftsPublic(ids: number[]) {
+    const list = ids.map(Number).filter(Number.isInteger).slice(0, 20);
+    if (!list.length) return [];
+    const rows = this.sql.exec(`SELECT * FROM drafts WHERE id IN (${list.map(() => "?").join(",")})`, ...list).toArray();
+    return rows.map((r) => ({
+      id: r.id as number,
+      kind: r.kind as string,
+      status: r.status as string,
+      preview: JSON.parse(r.preview as string),
+      author: r.author as string,
+      resolved_by: (r.resolved_by as string | null) ?? null,
+    }));
+  }
+
+  /** 還在等確認的卡片才改狀態，並通知大家更新畫面 */
+  private draftSettle(id: number, status: "done" | "cancelled" | "superseded" | "failed", by: string) {
+    const n = this.sql.exec("UPDATE drafts SET status = ?, resolved_by = ?, resolved_at = ? WHERE id = ? AND status = 'pending'", status, by, Date.now(), id).rowsWritten;
+    if (n) this.broadcast({ type: "draft", draft: this.draftsPublic([id])[0] });
+    return n > 0;
+  }
+
+  /** 成員按了確認或取消；回傳錯誤訊息（成功是 null） */
+  private draftResolve(id: number, by: string, confirm: boolean): string | null {
+    const r = this.sql.exec("SELECT * FROM drafts WHERE id = ?", id).toArray()[0];
+    if (!r) return "找不到這張卡片";
+    if (r.status !== "pending") return "這張卡片已經處理過了";
+    if (!confirm) {
+      this.draftSettle(id, "cancelled", by);
+      return null;
+    }
+    const p = JSON.parse(r.payload as string);
+    let ok = true;
+    switch (r.kind) {
+      case "add_expense":
+        this.addExpense(p as ExpenseInput);
+        break;
+      case "update_itinerary":
+        this.updateItinerary(p.date, p.fields, p.author);
+        break;
+      case "delete_expense":
+        ok = this.deleteExpense(Number(p.id));
+        break;
+      case "delete_reminder":
+        ok = this.reminderDelete(Number(p.id));
+        break;
+      default:
+        ok = false;
+    }
+    this.draftSettle(id, ok ? "done" : "failed", by);
+    return ok ? null : "要刪除的資料已經不在了（可能有人先刪了，或提醒已經通知過）";
+  }
+
+  /** 給系統提示用：最近幾天的卡片與狀態（不放進對話紀錄，免得模型模仿格式、自己寫假卡片） */
+  private draftBrief(): string {
+    const status: Record<string, string> = { pending: "等待成員確認（還沒寫入）", done: "已確認並寫入", cancelled: "成員取消了", superseded: "已被新卡片取代", failed: "失效" };
+    return this.sql
+      .exec("SELECT id, preview, author, status, resolved_by FROM drafts WHERE ts > ? ORDER BY id DESC LIMIT 10", Date.now() - 3 * 86400_000)
+      .toArray()
+      .reverse()
+      .map((r) => {
+        const p = JSON.parse(r.preview as string);
+        return `- 卡片編號 ${r.id}｜${p.title}：${p.summary}｜${r.author} 提出｜${status[r.status as string] ?? r.status}${r.status === "done" ? `（${r.resolved_by}）` : ""}`;
+      })
+      .join("\n");
   }
 
   private saveLocation(name: string, loc: { lat: number; lon: number; accuracy?: number }) {
@@ -960,6 +1075,20 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     const n = this.sql.exec("DELETE FROM expenses WHERE id = ?", id).rowsWritten;
     this.broadcastState();
     return n > 0;
+  }
+
+  expenseGet(id: number) {
+    const r = this.sql.exec("SELECT * FROM expenses WHERE id = ?", id).toArray()[0];
+    return r ? expenseBrief(r) : null;
+  }
+
+  expenseFind(keyword: string) {
+    return this.sql.exec("SELECT * FROM expenses WHERE description LIKE ? ORDER BY id DESC LIMIT 8", `%${keyword}%`).toArray().map(expenseBrief);
+  }
+
+  itineraryDay(date: string) {
+    const r = this.sql.exec("SELECT * FROM itinerary WHERE date = ?", date).toArray()[0];
+    return r ? { title: (r.title as string) ?? "", detail: (r.detail as string) ?? "", status: (r.status as string) ?? "" } : null;
   }
 
   expenseSummary() {
@@ -1077,6 +1206,11 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     const n = this.sql.exec("DELETE FROM reminders WHERE id = ?", id).rowsWritten;
     this.broadcastState();
     return n > 0;
+  }
+
+  reminderGet(id: number) {
+    const r = this.sql.exec("SELECT * FROM reminders WHERE id = ? AND sent = 0", id).toArray()[0];
+    return r ? { id, time: this.localTime(r.due as number), message: r.message as string } : null;
   }
 
   // ---- 票券保管箱 ----
@@ -1425,6 +1559,7 @@ function goBack(){if(history.length>1){history.back();return}window.close();setT
       ["入境", g.entry], ["付款與小費", g.money], ["插座電壓", g.power], ["交通", g.transport], ["退稅", g.taxRefund], ["網路", g.connectivity], ["禮儀", g.etiquette], ["天氣", g.weather],
     ].filter(([, v]) => v).map(([k, v]) => `- ${k}：${String(v).replace(/\n+/g, " ")}`).join("\n");
     const hasTool = (n: string) => toolDecls(p).some((d) => d.name === n);
+    const cards = this.draftBrief();
 
     return `你是「${AI_NAME}」，一個台灣家庭到${p.country}自由行的群組裡的 AI 旅遊助理。群組裡的每位成員都看得到你的回答。
 
@@ -1451,13 +1586,14 @@ ${itin}
 
 # 長期記憶（成員偏好、決定、預訂…，#編號可用 forget 刪除）
 ${mems}
-${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}${locs ? `\n# 成員最近位置\n${locs}\n` : ""}${translations ? `\n# 最近在翻譯頁翻過的句子（成員問「剛剛跟店員說了什麼」時參考）\n${translations}\n` : ""}
+${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}${locs ? `\n# 成員最近位置\n${locs}\n` : ""}${translations ? `\n# 最近在翻譯頁翻過的句子（成員問「剛剛跟店員說了什麼」時參考）\n${translations}\n` : ""}${cards ? `\n# 最近的確認卡片（等待確認的還沒寫入；要修改就重新呼叫同一個工具，replaces 填編號）\n${cards}\n` : ""}
 # 回答規則
 - 一律使用繁體中文與台灣用語，語氣親切，適合手機閱讀：精簡、條列、重點加粗，不要長篇大論。
 - 不要用 LaTeX 或 $…$ 數學式，箭頭、乘號等直接寫 →、×、≈。
 - 訊息開頭的［名字］代表是誰說的，回答時可以稱呼對方；但你的回答本身不要用［名字］開頭。
 - 營業時間、票價、活動、交通、天氣、排隊等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
 - 工具回傳 error 代表失敗：要如實告訴成員沒有完成，不可以說已完成。記帳前確認分攤對象是否符合成員說的人數。
+- 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。
 - 提到 ${p.currency} 價格時附上約合台幣（用 convert_currency）。
 - 問路：用 plan_route 給 Google Maps 連結，必要時用 web_search 補充轉乘與票價。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
@@ -1466,13 +1602,13 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 成員要求看照片／圖片／路線圖時，一定要用 find_images（店名或景點名稱加地名；好幾個地方就放進 queries 一次查完）；圖片會自動顯示在回答下方。絕對不要自己產生圖片網址或圖片搜尋連結，並提醒是網路圖片、僅供參考。沒有要求就不要找圖片。
 - 問「我附近有什麼」：直接用 find_nearby，near 留空（系統會自動用發問者的 GPS），回答時列出實際店名、距離、步行分鐘與地圖連結；需要評價再用 web_search 補充。問「我在哪」用 get_member_locations，說出區域與最近的車站。
 - 問計程車多少錢、要多久 → taxi_fare；問地震、颱風、天氣會不會影響行程 → disaster_alerts；問樂園排隊 → theme_park_wait_times。${hasTool("train_status") ? "問電車有沒有延誤、停駛 → train_status。" : ""}
-- 收到收據照片（或說「記帳這張收據」）：讀出店名、總金額、幣別與主要品項，用 add_expense 記帳（description 寫「店名：品項」），付款人預設是發問者；若可能達退稅門檻，順便提醒。
+- 收到收據照片（或說「記帳這張收據」）：讀出店名、日期、總金額、幣別與主要品項，用 add_expense 產生記帳卡片（description 寫「店名：品項」），付款人預設是發問者。幣別要看清楚：當地收據是 ${p.currency}，台灣收據是 TWD（NT$、民國年、統一發票）；民國年要加 1911（113 年＝2024 年）。若可能達退稅門檻，順便提醒。
 - 只有成員明確說「加入／加到清單」時才用 add_checklist_items。只是說想買、要帶、問推薦，都不可以自動加入清單；只有成員提到想買或要帶東西時，才在回答最後問一句要不要加進清單，其他話題（例如記帳、問路）不要問。買到了、帶了、辦好了 → update_checklist_item；問清單 → get_checklist。
 - 要求「幾點提醒」→ create_reminder（時間用當地時間 YYYY-MM-DD HH:mm）。
 - 傳照片說要「存起來／存成票券」→ save_document；問「給我看○○的票／訂位」→ find_documents。
 - 有人傳「🆘」走散求助：先安撫，用 get_member_locations 看大家在哪，建議就近約在明顯地標或車站出口集合，提醒可找工作人員幫忙${p.emergency ? `、緊急電話 ${p.emergency}` : ""}。
-- 有人說「我付了／花了…」→ 用 add_expense 記帳；問「花多少、怎麼分」→ expense_summary。
-- 成員做了決定、說了偏好、訂了東西、改了計畫 → 主動用 remember 或 update_itinerary 記下來。只有工具呼叫成功後才能說「已記住／已更新」。
+- 有人說「我付了／花了…」→ 用 add_expense 產生記帳卡片；問「花多少、怎麼分」→ expense_summary。
+- 成員做了決定、說了偏好、訂了東西 → 主動用 remember 記下來；行程要改就用 update_itinerary 產生修改卡片。只有 remember 成功後才能說「已記住」。
 - 收到照片：辨識菜單、商品、看板、車票並翻譯說明；商品可以查價比價。
 - 安全第一：遇到緊急狀況提供當地緊急電話${p.emergency ? `（${p.emergency}）` : ""}與最近的醫院資訊（find_nearby 的 hospital）。`;
   }
@@ -1536,7 +1672,16 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const system = this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
     const images: AttachedImage[] = [];
     const toolsUsed: string[] = [];
-    const ctx = await this.toolCtx(user.name, { photoId: trigger.photo_id, attachImage: (img) => images.length < 8 && images.push(img) });
+    const drafts: number[] = [];
+    const ctx = await this.toolCtx(user.name, {
+      photoId: trigger.photo_id,
+      attachImage: (img) => images.length < 8 && images.push(img),
+      propose: (d) => this.propose(d, user.name, id, drafts),
+    });
+    // 成員像是在修改剛才還沒確認的卡片（「打錯了，是 3500」）
+    const fixing = /改成|改為|改一下|打錯|寫錯|記錯|不對|應該是|更正|修正/.test(trigger.text)
+      ? this.sql.exec("SELECT id, kind, preview FROM drafts WHERE status = 'pending' AND ts > ? ORDER BY id DESC LIMIT 1", Date.now() - 30 * 60_000).toArray()[0]
+      : undefined;
     let lastError = "";
     // 跨模型共用：前一個模型中途被限流時，下一個模型接著已完成的工具結果繼續，不會重複記帳或重複查詢
     let turns = this.buildTurns(history, trigger, image);
@@ -1549,12 +1694,15 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       const nudged = new Set<string>();
       const forced = new Set<string>();
       let emptyRetried = false;
+      let cardNudged = false;
       try {
         for (let step = 0; step < MAX_STEPS; step++) {
           const res = await provider.generate({ system, turns, tools: decls, onDelta: (delta) => this.broadcast({ type: "ai_delta", id, delta }) });
           if (!res.calls.length) {
             // 模型偶爾偷懶：嘴上說「已加入清單」「圖片在下方」卻沒呼叫工具。提醒一次，重新回答
-            const need = requiredTool(trigger.text, toolsUsed, !!trigger.photo_id, available);
+            let need = requiredTool(trigger.text, toolsUsed, !!trigger.photo_id, available);
+            // 要寫入資料的工具：AI 正在反問成員（日期不在旅遊期間、金額看不清…）就讓它問，不要蓋掉硬寫
+            if (need && DRAFT_TOOLS.has(need) && isAskingBack(res.text)) need = null;
             if (need && !nudged.has(need) && step < MAX_STEPS - 1) {
               nudged.add(need);
               this.broadcast({ type: "ai_reset", id });
@@ -1574,6 +1722,20 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
                 turns = [...turns, { role: "model", parts: [{ text: res.text || "（略）" }] }, { role: "user", parts: [{ text: note }] }];
                 continue;
               }
+            }
+            // 嘴上說「請核對下方的卡片」卻沒呼叫工具（或成員在改還沒確認的卡片）：提醒它真的去呼叫
+            if (!drafts.length && !cardNudged && (claimsCard(res.text) || fixing) && step < MAX_STEPS - 1) {
+              cardNudged = true;
+              this.broadcast({ type: "ai_reset", id });
+              const hint = fixing
+                ? `成員可能是要修改還沒確認的卡片 #${fixing.id}（${JSON.parse(fixing.preview as string).summary}）：是的話，請重新呼叫 ${fixing.kind}，所有欄位填修改後的完整內容，replaces 填 ${fixing.id}；不是的話就照原本的意思回答。`
+                : "你說下方有確認卡片，但你沒有呼叫任何工具，成員看不到卡片。記帳 → add_expense；改行程 → update_itinerary；刪帳 → delete_expense；刪提醒 → delete_reminder；修改還沒確認的卡片要填 replaces。請現在呼叫，再簡短說明。";
+              turns = [
+                ...turns,
+                { role: "model", parts: [{ text: res.text || "（略）" }] },
+                { role: "user", parts: [{ text: `（系統提醒：${hint}成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
+              ];
+              continue;
             }
             // 查完工具後偶爾一個字都不回（以為剛才那段被收回的回答已經講過了），再請它回一次
             if (!res.text.trim() && !emptyRetried && toolsUsed.length && step < MAX_STEPS - 1) {
@@ -1607,6 +1769,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
           meta: JSON.stringify({
             provider: provider.id, providerLabel: PROVIDER_LABEL[provider.id], model: provider.model, tools: [...new Set(toolsUsed)].map(toolLabel),
             ...(images.length ? { images } : {}),
+            ...(drafts.length ? { drafts } : {}),
           }),
         });
         this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
@@ -1624,7 +1787,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 
     const noOwn = !(await this.keys()).gemini;
     const row = this.insertMessage({
-      id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true }),
+      // 中途產生的確認卡片還是附上，成員照樣可以確認
+      id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true, ...(drafts.length ? { drafts } : {}) }),
       text: `抱歉，AI 暫時無法回答 🙇${noOwn ? "\n\n如果常常遇到，管理員可以到 下方「設定」→ API 金鑰填入自己的 Gemini 金鑰。" : ""}\n\n\`${lastError.slice(0, 200)}\``,
     });
     this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });

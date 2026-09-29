@@ -40,6 +40,7 @@ const ICONS = {
   book: '<path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>',
   bookmark: '<path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/>',
   help: '<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3M12 17h.01"/>',
+  wallet: '<path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/>',
   chev: '<path d="m9 18 6-6-6-6"/>',
 };
 const svg = (name, cls = "") => `<svg viewBox="0 0 24 24" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>${ICONS[name] ?? ""}</svg>`;
@@ -670,16 +671,35 @@ function receiptFlow() {
   els.photoInput.click();
 }
 
-/** 輸入框上方的快捷列：最常用的 4 個＋「更多」 */
+/** 輸入框上方的快捷列（左右滑動）：分隔線前是直接問 AI 的常用問題，後面是打開各個工具頁 */
 function renderChips() {
+  const t = S.trip || {};
+  const cur = t.currency || "";
   const chips = [
     ["sun", "今天", () => ask("今天的行程和天氣？")],
-    ["pin", "附近", () => ask("我附近有什麼好吃的？", true)],
-    ["receipt", "收據", receiptFlow],
-    ...(hasTranslator() ? [["lang", "翻譯", openTranslator]] : []),
+    ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
+    ["receipt", "收據記帳", receiptFlow],
+    ...(t.countryCode === "JP" ? [["train", "電車狀況", () => ask("我們附近的電車現在有延誤或停駛嗎？")]] : []),
+    ...(cur && cur !== "TWD" ? [["exchange", "匯率", () => ask(`現在 ${cur} 匯率多少？1000 ${cur} 等於多少台幣？`)]] : []),
+    ["clock", "樂園排隊", () => ask("附近樂園現在哪些設施排隊最少？")],
+    ["wallet", "帳目", () => ask("目前花了多少錢？大家要怎麼分？")],
+    ["home", "回住宿", () => ask("我要怎麼回住宿？", true)],
+    ["pin", "附上位置", () => attachLocation(false)],
+    null,
+    ["calendar", "行程", () => openPanel("itinerary")],
+    ["compass", "旅遊指南", () => openPanel("travel")],
+    ["ticket", "票券", () => openPanel("tickets")],
+    ["users", "家人位置", () => openPanel("map")],
+    ["list", "清單", () => openPanel("checklist")],
+    ["bell", "提醒", () => openPanel("reminders")],
+    ["book", "旅遊日記", () => openPanel("diary")],
+    ["bookmark", "長期記憶", () => openPanel("memories")],
+    ["help", "使用說明", () => openPanel("guide")],
     ["plus", "更多", openMore],
   ];
-  els.chips.innerHTML = chips.map(([icon, label], i) => `<button type="button" data-i="${i}">${svg(icon)}${label}</button>`).join("");
+  els.chips.innerHTML = chips
+    .map((c, i) => (c ? `<button type="button" data-i="${i}">${svg(c[0])}${c[1]}</button>` : `<span class="chip-sep" aria-hidden="true"></span>`))
+    .join("");
   els.chips.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => chips[Number(b.dataset.i)][2]()));
 }
 
@@ -1390,7 +1410,7 @@ function guideItems() {
       "AI 會回答距離、車程時間、大概的車資範圍（依建立旅程時查到的當地費率）。",
     ], ["從住宿叫車到市中心要多少錢？"]],
     ...(t.countryCode === "JP" ? [["🚆", "電車狀況", "出門前查有沒有延誤、停駛", [
-      "按輸入框左邊的「＋」→「更多」→「<b>電車狀況</b>」，或直接問某條線。",
+      "按輸入框左邊的「＋」→「<b>電車狀況</b>」，或直接問某條線。",
       "查的是 Yahoo!路線 的即時運行資訊。",
     ], ["山手線現在有延誤嗎？"]]] : []),
     ["🎢", "樂園排隊", "迪士尼、環球影城等即時等待時間", [

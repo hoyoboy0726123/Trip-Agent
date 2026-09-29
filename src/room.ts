@@ -1448,11 +1448,14 @@ function goBack(){if(history.length>1){history.back();return}window.close();setT
     return now < this.workersBlocked.until;
   }
 
-  private async chain(): Promise<ProviderId[]> {
+  /** vision：有照片要辨識時，旅程自己的 Gemini 也排到 Workers AI 前面（看圖比 Gemma 準很多），額度滿了才退回 Gemma */
+  private async chain(vision = false): Promise<ProviderId[]> {
     const order: ProviderId[] = [];
+    const own = !!(await this.keys()).gemini;
     if (this.env.GEMINI_API_KEY) order.push("gemini");
+    if (vision && own) order.push("gemini-own");
     if (!(await this.workersAiBlocked())) order.push("workers-ai");
-    if ((await this.keys()).gemini) order.push("gemini-own");
+    if (!vision && own) order.push("gemini-own");
     return order;
   }
 
@@ -1648,7 +1651,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
   private async runAgent(trigger: MessageRow, user: Attachment) {
     const id = newId();
     const p = this.p();
-    const order = await this.chain();
+    const order = await this.chain(!!trigger.photo_id);
     const decls = toolDecls(p);
     const available = new Set(decls.map((d) => d.name));
 

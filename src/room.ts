@@ -8,7 +8,7 @@ import {
 import { parseArgs, providerFor, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
 import { disasterAlerts, DRAFT_TOOLS, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
-import { fixMapLinks } from "./maplinks";
+import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { renderDiaryPage } from "./diary-page";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -1357,7 +1357,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
 
   /** 以 AI 身分在群組發一則訊息（提醒、早報、日記、警報共用） */
   private postAiMessage(text: string, meta: Record<string, unknown>) {
-    const row = this.insertMessage({ author: AI_NAME, role: "assistant", text: fixMapLinks(text), photo_id: null, lat: null, lon: null, meta: JSON.stringify(meta) });
+    const row = this.insertMessage({ author: AI_NAME, role: "assistant", text: fixMapLinks(text, this.mapFix()), photo_id: null, lat: null, lon: null, meta: JSON.stringify(meta) });
     this.broadcast({ type: "message", message: this.publicMessage(row) });
     return row;
   }
@@ -1734,6 +1734,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。
 - 提到 ${p.currency} 價格時附上約合台幣（用 convert_currency）。
 - 問路：用 plan_route 給 Google Maps 連結，必要時用 web_search 補充轉乘與票價。
+- 住宿的位置寫成 [📍住宿](map)（系統會換成正確位置）；要帶路回住宿就用 plan_route，destination 填「住宿」。不要自己用住宿名稱或地址搜尋，常會跑到別的地方。
 - 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結（地點名稱用日文或英文的正式名稱，可加地區，例如 [📍ドン・キホーテ 池袋駅西口店](map)）。不要自己寫 Google 地圖網址，絕對不要編 maps.app.goo.gl 短網址，也不要用自己記得的地址或座標當連結（記錯一個字就會指到別的地方）。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
 - 每次有人問「附近」都要重新呼叫工具查詢，不可以沿用之前的回答。
@@ -1750,6 +1751,22 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 成員做了決定、說了偏好、訂了東西 → 主動用 remember 記下來；行程要改就用 update_itinerary 產生修改卡片。只有 remember 成功後才能說「已記住」。
 - 收到照片：辨識菜單、商品、看板、車票並翻譯說明；商品可以查價比價。
 - 安全第一：遇到緊急狀況提供當地緊急電話${p.emergency ? `（${p.emergency}）` : ""}與最近的醫院資訊（find_nearby 的 hospital）。`;
+  }
+
+  /** 地圖連結修正：提到住宿的連結一律換成正確位置（模型用住宿名稱搜尋常跑到別處、地址會抄錯字） */
+  private mapFix(): MapFixOptions {
+    const a = this.p().accommodation;
+    const coords = a.lat != null && a.lon != null ? `${a.lat},${a.lon}` : "";
+    const dest = coords || a.address || a.name;
+    if (!dest) return {};
+    const names = [a.name, a.address].map((s) => (s || "").trim()).filter((s) => s.length >= 3).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    return {
+      home: {
+        names: names.length ? new RegExp(names.join("|"), "i") : null,
+        search: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(dest)}`,
+        dest,
+      },
+    };
   }
 
   /** 這次的問題是在回覆哪一則訊息：給模型完整原文（可能早就超出最近的對話紀錄） */
@@ -1913,7 +1930,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
         }
         if (!finalText.trim()) finalText = images.length ? "幫你找到這些圖片 👇（網路圖片，僅供參考）" : "嗯…我沒有想到好的回答，可以換個方式問我嗎？";
         const row = this.insertMessage({
-          id, author: AI_NAME, role: "assistant", text: fixMapLinks(stripSpeakerTag(finalText)), photo_id: null, lat: null, lon: null,
+          id, author: AI_NAME, role: "assistant", text: fixMapLinks(stripSpeakerTag(finalText), this.mapFix()), photo_id: null, lat: null, lon: null,
           meta: JSON.stringify({
             provider: provider.id, providerLabel: PROVIDER_LABEL[provider.id], model: provider.model, tools: [...new Set(toolsUsed)].map(toolLabel),
             ...(images.length ? { images } : {}),

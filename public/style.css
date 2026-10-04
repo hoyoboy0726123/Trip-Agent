@@ -362,6 +362,8 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .btn.primary-sm { background: var(--red); color: #fff; border-color: var(--red); }
 .form { display: grid; gap: 8px; }
 .form input, .form select, .form textarea { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 16px; }
+/* 勾選框不能套用上面的滿版寬度，不然會把旁邊的文字擠成一字一行 */
+.form input[type="checkbox"], .form input[type="radio"] { width: auto; flex: none; padding: 0; }
 .checks { display: flex; flex-wrap: wrap; gap: 10px; font-size: 14px; }
 .big { font-size: 26px; font-weight: 800; }
 .list { display: grid; gap: 6px; }

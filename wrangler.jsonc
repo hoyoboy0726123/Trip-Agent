@@ -27,5 +27,6 @@
     "GEMINI_RPD": "500",
     "WORKERS_AI_MODEL": "@cf/google/gemma-4-26b-a4b-it"
   },
+  "version_metadata": { "binding": "CF_VERSION" },
   "observability": { "enabled": true }
 }

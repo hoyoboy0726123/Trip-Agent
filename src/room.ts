@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { decryptText, encryptText, hashPassword, maskKey, verifyPassword } from "./auth";
+import { decryptText, encryptText, hashPassword, maskKey, safeEqual, verifyPassword } from "./auth";
 import { INIT_STEPS, researchTrip } from "./init";
 import {
   BASE_CHECKLIST, EMPTY_GUIDE, diffFromTaiwan, flagEmoji, localDateTime, localToUtc, travelersText, tripDays, tripLine, validTimezone, zoned,
@@ -9,6 +9,7 @@ import { parseArgs, providerFor, WorkersAiQuotaError, type GeminiGate } from "./
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
 import { disasterAlerts, DRAFT_TOOLS, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks } from "./maplinks";
+import { renderDiaryPage } from "./diary-page";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
 
@@ -95,6 +96,11 @@ function expenseBrief(r: Record<string, SqlStorageValue>) {
   return { id: r.id as number, date: r.date as string, description: r.description as string, amount: r.amount as number, currency: r.currency as string, payer: r.payer as string };
 }
 
+/** 分享連結用的隨機碼（24 個網址安全字元，猜不到） */
+function randomToken(): string {
+  return btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(18)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 /** 回答裡說下方有確認卡片（用來抓「沒呼叫工具卻說有卡片」） */
 function claimsCard(text: string): boolean {
   return /(下方|下面)的?.{0,8}(卡片|內容)|按\s*\**\s*「\s*確認|［卡片|確認卡片/.test(text);
@@ -169,6 +175,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, payload TEXT, preview TEXT, author TEXT, message_id TEXT, status TEXT DEFAULT 'pending', resolved_by TEXT, resolved_at INTEGER);
     `);
+    // 日記加上每天的標題
+    if (!this.sql.exec("PRAGMA table_info(diaries)").toArray().some((c) => c.name === "title")) this.sql.exec("ALTER TABLE diaries ADD COLUMN title TEXT");
   }
 
   // ================= 設定與旅程資料 =================
@@ -226,6 +234,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       autoBrief: this.setting("auto_brief", "1") === "1",
       autoDiary: this.setting("auto_diary", "1") === "1",
       autoAlerts: this.setting("auto_alerts", "1") === "1",
+      share: this.setting("share_token") ? `/share/${this.roomId()}/${this.setting("share_token")}` : null, // 日記分享連結
       tavily: this.setting("key_tavily_mask"),
       gemini: this.setting("key_gemini_mask"),
       ownerGemini: !!this.env.GEMINI_API_KEY,
@@ -341,10 +350,13 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       ver: Number(req.headers.get("x-user-ver") ?? 0),
     };
     if (url.pathname === "/login") return this.login(req);
+    // 日記分享連結：不用登入，要在登入檢查之前處理
+    const shared = url.pathname.match(/^\/share\/([\w-]+)(?:\/photo\/([\w-]+))?$/);
+    if (shared) return this.shared(shared[1], shared[2], req, url);
     // 管理員改過密碼：舊的登入一律失效
     if (user.ver !== Number(this.setting("auth_version", "1"))) return Response.json({ ok: false, error: "請重新登入" }, { status: 401 });
     if (url.pathname === "/me") return Response.json({ ok: true });
-    if (url.pathname === "/album") return this.album();
+    if (url.pathname === "/album") return this.album("member", req, url);
 
     if (url.pathname === "/ws") {
       const pair = new WebSocketPair();
@@ -540,7 +552,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   private async handleAction(ws: WebSocket, user: Attachment, msg: any) {
     const reply = (ok: boolean, error?: string) => this.send(ws, { type: "action_result", ok, error, action: msg.action });
     const p = this.p();
-    const adminOnly = ["activate", "update_profile", "rerun_init", "update_keys", "update_passwords", "delete_trip", "settings", "reset", "brief_now", "diary_now"];
+    const adminOnly = ["activate", "update_profile", "rerun_init", "update_keys", "update_passwords", "delete_trip", "settings", "reset", "brief_now", "diary_now", "diary_rewrite", "share_on", "share_off"];
     if (adminOnly.includes(msg.action) && !user.admin) return reply(false, "只有管理員可以使用");
     // 還沒啟用的旅程只能做確認與設定
     if (p.status !== "active" && !["activate", "update_profile", "rerun_init", "update_keys", "delete_trip"].includes(msg.action)) return reply(false, "旅程還在準備中");
@@ -683,6 +695,18 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         break;
       case "diary_now":
         await this.writeDiary(this.today());
+        break;
+      case "diary_rewrite": {
+        const date = String(msg.date ?? "");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !this.sql.exec("SELECT 1 FROM diaries WHERE date = ?", date).toArray().length) return reply(false, "找不到這天的日記");
+        await this.writeDiary(date, false);
+        break;
+      }
+      // 日記分享連結：開啟後拿到連結的人不用登入就能看日記與照片，關閉後舊連結立刻失效
+      case "share_on":
+      case "share_off":
+        this.setSetting("share_token", msg.action === "share_on" ? this.setting("share_token") || randomToken() : "");
+        this.broadcast({ type: "settings", settings: this.settings() });
         break;
       case "translate": {
         const text = String(msg.text ?? "").trim().slice(0, 1000);
@@ -1313,31 +1337,52 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
   }
 
-  async writeDiary(date: string) {
+  /** announce＝在群組貼出來（每晚自動寫）；管理員重寫舊日記時不貼 */
+  async writeDiary(date: string, announce = true) {
     const p = this.p();
-    this.setSetting("diary_sent", date);
+    if (announce) this.setSetting("diary_sent", date);
     const start = localToUtc(date, "00:00", p.timezone) ?? Date.parse(date + "T00:00:00Z");
     const msgs = this.sql.exec<MessageRow>("SELECT * FROM messages WHERE ts >= ? AND ts < ? ORDER BY ts", start, start + 86400_000).toArray();
-    const photos = msgs.filter((m) => m.photo_id && m.role === "user").map((m) => m.photo_id as string).slice(0, 8);
-    const spent = this.sql.exec("SELECT COALESCE(SUM(amount_local), 0) AS v FROM expenses WHERE date = ?", date).one().v as number;
+    const photos = msgs.filter((m) => m.photo_id && m.role === "user").map((m) => m.photo_id as string).slice(0, 12);
+    // 出發前預付的機票、住宿、門票（台幣大額）也可能記在出發日，不能當成當天花費；只拿當天買的東西當寫作素材
+    const bought = this.sql
+      .exec("SELECT description FROM expenses WHERE date = ? AND currency != 'TWD' AND amount_twd < 6000 ORDER BY id", date)
+      .toArray()
+      .map((r) => String(r.description))
+      .slice(0, 15);
     const today = this.itinerary().find((d) => d.date === date);
     const transcript = msgs
       .filter((m) => m.role !== "system" && (m.meta ? !JSON.parse(m.meta).kind : true))
       .map((m) => `${m.role === "assistant" ? AI_NAME : m.author}：${m.text.slice(0, 200)}${m.photo_id ? "（照片）" : ""}`)
       .join("\n")
       .slice(-6000);
-    const prompt = `請用今天的群組對話，幫這個台灣家庭寫一篇「📔 旅遊日記」的內文（標題、日期系統會加，你不要再寫），繁體中文，溫馨有趣、像家人一起回憶，300–400 字。
-寫出今天去了哪裡、吃了什麼、有趣的時刻、印象深刻的事；不要編造對話裡沒有的事，資料少就寫短一點。
-地點：${p.country}${p.city}；日期：${date}；行程：${today?.title || "自由活動"}；今天花費約 ${p.currencySymbol}${Math.round(spent).toLocaleString()}；照片 ${photos.length} 張
+    const prompt = `請用今天的群組對話，幫這個台灣家庭寫一篇旅遊日記，繁體中文，溫馨有趣、像家人一起回憶。
+格式：第一行只寫標題（14 字以內、生動有畫面，不要加符號、引號或「標題：」），空一行，接著是內文 3–5 段、共 350–500 字，段落之間空一行。
+寫出今天去了哪裡、吃了什麼、買了什麼、有趣的時刻、印象深刻的事；不要編造對話裡沒有的事，資料少就寫短一點；不要寫花了多少錢。
+地點：${p.country}${p.city}；日期：${date}；行程：${today?.title || "自由活動"}；照片 ${photos.length} 張
+今天買的東西：${bought.join("、") || "（沒有記帳）"}
 對話：
 ${transcript || "（今天群組沒什麼對話）"}`;
-    const text = await this.generateText("你是幫家庭寫旅遊日記的溫暖作家，只根據提供的資料寫。", prompt, false, 1);
+    const raw = (await this.generateText("你是幫家庭寫旅遊日記的溫暖作家，只根據提供的資料寫。", prompt, false, 1)).trim();
+    const [first = "", ...rest] = raw.split("\n");
+    let title = first.replace(/^#+\s*|^標題[:：]\s*|\*\*|[「」『』"“”]/g, "").trim();
+    let text = rest.join("\n").trim();
+    // 模型沒照格式（第一行就是內文）：整段當內文，標題用當天行程
+    if (!text || title.length > 24) {
+      text = raw;
+      title = today?.title ? String(today.title) : "旅途中的一天";
+    }
     this.sql.exec(
-      "INSERT INTO diaries (date, ts, text, photo_ids) VALUES (?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, text = excluded.text, photo_ids = excluded.photo_ids",
-      date, Date.now(), text, JSON.stringify(photos),
+      "INSERT INTO diaries (date, ts, title, text, photo_ids) VALUES (?, ?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, title = excluded.title, text = excluded.text, photo_ids = excluded.photo_ids",
+      date, Date.now(), title, text, JSON.stringify(photos),
     );
-    const images: AttachedImage[] = photos.map((id) => ({ src: `/api/photo/${id}`, caption: "", source: "今天的照片" }));
-    this.postAiMessage(`📔 **${date.slice(5).replace("-", "/")} 旅遊日記**\n\n${text}\n\n（下方「工具箱」→ 旅遊日記 可以看全部、匯出相簿）`, { kind: "diary", images });
+    if (announce) {
+      const images: AttachedImage[] = photos.slice(0, 8).map((id) => ({ src: `/api/photo/${id}`, caption: "", source: "今天的照片" }));
+      this.postAiMessage(
+        `📔 **${date.slice(5).replace("-", "/")} 旅遊日記｜${title}**\n\n${text}\n\n（下方「工具箱」→ 旅遊日記：看圖文版、下載 PDF 或分享給親友）`,
+        { kind: "diary", images },
+      );
+    }
     this.broadcastState();
   }
 
@@ -1374,35 +1419,61 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     if (notes.length) this.postAiMessage(`⚠️ **警報通知**\n\n${notes.join("\n\n")}${p.emergency ? `\n\n緊急電話：${p.emergency}` : ""}`, { kind: "alert" });
   }
 
-  /** 旅遊相簿：日記＋照片，可以用瀏覽器「列印 → 存成 PDF」 */
-  private album(): Response {
+  /** 旅遊日記網頁（成員版／分享版）：封面＋每天一章，可以列印成 PDF */
+  private album(mode: "member" | "share", req: Request, url: URL): Response {
     const p = this.p();
-    const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-    const diaries = this.sql.exec("SELECT * FROM diaries ORDER BY date").toArray();
-    const body = diaries.length
-      ? diaries
-          .map((d) => {
-            const photos: string[] = JSON.parse((d.photo_ids as string) || "[]");
-            return `<section><h2>${esc(String(d.date).slice(5).replace("-", "/"))}</h2>
-              <p>${esc(d.text).replace(/\n/g, "<br>")}</p>
-              <div class="photos">${photos.map((x) => `<img src="/api/photo/${esc(x)}" loading="lazy">`).join("")}</div></section>`;
-          })
-          .join("")
-      : "<p>還沒有日記。旅途中每晚 22:00（當地時間）會自動寫一篇。</p>";
-    const html = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${esc(p.title)} 相簿</title><style>
-body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;max-width:760px;margin:0 auto;padding:24px 16px;color:#222;line-height:1.7}
-h1{color:#1d4ed8}section{page-break-inside:avoid;margin-bottom:32px;border-top:2px solid #eee;padding-top:12px}
-.photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px}.photos img{width:100%;border-radius:10px}
-.bar{position:sticky;top:0;background:#fff;padding:8px 0;display:flex;gap:8px}@media print{.bar{display:none}}
-.bar button{flex:1;padding:10px;font-size:15px;border:1px solid #ddd;border-radius:10px;background:#f7f7f7;color:#222}
-</style></head><body><div class="bar"><button onclick="goBack()">← 回聊天室</button><button onclick="print()">🖨 列印／存成 PDF</button></div>
-<script>
-// 主畫面 App 模式下相簿會在同一個視窗打開、沒有返回鍵；瀏覽器另開分頁時則直接關掉分頁
-function goBack(){if(history.length>1){history.back();return}window.close();setTimeout(function(){location.href="/t/${esc(this.roomId())}"},300)}
-</script>
-<h1>${flagEmoji(p.countryCode)} ${esc(p.title)}</h1><p>${esc(p.startDate)} – ${esc(p.endDate)}</p>${body}</body></html>`;
-    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    const origin = req.headers.get("x-origin") ?? "";
+    const token = this.setting("share_token");
+    const sharePath = `/share/${this.roomId()}/${token}`;
+    const photoBase = mode === "share" ? `${sharePath}/photo/` : "/api/photo/";
+    const plan = new Map(this.itinerary().map((d) => [String(d.date), String(d.title ?? "")]));
+    const start = Date.parse(p.startDate + "T00:00:00Z");
+    const days = this.sql
+      .exec("SELECT * FROM diaries ORDER BY date")
+      .toArray()
+      .map((d) => {
+        const date = String(d.date);
+        return {
+          date,
+          dayNo: Math.floor((Date.parse(date + "T00:00:00Z") - start) / 86400_000) + 1,
+          title: String(d.title || plan.get(date) || "旅途中的一天"),
+          plan: plan.get(date) ?? "",
+          text: String(d.text ?? ""),
+          photos: (JSON.parse((d.photo_ids as string) || "[]") as string[]).map((id) => photoBase + id),
+        };
+      });
+    const html = renderDiaryPage({
+      tripTitle: p.title,
+      dates: `${p.startDate.replaceAll("-", "/")} – ${p.endDate.slice(5).replace("-", "/")}`,
+      travelers: p.travelers.map((t) => t.name).join("、"),
+      accent: "#1d4ed8",
+      days,
+      mode,
+      shareUrl: token ? origin + sharePath : null,
+      origin,
+      autoPrint: url.searchParams.get("print") === "1",
+      homeUrl: `/t/${this.roomId()}`,
+    });
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex" } });
+  }
+
+  /** 分享連結：分享碼對了才給看；照片只給日記裡用到的那幾張 */
+  private shared(token: string, photoId: string | undefined, req: Request, url: URL): Response {
+    const saved = this.setting("share_token");
+    if (!saved || !safeEqual(token, saved)) {
+      return new Response(
+        `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>連結已失效</title><body style="font-family:sans-serif;text-align:center;padding:60px 20px;color:#555">這個日記分享連結已經關閉或不存在 🙏</body>`,
+        { status: 404, headers: { "content-type": "text/html; charset=utf-8", "x-robots-tag": "noindex" } },
+      );
+    }
+    if (!photoId) return this.album("share", req, url);
+    const inDiary = this.sql
+      .exec("SELECT photo_ids FROM diaries")
+      .toArray()
+      .some((d) => (JSON.parse((d.photo_ids as string) || "[]") as string[]).includes(photoId));
+    const row = inDiary ? this.sql.exec("SELECT mime, data FROM photos WHERE id = ?", photoId).toArray()[0] : undefined;
+    if (!row) return new Response("Not found", { status: 404 });
+    return new Response(row.data as ArrayBuffer, { headers: { "content-type": row.mime as string, "cache-control": "public, max-age=86400", "x-robots-tag": "noindex" } });
   }
 
   // ================= 畫面上的狀態 =================
@@ -1428,7 +1499,7 @@ function goBack(){if(history.length>1){history.back();return}window.close();setT
       checklist: this.checklistGet(),
       reminders: this.reminderList(),
       documents: this.documentFind().map((d) => ({ id: d.id, title: d.title, note: d.note, author: d.author, ts: d.ts, photo: `/api/photo/${d.photo_id}` })),
-      diaries: this.sql.exec("SELECT date, ts, text, photo_ids FROM diaries ORDER BY date DESC").toArray(),
+      diaries: this.sql.exec("SELECT date, ts, title, text, photo_ids FROM diaries ORDER BY date DESC").toArray(),
       locations: this.memberLocation(),
       gemini: this.ownLimiter.usage(),
     };

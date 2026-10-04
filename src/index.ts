@@ -172,6 +172,13 @@ export default {
       return json({ ok: true }, { headers: { "set-cookie": clearSessionCookie() } });
     }
 
+    // ---------- 旅遊日記分享連結：不用登入，看不看得到由那個旅程的分享碼決定（管理員可隨時關閉） ----------
+    const share = path.match(/^\/share\/([a-z0-9]+)\/([\w-]+(?:\/photo\/[\w-]+)?)$/);
+    if (share && req.method === "GET") {
+      if (!ROOM_ID.test(share[1])) return new Response("Not found", { status: 404 });
+      return roomStub(env, share[1]).fetch(new Request(`https://room/share/${share[2]}${url.search}`, { headers: { "x-origin": url.origin } }));
+    }
+
     // ---------- 要登入（依 cookie 裡的旅程轉給那個旅程房間） ----------
     if (path.startsWith("/api/") || path === "/ws") {
       const user = await readSession(req, env);
@@ -191,7 +198,11 @@ export default {
         return json({ ok: true, user: { room: user.room, name: user.name, admin: user.admin } });
       }
 
-      if (path === "/api/album" && req.method === "GET") return room.fetch(new Request("https://room/album", { headers }));
+      // 旅遊日記網頁（日記＋照片），可列印成 PDF；?print=1 打開就直接列印
+      if (path === "/api/album" && req.method === "GET") {
+        headers.set("x-origin", url.origin);
+        return room.fetch(new Request("https://room/album" + url.search, { headers }));
+      }
 
       // 網路圖片轉送：避免原網站擋外連；網址由 find_images 簽章，不能當成公開代理使用
       if (path === "/api/img" && req.method === "GET") {

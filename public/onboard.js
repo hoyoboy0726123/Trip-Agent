@@ -58,7 +58,7 @@ function renderPersonalSetup() {
   const root = showScreen(`
     <form id="ps-form" class="card form" novalidate>
       <div class="center"><div class="hero-logo">🙋</div><h2>建立個人助理</h2>
-        <p class="small muted">只有你一個人用：會記得你說過的事、幫你設提醒、管待辦和購物清單、收好照片與文件。<br>AI 只用 Cloudflare Workers AI，不會送到 Gemini。</p></div>
+        <p class="small muted">只有你一個人用：會記得你說過的事、幫你設提醒、管待辦和購物清單、收好照片與文件。</p></div>
       ${W.invite ? "" : `<label class="field">邀請碼<input id="ps-invite" autocomplete="off" required /></label>`}
       <label class="field">你的稱呼<input id="ps-name" maxlength="16" placeholder="例如：爸爸、小美" autocomplete="nickname" required /></label>
       <label class="field">你住的地方（選填，天氣和「附近」會用到）

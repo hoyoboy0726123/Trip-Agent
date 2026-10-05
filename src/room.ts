@@ -352,7 +352,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     return { ok: true };
   }
 
-  /** 個人助理：只有本人，建好就能用（沒有 AI 研究目的地的初始化），AI 只用 Workers AI */
+  /** 個人助理：只有本人，建好就能用（沒有 AI 研究目的地的初始化） */
   async setupPersonal(input: PersonalSetupInput): Promise<{ ok: boolean; error?: string; title?: string }> {
     if (this.profile()) return { ok: false, error: "這個空間已經建立過了" };
     const tz = validTimezone(input.timezone) ? input.timezone : "Asia/Taipei";
@@ -384,7 +384,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         `- **清單**：「把牛奶加到購物清單」「待辦有哪些？」\n` +
         `- **查資料**：天氣、附近美食、怎麼去、上網搜尋${input.tavilyKey ? "" : "（要先到 設定 → API 金鑰 填 Tavily）"}\n` +
         `- **保管箱**：照片、票券、文件傳給我說「存起來」\n\n` +
-        `🔒 這個空間的 AI 只用 Cloudflare Workers AI，不會把你的資料送到 Gemini。`,
+        `🔒 這裡的對話只有你看得到。`,
       { kind: "welcome" },
     );
     await this.ctx.storage.setAlarm(Date.now() + 60_000);
@@ -1679,7 +1679,6 @@ score：當旅遊日記插圖的價值，大部分照片是 2–4 分：
 
   /** 日記：長文又要照格式，先用比較會寫的模型（一天一篇，額度跟聊天分開；擁有者金鑰→旅程自己的金鑰），不行再用一般的模型鏈 */
   private async generateLong(system: string, prompt: string): Promise<string> {
-    if (this.isPersonal()) return this.generateText(system, prompt, false, 1, 4096);
     const writer = this.env.GEMINI_WRITER_MODEL;
     const keys = [this.env.GEMINI_API_KEY ?? "", (await this.keys()).gemini ?? ""].filter(Boolean);
     for (const [i, key] of keys.entries()) {
@@ -1963,8 +1962,6 @@ ${transcript || "（今天群組沒什麼對話）"}`;
 
   /** vision：有照片要辨識時，旅程自己的 Gemini 也排到 Workers AI 前面（看圖比 Gemma 準很多），額度滿了才退回 Gemma */
   private async chain(vision = false): Promise<ProviderId[]> {
-    // 個人助理不送 Gemini（免費層的內容可能被人工審閱），只用 Workers AI
-    if (this.isPersonal()) return (await this.workersAiBlocked()) ? [] : ["workers-ai"];
     const order: ProviderId[] = [];
     const own = !!(await this.keys()).gemini;
     if (this.env.GEMINI_API_KEY) order.push("gemini");

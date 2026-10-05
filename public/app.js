@@ -1346,28 +1346,13 @@ function renderPanelInner() {
     case "keys": {
       els.panelTitle.textContent = "🔑 API 金鑰";
       const s = S.settings;
-      if (isPersonal()) {
-        b.innerHTML = `
-        <div class="card small"><h3>AI</h3>個人助理只用 Cloudflare Workers AI（${escapeHtml(s.workersModel || "")}），不會把你的資料送到 Gemini。</div>
-        <div class="card"><h3>🔍 Tavily 搜尋金鑰</h3>
-          <div class="small muted">目前：${escapeHtml(s.tavily || "未設定")}。到 <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a> 免費申請，AI 才能上網查資料。</div>
-          <form class="row" id="k-tavily"><input name="k" placeholder="tvly-…" autocomplete="off" style="flex:1" /><button class="btn primary-sm">更新</button></form>
-        </div>
-        <p class="small muted">🔐 金鑰加密保存，只有伺服器用得到，畫面上看不到完整內容。</p>`;
-        $("#k-tavily", b).addEventListener("submit", (e) => {
-          e.preventDefault();
-          const k = e.target.k.value.trim();
-          if (k) action({ action: "update_keys", tavily: k });
-        });
-        break;
-      }
       b.innerHTML = `
         <div class="card small">
           <h3>AI 使用順序</h3>
           <ol class="steps">
             ${s.ownerGemini ? "<li>網站提供的 Gemini 免費額度</li>" : ""}
             <li>網站提供的 Workers AI 免費額度（每天台灣時間早上 8 點重置）</li>
-            <li>這個旅程自己的 Gemini 金鑰：${s.gemini ? `✅ ${escapeHtml(s.gemini)}` : "❌ 未設定"}</li>
+            <li>這個${isPersonal() ? "空間" : "旅程"}自己的 Gemini 金鑰：${s.gemini ? `✅ ${escapeHtml(s.gemini)}` : "❌ 未設定"}</li>
           </ol>
           ${s.gemini ? `<div class="muted">自己的 Gemini 用量：<span id="gemini-usage">${escapeHtml(geminiUsageText(S.state?.gemini))}</span></div>` : ""}
         </div>
@@ -1413,10 +1398,10 @@ function renderPersonalSettings(st, b) {
       <input type="checkbox" id="autoloc" ${auto ? "checked" : ""} /></label></div>
     <div class="card small">
       <div>📍 ${escapeHtml(t.city || "未設定住的地方")}｜${escapeHtml(t.timezone)}</div>
-      <div>🤖 AI：Cloudflare Workers AI（${escapeHtml(s.workersModel || "")}），不使用 Gemini</div>
+      <div>🤖 AI：Gemini 優先，額度用完改用 Workers AI</div>
       <div>🔍 網路搜尋：${s.tavily ? "✅ Tavily" : "⚠️ 未設定（AI 不能上網查資料）"}</div>
     </div>
-    <div class="card"><div class="stack"><button class="btn" data-go="keys">🔑 網路搜尋金鑰</button></div></div>
+    <div class="card"><div class="stack"><button class="btn" data-go="keys">🔑 API 金鑰</button></div></div>
     <div class="card"><h3>🔒 更改密碼</h3>
       <form class="form" id="pw-form">
         <input name="admin" type="password" placeholder="新密碼（至少 6 個字）" autocomplete="new-password" />

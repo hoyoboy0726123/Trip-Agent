@@ -14,6 +14,10 @@ export interface RoomApi {
   /** 個人助理知識庫 */
   noteSave(n: { title: string; summary: string; content?: string; url?: string; tags?: string[]; thumb?: string }, author: string): unknown;
   noteSearch(keyword: string): unknown;
+  /** 行事曆 */
+  eventList(from: string, to: string): unknown[];
+  eventGet(id: number): (EventInput & { id: number }) | null;
+  eventFind(keyword: string): (EventInput & { id: number })[];
   /** 個人帳本：某個月的花費、分類、預算 */
   ledger(month?: string): unknown;
   deleteMemory(id: number): boolean;
@@ -86,8 +90,19 @@ export interface ToolContext {
 }
 
 /** 要成員按確認才會執行的動作 */
-export type DraftKind = "add_expense" | "update_itinerary" | "delete_expense" | "delete_reminder";
-export const DRAFT_TOOLS = new Set<string>(["add_expense", "update_itinerary", "delete_expense", "delete_reminder"]);
+export type DraftKind = "add_expense" | "update_itinerary" | "delete_expense" | "delete_reminder" | "add_event" | "update_event" | "delete_event";
+export const DRAFT_TOOLS = new Set<string>(["add_expense", "update_itinerary", "delete_expense", "delete_reminder", "add_event", "update_event", "delete_event"]);
+
+/** 行事曆的一個行程（時間都是空間時區的當地時間；沒有 start＝整天） */
+export interface EventInput {
+  title: string;
+  date: string;
+  start?: string | null;
+  end?: string | null;
+  location?: string | null;
+  note?: string | null;
+  remindMin?: number | null;
+}
 
 export interface DraftInput {
   kind: DraftKind;
@@ -931,12 +946,131 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    label: "📅 新增行程",
+    decl: (p) => ({
+      name: "add_event",
+      description: `在行事曆新增一個有日期的事（約會、會議、看診、上課、出遊、繳費截止日）。會在回答下方產生確認卡片，使用者按確認才寫入。時間一律用 ${p.timezone} 的當地時間。`,
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "標題，例如「看牙醫」「小美家長會」" },
+          date: { type: "string", description: "日期 YYYY-MM-DD（「下週三」要換成實際日期）" },
+          start: { type: "string", description: "開始時間 HH:mm；沒有時間（整天）就不要填" },
+          end: { type: "string", description: "結束時間 HH:mm，可留空" },
+          location: { type: "string", description: "地點，可留空" },
+          note: { type: "string", description: "備註，可留空" },
+          remind_minutes: { type: "integer", description: "提前幾分鐘提醒（例如 30、60、1440＝前一天）；使用者沒說就不要填" },
+          replaces: REPLACES_PARAM,
+        },
+        required: ["title", "date"],
+      },
+    }),
+    async run(args, { propose }) {
+      const e = cleanEvent(args);
+      if ("error" in e) return e;
+      if (!propose) return { error: "需要確認卡片" };
+      return propose({
+        kind: "add_event",
+        payload: e,
+        replaces: Number(args.replaces) || undefined,
+        preview: { title: "新增行程確認", confirm: "加到行事曆", summary: `${eventWhen(e)} ${e.title}`, rows: eventRows(e) },
+      });
+    },
+  },
+  {
+    label: "📅 查行程",
+    decl: {
+      name: "list_events",
+      description: "查行事曆：某天或某段期間有哪些行程（例如「這週有什麼事」「下週三有空嗎」）。",
+      parameters: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "開始日期 YYYY-MM-DD，預設今天" },
+          days: { type: "integer", description: "查幾天，預設 14，最多 90" },
+        },
+      },
+    },
+    async run(args, { room, profile }) {
+      const from = /^\d{4}-\d{2}-\d{2}$/.test(String(args.from ?? "")) ? String(args.from) : localDate(profile);
+      const days = Math.min(Math.max(Number(args.days) || 14, 1), 90);
+      const list = room.eventList(from, shiftDate(from, days - 1));
+      return { from, to: shiftDate(from, days - 1), count: list.length, events: list };
+    },
+  },
+  {
+    label: "📅 修改行程",
+    decl: {
+      name: "update_event",
+      description: "修改行事曆裡已經有的行程（改時間、地點、標題、提醒）。用 id（list_events 會給）或標題關鍵字找。會產生確認卡片。",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "integer" },
+          keyword: { type: "string", description: "標題關鍵字" },
+          title: { type: "string" },
+          date: { type: "string", description: "YYYY-MM-DD" },
+          start: { type: "string", description: "HH:mm；要改成整天就填空字串" },
+          end: { type: "string" },
+          location: { type: "string" },
+          note: { type: "string" },
+          remind_minutes: { type: "integer" },
+          replaces: REPLACES_PARAM,
+        },
+      },
+    },
+    async run(args, { room, propose }) {
+      const old = pickEvent(args, room);
+      if ("error" in old || "matches" in old) return old;
+      const merged = cleanEvent({
+        title: args.title ?? old.title,
+        date: args.date ?? old.date,
+        start: args.start !== undefined ? args.start : old.start,
+        end: args.end !== undefined ? args.end : old.end,
+        location: args.location ?? old.location,
+        note: args.note ?? old.note,
+        remind_minutes: args.remind_minutes ?? old.remindMin,
+      });
+      if ("error" in merged) return merged;
+      if (!propose) return { error: "需要確認卡片" };
+      const before = eventRows(old), after = eventRows(merged);
+      return propose({
+        kind: "update_event",
+        payload: { id: old.id, event: merged },
+        replaces: Number(args.replaces) || undefined,
+        preview: {
+          title: "修改行程確認",
+          confirm: "確認修改",
+          summary: `#${old.id} ${old.title} → ${eventWhen(merged)} ${merged.title}`,
+          rows: after.map(([k, v], i) => (before[i] && before[i][1] !== v ? [k, v, before[i][1]] : [k, v]) as [string, string, string?]),
+        },
+      });
+    },
+  },
+  {
+    label: "📅 刪除行程",
+    decl: {
+      name: "delete_event",
+      description: "刪除行事曆裡的行程。用 id（list_events 會給）或標題關鍵字找。會產生確認卡片。",
+      parameters: { type: "object", properties: { id: { type: "integer" }, keyword: { type: "string" } } },
+    },
+    async run(args, { room, propose }) {
+      const old = pickEvent(args, room);
+      if ("error" in old || "matches" in old) return old;
+      if (!propose) return { error: "需要確認卡片" };
+      return propose({
+        kind: "delete_event",
+        payload: { id: old.id },
+        preview: { title: "刪除行程確認", confirm: "確認刪除", summary: `刪除 #${old.id} ${eventWhen(old)} ${old.title}`, rows: eventRows(old) },
+      });
+    },
+  },
+  {
     label: "📚 存進知識庫",
     decl: {
       name: "save_note",
       description:
         "把整理好的內容存進知識庫（文章、影片、Reels 的重點、筆記），之後可以用 search_notes 找出來。" +
-        "使用者貼連結或說「存到知識庫」時：先用 read_webpage 讀內容，再用這個存。同一個網址再存會更新原本那筆。",
+        "使用者貼連結或說「存到知識庫」時：先用 read_webpage 讀內容，再用這個存。同一個網址再存會更新原本那筆。回答時說已存進「知識庫」。",
       parameters: {
         type: "object",
         properties: {
@@ -966,7 +1100,9 @@ export const TOOLS: Tool[] = [
     label: "📚 查知識庫",
     decl: {
       name: "search_notes",
-      description: "從知識庫找以前存過的文章、影片、筆記（例如「之前存的那個 3D 開源專案叫什麼」）。",
+      description:
+        "從知識庫找以前存過的文章、影片、筆記，以及保管箱裡的照片文件（例如「之前存的那個 3D 開源專案叫什麼」）。" +
+        "回答用到這些內容時，句尾加上來源連結，例如 [1](#note-12)、[2](#doc-3)（網址用結果裡的 ref）。",
       parameters: { type: "object", properties: { keyword: { type: "string", description: "關鍵字，留空＝最近存的" } } },
     },
     async run(args, { room }) {
@@ -1476,6 +1612,69 @@ async function readPlain(url: string) {
   }
 }
 
+// ---------------- 行事曆小工具 ----------------
+
+const WD = "日一二三四五六";
+const dateWithDay = (d: string) => `${d}（${WD[new Date(d + "T00:00:00Z").getUTCDay()]}）`;
+const hhmm = (v: unknown) => {
+  const m = String(v ?? "").trim().match(/^(\d{1,2})[:：](\d{2})$/);
+  return m && Number(m[1]) < 24 && Number(m[2]) < 60 ? `${m[1].padStart(2, "0")}:${m[2]}` : null;
+};
+
+function cleanEvent(a: Record<string, any>): EventInput | { error: string } {
+  const title = String(a.title ?? "").trim().slice(0, 80);
+  const date = String(a.date ?? "").trim();
+  if (!title) return { error: "行程要有標題" };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date))) return { error: "日期格式要是 YYYY-MM-DD" };
+  const start = hhmm(a.start), end = start ? hhmm(a.end) : null;
+  const remind = a.remind_minutes == null || a.remind_minutes === "" ? null : Math.max(0, Math.min(Math.round(Number(a.remind_minutes)), 20160));
+  return {
+    title, date, start, end: end && end > (start ?? "") ? end : null,
+    location: String(a.location ?? "").trim().slice(0, 120) || null,
+    note: String(a.note ?? "").trim().slice(0, 300) || null,
+    remindMin: Number.isFinite(remind) ? remind : null,
+  };
+}
+
+function eventWhen(e: EventInput): string {
+  return `${dateWithDay(e.date)}${e.start ? ` ${e.start}${e.end ? `–${e.end}` : ""}` : " 整天"}`;
+}
+
+function remindText(m: number | null | undefined): string {
+  if (m == null) return "不提醒";
+  if (m === 0) return "準時提醒";
+  if (m % 1440 === 0) return `前 ${m / 1440} 天`;
+  if (m % 60 === 0) return `前 ${m / 60} 小時`;
+  return `前 ${m} 分鐘`;
+}
+
+function eventRows(e: EventInput): [string, string, string?][] {
+  return [
+    ["標題", e.title],
+    ["日期", dateWithDay(e.date)],
+    ["時間", e.start ? `${e.start}${e.end ? `–${e.end}` : ""}` : "整天"],
+    ["地點", e.location || "—"],
+    ["提醒", remindText(e.remindMin)],
+    ...(e.note ? [["備註", e.note] as [string, string]] : []),
+  ];
+}
+
+function pickEvent(args: Record<string, any>, room: RoomApi): (EventInput & { id: number }) | { error: string; recent?: unknown } | { matches: unknown; note: string } {
+  if (args.id) {
+    const e = room.eventGet(Number(args.id));
+    if (e) return e;
+  }
+  if (args.keyword) {
+    const found = room.eventFind(String(args.keyword));
+    if (found.length === 1) return found[0];
+    if (found.length > 1) return { matches: found.map((e) => ({ id: e.id, when: eventWhen(e), title: e.title })), note: "有好幾個符合，請問是哪一個，再用 id 呼叫" };
+  }
+  return { error: "行事曆裡找不到這個行程", recent: room.eventList(localDateFrom(), "9999-12-31").slice(0, 8) };
+}
+
+/** pickEvent 找不到時列近期行程用：從今天（UTC）開始就好 */
+const localDateFrom = () => new Date().toISOString().slice(0, 10);
+
 /** 個人帳本的分類 */
 const PERSONAL_CATEGORIES = ["餐飲", "交通", "購物", "日用品", "娛樂", "醫療", "帳單", "其他"];
 
@@ -1529,7 +1728,7 @@ const TRAVEL_ONLY = new Set([
 ]);
 
 /** 只有個人助理才有的工具 */
-const PERSONAL_ONLY = new Set(["save_note", "search_notes"]);
+const PERSONAL_ONLY = new Set(["save_note", "search_notes", "add_event", "list_events", "update_event", "delete_event"]);
 
 /** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */
 export function toolDecls(p: TripProfile): ToolDecl[] {

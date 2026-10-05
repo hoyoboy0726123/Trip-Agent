@@ -222,6 +222,13 @@ export default {
       return json({ ok: true }, { headers: { "set-cookie": await sessionCookie(env, set) } });
     }
 
+    // ---------- 個人助理的行事曆訂閱（ICS）：不用登入，Google／Apple 日曆定時來拿；看得到與否由網址裡的密語決定 ----------
+    const ics = path.match(/^\/ics\/([a-z0-9]+)\/([\w-]+)\.ics$/);
+    if (ics && req.method === "GET") {
+      if (!ROOM_ID.test(ics[1])) return new Response("Not found", { status: 404 });
+      return roomStub(env, ics[1]).fetch(new Request(`https://room/ics/${ics[2]}.ics`));
+    }
+
     // ---------- 旅遊日記分享連結：不用登入，看不看得到由那個旅程的分享碼決定（管理員可隨時關閉） ----------
     const share = path.match(/^\/share\/([a-z0-9]+)\/([\w-]+(?:\/photo\/[\w-]+)?)$/);
     if (share && req.method === "GET") {

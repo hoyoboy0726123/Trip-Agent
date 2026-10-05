@@ -369,6 +369,17 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .meter > span.warn { background: #d98a00; }
 .meter > span.over { background: var(--danger); }
 .note { display: grid; gap: 8px; margin-bottom: 10px; }
+.note.flash { outline: 2px solid var(--red); outline-offset: 2px; }
+.seg-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.seg-tabs button { flex: 1; padding: 9px 8px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: inherit; font-size: 14px; cursor: pointer; }
+.seg-tabs button.on { background: var(--red); border-color: var(--red); color: #fff; font-weight: 700; }
+.inbox-box { margin-bottom: 8px; }
+hr.soft { border: 0; border-top: 1px dashed var(--line); margin: 12px 0; }
+.dream-cards { gap: 10px; }
+.dream-card { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid var(--line); }
+.dream-card:first-of-type { border-top: 0; padding-top: 2px; }
+.cal-day.is-today { border-color: var(--red); }
+.ev-time { font-variant-numeric: tabular-nums; }
 .note-title { font-size: 16px; line-height: 1.4; }
 .note-tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .note-tags .tag { border: 0; cursor: pointer; font: inherit; font-size: 12px; }

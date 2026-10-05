@@ -8,7 +8,7 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*", "/ws", "/share/*"],
+    "run_worker_first": ["/api/*", "/ws", "/share/*", "/ics/*"],
     // /t/<旅程代碼> 這類網址都交給同一個頁面處理
     "not_found_handling": "single-page-application"
   },

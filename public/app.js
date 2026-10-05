@@ -857,8 +857,8 @@ function renderChips() {
     null,
     ["list", "清單", () => openPanel("checklist")],
     ["bell", "提醒", () => openPanel("reminders")],
+    ["calendar", "行事曆", () => openPanel("calendar")],
     ["book", "知識庫", () => openPanel("notes")],
-    ["ticket", "保管箱", () => openPanel("tickets")],
     ["bookmark", "記憶", () => openPanel("memories")],
     ["plus", "更多", openMore],
   ] : [
@@ -1233,6 +1233,7 @@ function renderPanelInner() {
     if (S.panel === "expenses") return renderLedgerPanel(st, b);
     if (S.panel === "memories") return renderPersonalMemories(st, b);
     if (S.panel === "notes") return renderNotesPanel(st, b);
+    if (S.panel === "calendar") return renderCalendarPanel(st, b);
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
@@ -1424,6 +1425,16 @@ function renderTodayPanel(st, b) {
   const brief = st.brief;
   b.innerHTML = `
     <div class="today-head"><div class="today-date">${dateLabel(now)}</div><div class="muted">${greeting()}，${escapeHtml(S.me.name)}</div></div>
+    ${dreamCardsHtml(st.cards)}
+    <div class="card today-card">
+      <div class="row between"><h3>📅 行程</h3><button class="btn small" data-go="calendar">行事曆</button></div>
+      ${(() => {
+        const soon = (st.events || []).filter((e) => e.date >= now).slice(0, 5);
+        return soon.length
+          ? `<div class="list">${soon.map((e) => `<div class="item small"><span><b>${e.date === now ? "今天" : escapeHtml(dateLabel(e.date))}</b> ${escapeHtml(e.start || "整天")}　${escapeHtml(e.title)}${e.location ? `<span class="muted">・${escapeHtml(e.location)}</span>` : ""}</span></div>`).join("")}</div>`
+          : `<div class="small muted">接下來沒有行程。在聊天說「下週三下午 3 點看牙醫」就會加進來。</div>`;
+      })()}
+    </div>
     <div class="card today-card">
       <div class="row between"><h3>☀️ 早報</h3>${brief ? "" : `<button class="btn small" id="td-brief">現在產生</button>`}</div>
       ${brief
@@ -1462,6 +1473,7 @@ function renderTodayPanel(st, b) {
     e.target.reset();
   });
   b.querySelectorAll("[data-done]").forEach((x) => x.addEventListener("change", () => action({ action: "checklist_toggle", id: Number(x.dataset.done), done: x.checked })));
+  bindDreamCards(b, st.cards || []);
 }
 
 /** 個人帳本：本月總額、預算、分類、明細 */
@@ -1520,6 +1532,13 @@ function renderPersonalMemories(st, b) {
       <div class="row" style="gap:6px"><select name="category" style="flex:1">${groups.map((c) => `<option>${c}</option>`).join("")}</select><button class="btn primary-sm" style="white-space:nowrap">新增記憶</button></div>
     </form></div>
     ${sections || `<div class="card small muted">還沒有記憶。在聊天說「記住…」，或聊幾句之後 AI 會自動整理。</div>`}
+    <div class="card"><h3>🌙 夜間整理</h3>
+      <div class="small muted">每天凌晨會整理一次：寫當天回顧、合併重複的記憶、找出矛盾和習慣，早上在「今天」頁問你對不對。自動改的都可以復原。</div>
+      <div class="small" style="margin-top:6px">${s.lastDream ? `上次：${escapeHtml(dateLabel(s.lastDream.date))}${s.lastDream.skipped ? `（${escapeHtml(s.lastDream.skipped)}）` : s.lastDream.error ? `（${escapeHtml(s.lastDream.error)}）` : `，合併 ${s.lastDream.merged ?? 0} 條、要你確認 ${s.lastDream.cards ?? 0} 件`}` : "還沒整理過"}</div>
+      <button type="button" class="btn small" id="dream-now" style="margin-top:6px">現在整理一次</button>
+      ${(st.dreamOps || []).length ? `<details style="margin-top:8px"><summary class="small">整理紀錄（${st.dreamOps.length}）</summary><div class="list">${st.dreamOps.map((o) => `<div class="item small"><div>${escapeHtml(o.reason)}<div class="muted">${dayText(o.ts)}${o.undone ? "・已復原" : ""}</div></div>${o.undone ? "" : `<button type="button" class="btn small" data-undo="${o.id}">復原</button>`}</div>`).join("")}</div></details>` : ""}
+    </div>
+    ${(st.episodes || []).length ? `<details class="card"><summary>📔 每天的回顧（${st.episodes.length}）</summary><div class="list">${st.episodes.map((e) => `<div class="item small"><div><b>${e.weekly ? "🗓 週回顧" : escapeHtml(dateLabel(String(e.date).slice(0, 10)))}</b><div style="white-space:pre-wrap">${escapeHtml(e.summary)}</div></div></div>`).join("")}</div></details>` : ""}
     ${arch.length ? `<details class="card"><summary>已取代、過期的記憶（${arch.length}）</summary><div class="list">${arch.map((m) => `<div class="item small"><div><span class="muted">${escapeHtml(m.content)}</span>
         <div class="muted">${m.status === "expired" ? "已過期" : "已被新資訊取代"}・${dayText(m.updated || m.ts)}</div></div>
         <div class="row" style="gap:6px"><button class="btn small" data-restore="${m.id}">恢復</button><button class="btn danger small" data-del-mem="${m.id}">刪</button></div></div>`).join("")}</div></details>` : ""}
@@ -1545,6 +1564,12 @@ function renderPersonalMemories(st, b) {
   );
   b.querySelectorAll("[data-del-mem]").forEach((x) => x.addEventListener("click", () => confirm("確定刪除這條記憶？") && action({ action: "delete_memory", id: Number(x.dataset.delMem) })));
   b.querySelectorAll("[data-restore]").forEach((x) => x.addEventListener("click", () => action({ action: "restore_memory", id: Number(x.dataset.restore) })));
+  $("#dream-now", b).addEventListener("click", (e) => {
+    e.target.disabled = true;
+    e.target.textContent = "整理中，約需 20 秒…";
+    action({ action: "dream_now" });
+  });
+  b.querySelectorAll("[data-undo]").forEach((x) => x.addEventListener("click", () => confirm("復原這筆整理？") && action({ action: "dream_undo", id: Number(x.dataset.undo) })));
 }
 
 // ---------- 手機通知（Web Push） ----------
@@ -1597,6 +1622,117 @@ async function disablePush() {
   if (sub) await api("/api/push/unsubscribe", { endpoint: sub.endpoint });
 }
 
+// ---------- 行事曆 ----------
+
+const REMIND_OPTS = [["", "不提醒"], ["0", "準時"], ["10", "10 分鐘前"], ["30", "30 分鐘前"], ["60", "1 小時前"], ["120", "2 小時前"], ["1440", "前一天"]];
+const remindLabel = (m) => (m == null ? "" : (REMIND_OPTS.find(([v]) => v === String(m)) || [null, `前 ${m} 分鐘`])[1]);
+
+function eventLine(e, del = true) {
+  const time = e.start ? `${e.start}${e.end ? `–${e.end}` : ""}` : "整天";
+  return `<div class="item small ev"><div><b class="ev-time">${escapeHtml(time)}</b> ${escapeHtml(e.title)}
+      ${e.location ? `<div class="muted">📍 ${escapeHtml(e.location)}</div>` : ""}${e.remindMin != null ? `<div class="muted">🔔 ${escapeHtml(remindLabel(e.remindMin))}</div>` : ""}</div>
+      ${del ? `<button type="button" class="btn danger small" data-del-ev="${e.id}" aria-label="刪除">✕</button>` : ""}</div>`;
+}
+
+function groupByDate(list) {
+  const out = new Map();
+  for (const e of list) (out.get(e.date) || out.set(e.date, []).get(e.date)).push(e);
+  return out;
+}
+
+/** 行事曆：新增、近期行程、訂閱到手機日曆 */
+function renderCalendarPanel(st, b) {
+  els.panelTitle.textContent = "📅 行事曆";
+  const s = S.settings || {};
+  const today = todayLocal();
+  const events = st.events || [];
+  const upcoming = groupByDate(events.filter((e) => e.date >= today));
+  const past = events.filter((e) => e.date < today);
+  const icsUrl = s.ics ? `${location.origin}${s.ics}` : "";
+  b.innerHTML = `
+    ${backToHub()}
+    <details class="card" ${S.calAddOpen ? "open" : ""} id="cal-add-box"><summary><b>＋ 新增行程</b></summary>
+      <form class="form" id="cal-add" style="margin-top:8px">
+        <input name="title" placeholder="例如：看牙醫、小美家長會" required />
+        <div class="row" style="gap:6px"><input name="date" type="date" value="${today}" required style="flex:1" /><select name="remind" style="flex:1">${REMIND_OPTS.map(([v, l]) => `<option value="${v}">🔔 ${l}</option>`).join("")}</select></div>
+        <div class="row" style="gap:6px"><input name="start" type="time" style="flex:1" aria-label="開始時間" /><span class="muted">到</span><input name="end" type="time" style="flex:1" aria-label="結束時間" /></div>
+        <input name="location" placeholder="地點（可留空）" />
+        <div class="small muted">沒填時間＝整天。也可以直接在聊天說「下週三下午 3 點看牙醫，前一天提醒我」。</div>
+        <button class="btn primary-sm">加到行事曆</button>
+      </form>
+    </details>
+    ${upcoming.size
+      ? [...upcoming].map(([d, list]) => `<div class="card cal-day${d === today ? " is-today" : ""}"><h3>${dateLabel(d)}${d === today ? " ・今天" : ""}</h3><div class="list">${list.map((e) => eventLine(e)).join("")}</div></div>`).join("")
+      : `<div class="card small muted">接下來沒有行程。</div>`}
+    ${past.length ? `<details class="card"><summary>過去 7 天（${past.length}）</summary><div class="list">${past.slice().reverse().map((e) => `<div class="muted small">${dateLabel(e.date)}</div>${eventLine(e)}`).join("")}</div></details>` : ""}
+    <div class="card"><h3>📲 訂閱到手機日曆</h3>
+      ${icsUrl
+        ? `<div class="small muted">把這個連結加到 iPhone 行事曆或 Google 日曆，這裡的行程就會出現在手機日曆（每幾小時更新一次）。連結等於密碼，不要給別人。</div>
+           <div class="share-link">${escapeHtml(icsUrl)}</div>
+           <div class="row" style="gap:6px;flex-wrap:wrap"><a class="btn" href="${escapeHtml(icsUrl.replace(/^https?:/, "webcal:"))}">加到 iPhone 行事曆</a><button type="button" class="btn" id="ics-copy">複製連結</button></div>
+           <div class="small muted" style="margin-top:6px">Google 日曆：電腦版 → 左邊「其他日曆」旁的＋ → 「透過網址新增」→ 貼上連結。</div>
+           <div class="row" style="gap:6px;margin-top:8px"><button type="button" class="btn small" id="ics-reset">換一個新連結</button><button type="button" class="btn small danger" id="ics-off">關閉訂閱</button></div>`
+        : `<div class="small muted">產生一個訂閱連結，手機內建的行事曆或 Google 日曆就看得到這裡的行程。</div><button type="button" class="btn" id="ics-on" style="margin-top:6px">產生訂閱連結</button>`}
+    </div>`;
+  bindBack(b);
+  $("#cal-add-box", b).addEventListener("toggle", (e) => (S.calAddOpen = e.target.open));
+  $("#cal-add", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    action({ action: "event_add", title: f.get("title"), date: f.get("date"), start: f.get("start"), end: f.get("end"), location: f.get("location"), remind: f.get("remind") });
+    e.target.reset();
+    e.target.date.value = today;
+  });
+  b.querySelectorAll("[data-del-ev]").forEach((x) => x.addEventListener("click", () => confirm("刪除這個行程？") && action({ action: "event_delete", id: Number(x.dataset.delEv) })));
+  $("#ics-on", b)?.addEventListener("click", () => action({ action: "ics_on" }));
+  $("#ics-reset", b)?.addEventListener("click", () => confirm("換新連結後，舊的訂閱會失效，要在手機日曆重新訂閱一次。確定？") && action({ action: "ics_reset" }));
+  $("#ics-off", b)?.addEventListener("click", () => confirm("關閉後手機日曆就拿不到新的行程。確定？") && action({ action: "ics_off" }));
+  $("#ics-copy", b)?.addEventListener("click", async (e) => {
+    try {
+      await navigator.clipboard.writeText(icsUrl);
+      e.target.textContent = "✅ 已複製";
+    } catch {
+      prompt("複製這個連結", icsUrl);
+    }
+  });
+}
+
+// ---------- 做夢：早上的確認卡 ----------
+
+const CARD_BUTTONS = {
+  insight: [["yes", "✅ 對"], ["edit", "✏️ 改"], ["no", "❌ 不對"]],
+  conflict: [["yes", "還是對的"], ["no", "已經不對了"]],
+  merge: [["yes", "✅ 合併"], ["no", "不要"]],
+  followup: [["done", "做好了"], ["later", "還沒，加到待辦"], ["dismiss", "不用了"]],
+  weekly: [["dismiss", "看完了"]],
+};
+
+function dreamCardsHtml(cards) {
+  if (!cards?.length) return "";
+  return `<div class="card today-card dream-cards"><h3>🌙 昨晚我整理了這些，對嗎？</h3>
+    ${cards.map((c) => `<div class="dream-card" data-card="${c.id}">
+      <b>${escapeHtml(c.title)}</b>${c.body ? `<div class="small muted" style="white-space:pre-wrap">${escapeHtml(c.body)}</div>` : ""}
+      <div class="row" style="gap:6px;flex-wrap:wrap">${(CARD_BUTTONS[c.kind] || [["dismiss", "知道了"]]).map(([a, l]) => `<button type="button" class="btn small" data-ans="${a}">${l}</button>`).join("")}</div>
+    </div>`).join("")}</div>`;
+}
+
+function bindDreamCards(b, cards) {
+  b.querySelectorAll("[data-card] [data-ans]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const id = Number(x.closest("[data-card]").dataset.card);
+      const c = cards.find((y) => y.id === id);
+      let text = "";
+      if (x.dataset.ans === "edit") {
+        text = prompt("改成：", String(c.body || "").split("\n")[0]) || "";
+        if (!text.trim()) return;
+      }
+      if (c.kind === "conflict" && x.dataset.ans === "no") text = prompt("現在正確的是？（可留空）", "") || "";
+      x.closest("[data-card]").querySelectorAll("button").forEach((y) => (y.disabled = true));
+      action({ action: "card_answer", id, answer: x.dataset.ans, text });
+    }),
+  );
+}
+
 /** 知識庫：貼連結讓 AI 整理存進來；可以搜尋、看重點、開原始連結、刪除 */
 function renderNotesPanel(st, b) {
   els.panelTitle.textContent = "📚 知識庫";
@@ -1604,17 +1740,36 @@ function renderNotesPanel(st, b) {
   const q = (S.noteQuery || "").trim().toLowerCase();
   const tagsOf = (n) => { try { return JSON.parse(n.tags || "[]"); } catch { return []; } };
   const list = q ? notes.filter((n) => `${n.title} ${n.summary} ${n.tags}`.toLowerCase().includes(q)) : notes;
-  b.innerHTML = `
-    ${backToHub()}
-    <p class="small muted">在聊天貼 Facebook／Instagram Reels 或網頁連結，AI 會看完幫你整理重點存進來（影片也看得到）。之後在聊天問「之前存的那個…」也找得到。</p>
-    <input id="note-q" class="note-search" placeholder="搜尋標題、重點、標籤…" value="${escapeHtml(S.noteQuery || "")}" autocomplete="off" />
-    <div class="small muted" style="margin:6px 2px">${q ? `找到 ${list.length} 筆` : `共 ${notes.length} 筆`}</div>
-    ${list.map((n) => `<div class="card note">
+  const inbox = notes.filter((n) => n.inbox);
+  const noteCard = (n) => S.noteEdit === n.id
+    ? `<form class="card form note" data-note-form="${n.id}" id="note-${n.id}">
+        <input name="title" value="${escapeHtml(n.title)}" required />
+        <input name="tags" value="${escapeHtml(tagsOf(n).join("、"))}" placeholder="標籤，用頓號隔開" />
+        <textarea name="summary" rows="6" required>${escapeHtml(n.summary || "")}</textarea>
+        <div class="row" style="gap:6px"><button class="btn primary-sm">儲存</button><button type="button" class="btn" data-edit-cancel>取消</button></div>
+      </form>`
+    : `<div class="card note${S.noteFocus === n.id ? " flash" : ""}" id="note-${n.id}">
         <div class="row between" style="align-items:flex-start"><b class="note-title">${escapeHtml(n.title)}</b><span class="small muted" style="white-space:nowrap">${dayText(n.ts)}</span></div>
         ${tagsOf(n).length ? `<div class="note-tags">${tagsOf(n).map((t) => `<button type="button" class="tag" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</button>`).join("")}</div>` : ""}
         <div class="small msg-text note-body">${md(n.summary || "")}</div>
-        <div class="row" style="gap:6px;flex-wrap:wrap">${n.url ? `<a class="btn small" href="${escapeHtml(n.url)}" target="_blank" rel="noopener">開原始連結</a>` : ""}<button type="button" class="btn small" data-ask="${n.id}">問 AI</button><button type="button" class="btn danger small" data-del-note="${n.id}">刪除</button></div>
-      </div>`).join("") || `<div class="card small muted">${q ? "找不到符合的內容" : "還沒有內容。試試在聊天貼一個 Reels 或網頁連結。"}</div>`}`;
+        <div class="row" style="gap:6px;flex-wrap:wrap">${n.inbox ? `<button type="button" class="btn small primary-sm" data-file="${n.id}">✅ 收好</button>` : ""}${n.url ? `<a class="btn small" href="${escapeHtml(n.url)}" target="_blank" rel="noopener">開原始連結</a>` : ""}<button type="button" class="btn small" data-edit-note="${n.id}">改</button><button type="button" class="btn small" data-ask="${n.id}">問 AI</button><button type="button" class="btn danger small" data-del-note="${n.id}">刪除</button></div>
+      </div>`;
+  b.innerHTML = `
+    ${backToHub()}
+    <div class="seg-tabs"><button type="button" class="on">📚 筆記與連結</button><button type="button" data-go-docs>🗂 照片文件</button></div>
+    <p class="small muted">在聊天貼 Facebook／Instagram Reels 或網頁連結，AI 會看完幫你整理重點存進來（影片也看得到）。之後在聊天問「之前存的那個…」也找得到，回答會附上來源。</p>
+    <details class="card" id="note-add-box" ${S.noteAddOpen ? "open" : ""}><summary><b>＋ 新增筆記</b></summary>
+      <form class="form" id="note-add" style="margin-top:8px">
+        <input name="title" placeholder="標題" required />
+        <textarea name="content" rows="4" placeholder="內容" required></textarea>
+        <input name="tags" placeholder="標籤，用頓號隔開（可留空）" />
+        <button class="btn primary-sm">存進知識庫</button>
+      </form>
+    </details>
+    ${inbox.length && !q ? `<div class="card inbox-box"><h3>📥 剛收進來（${inbox.length}）</h3><div class="small muted">AI 幫你存的，看一下標題和標籤對不對，按「收好」就移到下面。</div></div>${inbox.map(noteCard).join("")}<hr class="soft" />` : ""}
+    <input id="note-q" class="note-search" placeholder="搜尋標題、重點、標籤…" value="${escapeHtml(S.noteQuery || "")}" autocomplete="off" />
+    <div class="small muted" style="margin:6px 2px">${q ? `找到 ${list.length} 筆` : `共 ${notes.length} 筆`}</div>
+    ${(q ? list : list.filter((n) => !n.inbox)).map(noteCard).join("") || `<div class="card small muted">${q ? "找不到符合的內容" : inbox.length ? "整理好的筆記會出現在這裡" : "還沒有內容。試試在聊天貼一個 Reels 或網頁連結。"}</div>`}`;
   bindBack(b);
   const qi = $("#note-q", b);
   qi.addEventListener("input", () => {
@@ -1626,6 +1781,29 @@ function renderNotesPanel(st, b) {
     again?.setSelectionRange(pos, pos);
   });
   b.querySelectorAll("[data-tag]").forEach((x) => x.addEventListener("click", () => { S.noteQuery = x.dataset.tag; renderPanel(); }));
+  $("[data-go-docs]", b).addEventListener("click", () => openPanel("tickets"));
+  $("#note-add-box", b).addEventListener("toggle", (e) => (S.noteAddOpen = e.target.open));
+  $("#note-add", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    action({ action: "note_add", title: f.get("title"), content: f.get("content"), tags: f.get("tags") });
+    e.target.reset();
+  });
+  b.querySelectorAll("[data-file]").forEach((x) => x.addEventListener("click", () => action({ action: "note_file", id: Number(x.dataset.file) })));
+  b.querySelectorAll("[data-edit-note]").forEach((x) => x.addEventListener("click", () => { S.noteEdit = Number(x.dataset.editNote); renderPanel(); }));
+  b.querySelectorAll("[data-note-form]").forEach((f) => {
+    f.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const d = new FormData(f);
+      action({ action: "note_edit", id: Number(f.dataset.noteForm), title: d.get("title"), tags: d.get("tags"), summary: d.get("summary") });
+      S.noteEdit = null;
+    });
+    f.querySelector("[data-edit-cancel]").addEventListener("click", () => { S.noteEdit = null; renderPanel(); });
+  });
+  if (S.noteFocus) {
+    $(`#note-${S.noteFocus}`, b)?.scrollIntoView({ block: "center" });
+    setTimeout(() => (S.noteFocus = null), 1500);
+  }
   b.querySelectorAll("[data-del-note]").forEach((x) => x.addEventListener("click", () => confirm("確定從知識庫刪除這筆？") && action({ action: "note_delete", id: Number(x.dataset.delNote) })));
   b.querySelectorAll("[data-ask]").forEach((x) =>
     x.addEventListener("click", () => {
@@ -1868,8 +2046,8 @@ function renderSettingsPanel(st, b) {
 function toolCards() {
   if (isPersonal()) {
     return [
-      ["notes", "book", "知識庫", "貼連結讓 AI 整理存下來"],
-      ["tickets", "ticket", "保管箱", "照片、票券、文件，離線可看"],
+      ["calendar", "calendar", "行事曆", "行程、提醒、訂閱到手機日曆"],
+      ["notes", "book", "知識庫", "連結、筆記、照片文件"],
       ["checklist", "list", "清單", "待辦、購物"],
       ["reminders", "bell", "提醒", "時間到通知你"],
       ["memories", "bookmark", "記憶", "AI 記得你的事，可以刪改"],
@@ -2829,6 +3007,24 @@ function toggleMic() {
 }
 
 // 離線快取（常用句、票券照片沒網路也能用；畫面更新也會立刻生效）
+// AI 回答裡的知識庫來源連結：#note-12 打開那一筆筆記，#doc-3 打開保管箱
+document.addEventListener(
+  "click",
+  (e) => {
+    const a = e.target.closest?.('a[href^="#note-"], a[href^="#doc-"]');
+    if (!a) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const [kind, id] = a.getAttribute("href").slice(1).split("-");
+    if (kind === "note") {
+      S.noteFocus = Number(id);
+      S.noteQuery = "";
+      openPanel("notes");
+    } else openPanel("tickets");
+  },
+  true,
+);
+
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 
 if (ROOM) checkSession();

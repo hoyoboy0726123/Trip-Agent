@@ -59,7 +59,7 @@ function renderPersonalSetup() {
     <form id="ps-form" class="card form" novalidate>
       <div class="center"><div class="hero-logo">🙋</div><h2>建立個人助理</h2>
         <p class="small muted">只有你一個人用：會記得你說過的事、幫你設提醒、管待辦和購物清單、收好照片與文件。</p></div>
-      ${W.invite ? "" : `<label class="field">邀請碼<input id="ps-invite" autocomplete="off" required /></label>`}
+      <label class="field">個人助理邀請碼<input id="ps-invite" inputmode="numeric" autocomplete="off" required /></label>
       <label class="field">你的稱呼<input id="ps-name" maxlength="16" placeholder="例如：爸爸、小美" autocomplete="nickname" required /></label>
       <label class="field">你住的地方（選填，天氣和「附近」會用到）
         <div class="row" style="gap:6px"><input id="ps-place" placeholder="例如：台北市大安區" style="flex:1" /><button type="button" class="btn" id="ps-search">搜尋</button></div>
@@ -85,7 +85,7 @@ function renderPersonalSetup() {
   };
   $("#ps-search", root).addEventListener("click", async () => {
     const q = $("#ps-place", root).value.trim();
-    const invite = W.invite || $("#ps-invite", root)?.value.trim();
+    const invite = $("#ps-invite", root).value.trim();
     if (!q) return;
     if (!invite) return err("請先填邀請碼");
     const picks = $("#ps-picks", root);
@@ -109,7 +109,7 @@ function renderPersonalSetup() {
   $("#ps-form", root).addEventListener("submit", async (e) => {
     e.preventDefault();
     err("");
-    const invite = W.invite || $("#ps-invite", root)?.value.trim();
+    const invite = $("#ps-invite", root).value.trim();
     const name = $("#ps-name", root).value.trim();
     const pw = $("#ps-pw", root).value, pw2 = $("#ps-pw2", root).value;
     if (!invite) return err("請填邀請碼");
@@ -132,8 +132,6 @@ function renderPersonalSetup() {
       btn.textContent = "建立";
       return err(r.error || "建立失敗");
     }
-    W.invite = invite;
-    saveWizard();
     store("ta-name", name);
     location.href = `/t/${r.room}`;
   });

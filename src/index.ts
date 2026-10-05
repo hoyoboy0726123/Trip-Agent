@@ -32,8 +32,8 @@ async function readJson(req: Request): Promise<any> {
 }
 
 /** 還沒建立旅程前（引導設置中）的 API，用邀請碼當通行證 */
-async function inviteOk(req: Request, env: Env, code: unknown): Promise<string | null> {
-  const r = await registry(env).checkInvite(ipOf(req), String(code ?? ""));
+async function inviteOk(req: Request, env: Env, code: unknown, kind: "trip" | "personal" | "any" = "trip"): Promise<string | null> {
+  const r = await registry(env).checkInvite(ipOf(req), String(code ?? ""), kind);
   return r.ok ? null : r.error ?? "邀請碼不正確";
 }
 
@@ -96,7 +96,7 @@ async function createTrip(req: Request, env: Env): Promise<Response> {
 /** 個人助理：只有本人一個人用，建好就能聊，不必等 AI 查目的地資料 */
 async function createPersonal(req: Request, env: Env): Promise<Response> {
   const b = await readJson(req);
-  const inviteErr = await inviteOk(req, env, b.invite);
+  const inviteErr = await inviteOk(req, env, b.invite, "personal");
   if (inviteErr) return bad(inviteErr, 403);
   const name = str(b.name, 16);
   if (!name) return bad("請填寫你的稱呼");
@@ -175,7 +175,7 @@ export default {
       const b = await readJson(req);
       const session = await readSessions(req, env);
       if (!session) {
-        const err = await inviteOk(req, env, b.invite);
+        const err = await inviteOk(req, env, b.invite, "any");
         if (err) return bad(err, 403);
       }
       const q = str(b.q, 200);

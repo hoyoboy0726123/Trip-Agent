@@ -9,6 +9,8 @@ export interface Env {
   SESSION_SECRET: string;
   /** 建立新旅程要輸入的邀請碼 */
   INVITE_CODE: string;
+  /** 建立個人助理要輸入的邀請碼（跟旅程分開；沒設定就沿用 INVITE_CODE） */
+  PERSONAL_INVITE_CODE?: string;
   /** 擁有者後台（看所有旅程、刪除旅程） */
   OWNER_PASSWORD?: string;
   /** 擁有者的 Gemini 金鑰（選填）：所有旅程優先使用，用完才用朋友自己填的 */

@@ -65,13 +65,15 @@ export class Registry extends DurableObject<Env> {
 
   // ---------------- 邀請碼 ----------------
 
-  /** 猜錯太多次就暫時鎖住這個 IP（15 分鐘 10 次） */
-  checkInvite(ip: string, code: string): { ok: boolean; error?: string } {
+  /** 猜錯太多次就暫時鎖住這個 IP（15 分鐘 10 次）；kind＝要建立的是旅程還是個人助理（兩種邀請碼不同） */
+  checkInvite(ip: string, code: string, kind: "trip" | "personal" | "any" = "trip"): { ok: boolean; error?: string } {
     const row = this.sql.exec("SELECT count, ts FROM attempts WHERE ip = ?", ip).toArray()[0];
     const recent = row && Date.now() - (row.ts as number) < 15 * 60_000 ? (row.count as number) : 0;
     if (recent >= 10) return { ok: false, error: "嘗試太多次，請 15 分鐘後再試" };
     const invite = (this.env.INVITE_CODE ?? "").trim();
-    if (invite && safeEqual(String(code ?? "").trim(), invite)) return { ok: true };
+    const personal = (this.env.PERSONAL_INVITE_CODE ?? "").trim() || invite;
+    const accepted = kind === "trip" ? [invite] : kind === "personal" ? [personal] : [invite, personal];
+    if (accepted.some((c) => c && safeEqual(String(code ?? "").trim(), c))) return { ok: true };
     this.sql.exec("INSERT INTO attempts VALUES (?, ?, ?) ON CONFLICT(ip) DO UPDATE SET count = ?, ts = ?", ip, recent + 1, Date.now(), recent + 1, Date.now());
     return { ok: false, error: invite ? "邀請碼不正確" : "網站尚未設定邀請碼" };
   }

@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { safeEqual } from "./auth";
 import { GeminiLimiter, limitsFrom } from "./ratelimit";
+import { generateVapidKeys, type VapidKeys } from "./push";
 import type { Env } from "./types";
 
 // 全站只有一個 Registry：邀請碼檢查、旅程清單（擁有者後台用）、所有旅程共用的額度狀態
@@ -46,6 +47,20 @@ export class Registry extends DurableObject<Env> {
 
   private set(key: string, value: string) {
     this.sql.exec("INSERT INTO kv VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
+  }
+
+  // ---------------- 手機推播 ----------------
+
+  /** 推播用的 VAPID 金鑰：第一次用到時產生並保存，所有空間共用一組 */
+  async vapidKeys(): Promise<VapidKeys> {
+    const saved = this.get("vapid");
+    if (saved) return JSON.parse(saved);
+    const keys = await generateVapidKeys();
+    // 產生金鑰時有 await，另一個請求可能已經先存了：以先存的為準
+    const again = this.get("vapid");
+    if (again) return JSON.parse(again);
+    this.set("vapid", JSON.stringify(keys));
+    return keys;
   }
 
   // ---------------- 邀請碼 ----------------

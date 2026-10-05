@@ -850,7 +850,8 @@ function renderChips() {
   const t = S.trip || {};
   const cur = t.currency || "";
   const chips = isPersonal() ? [
-    ["sun", "今天", () => ask("今天天氣如何？我有哪些提醒和待辦？")],
+    ["sun", "今天", () => openPanel("today")],
+    ["receipt", "收據記帳", receiptFlow],
     ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
     ["pin", "附上位置", () => attachLocation(false)],
     null,
@@ -906,7 +907,7 @@ els.chipsToggle.addEventListener("click", () => {
 
 const MORE_ASKS = ["明天的行程和天氣？", "目前花了多少錢？大家要怎麼分？", "最近有地震或颱風嗎？會影響行程嗎？"];
 
-const MORE_ASKS_PERSONAL = ["我今天有哪些待辦和提醒？", "你記得我哪些事？", "這個週末天氣如何？"];
+const MORE_ASKS_PERSONAL = ["我今天有哪些待辦和提醒？", "這個月花了多少？預算還剩多少？", "你記得我哪些事？", "這個週末天氣如何？"];
 
 function moreActions() {
   const t = S.trip || {};
@@ -914,6 +915,7 @@ function moreActions() {
   if (isPersonal()) {
     return [
       ["camera", "拍照問", () => els.photoInput.click()],
+      ["receipt", "收據記帳", receiptFlow],
       ["pin", "附上位置", () => attachLocation(false)],
       ["sun", "今天", () => ask("今天天氣如何？我有哪些提醒和待辦？")],
       ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
@@ -1068,9 +1070,11 @@ function setState(state) {
   if (t.kind === "personal") {
     els.dayBadge.textContent = dateLabel(now);
     els.nextCard.hidden = els.ncToggle.hidden = true;
-    for (const tab of ["translator", "itinerary", "expenses"]) els.tabbar.querySelector(`[data-tab="${tab}"]`).hidden = true;
+    for (const tab of ["translator", "itinerary"]) els.tabbar.querySelector(`[data-tab="${tab}"]`).hidden = true;
+    for (const tab of ["today", "expenses"]) els.tabbar.querySelector(`[data-tab="${tab}"]`).hidden = false;
     if (!S.pending.photo) els.input.placeholder = "跟你的助理說…";
-    if (S.panel && !["settings", "tripedit", "keys", "diary-edit"].includes(S.panel)) renderPanel();
+    const typing = document.activeElement && els.panel.contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+    if (S.panel && !typing && !["settings", "tripedit", "keys", "diary-edit"].includes(S.panel)) renderPanel();
     return;
   }
   els.dayBadge.textContent = day < 1 ? `倒數 ${1 - day} 天` : now <= t.endDate ? `Day ${day}` : "旅程結束";
@@ -1128,7 +1132,7 @@ function geminiUsageText(g) {
 
 // ---------- 底部分頁列：聊天以外的分頁是蓋在聊天上方的整頁面板 ----------
 
-const TAB_OF = { itinerary: "itinerary", expenses: "expenses", settings: "settings", tripedit: "settings", keys: "settings" };
+const TAB_OF = { today: "today", itinerary: "itinerary", expenses: "expenses", settings: "settings", tripedit: "settings", keys: "settings" };
 
 function setTab(tab) {
   const buttons = [...els.tabbar.querySelectorAll("button")];
@@ -1222,6 +1226,11 @@ function renderPanelInner() {
     els.panelTitle.textContent = "📴 離線中";
     b.innerHTML = `<div class="card small muted">目前沒有網路，這個功能暫時不能用。翻譯常用句、票券、旅遊指南離線也能看。</div>`;
     return;
+  }
+  if (isPersonal()) {
+    if (S.panel === "today") return renderTodayPanel(st, b);
+    if (S.panel === "expenses") return renderLedgerPanel(st, b);
+    if (S.panel === "memories") return renderPersonalMemories(st, b);
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
@@ -1385,6 +1394,207 @@ function renderPanelInner() {
   }
 }
 
+// ================= 個人助理：今天、記帳、記憶、手機通知 =================
+
+const nt = (n) => `NT$${Math.round(Number(n) || 0).toLocaleString("en-US")}`;
+
+function greeting() {
+  const h = new Date().getHours();
+  return h < 5 ? "夜深了" : h < 11 ? "早安" : h < 17 ? "午安" : "晚安";
+}
+
+/** 長條：預算用（到八成變橘、超過變紅）；plain＝分類佔比，不用警示色 */
+function meter(value, total, plain = false) {
+  const pct = total ? Math.min(100, Math.round((value / total) * 100)) : 0;
+  const cls = plain ? "" : pct >= 100 ? "over" : pct >= 80 ? "warn" : "";
+  return `<div class="meter"><span class="${cls}" style="width:${pct}%"></span></div>`;
+}
+
+/** 今天頁：早報、提醒、待辦、本月花費，一頁看完 */
+function renderTodayPanel(st, b) {
+  els.panelTitle.textContent = "☀️ 今天";
+  const s = S.settings || {};
+  const now = todayLocal();
+  const rem = (st.reminders || []).slice(0, 5);
+  const todos = (st.checklist || []).filter((c) => c.list === "待辦" && !c.done);
+  const shop = (st.checklist || []).filter((c) => c.list === "購物" && !c.done);
+  const l = st.ledger || { total: 0, budget: 0, month: "" };
+  const brief = st.brief;
+  b.innerHTML = `
+    <div class="today-head"><div class="today-date">${dateLabel(now)}</div><div class="muted">${greeting()}，${escapeHtml(S.me.name)}</div></div>
+    <div class="card today-card">
+      <div class="row between"><h3>☀️ 早報</h3>${brief ? "" : `<button class="btn small" id="td-brief">現在產生</button>`}</div>
+      ${brief
+        ? `<div class="small msg-text">${md(String(brief.text).replace(/^☀️[^\n]*\n+/, ""))}</div>`
+        : `<div class="small muted">${s.autoBrief === false ? "每日早報目前關閉（可在 設定 開啟）。" : `每天 ${s.briefHour ?? 7}:00 左右會自動發早報。`}</div>`}
+    </div>
+    <div class="card today-card">
+      <div class="row between"><h3>⏰ 提醒</h3><button class="btn small" data-go="reminders">全部</button></div>
+      ${rem.length
+        ? `<div class="list">${rem.map((r) => `<div class="item small"><span><b>${escapeHtml(String(r.time).slice(5, 16))}</b>　${escapeHtml(r.message)}</span></div>`).join("")}</div>`
+        : `<div class="small muted">沒有提醒。在聊天說「明天 8 點提醒我繳費」就會設好。</div>`}
+    </div>
+    <div class="card today-card">
+      <div class="row between"><h3>✅ 待辦</h3><button class="btn small" data-go="checklist">清單</button></div>
+      <form class="row inline-form" id="td-add" style="gap:6px;margin:6px 0"><input name="item" placeholder="新增待辦…" style="flex:1" autocomplete="off" /><button class="btn primary-sm">加入</button></form>
+      <div class="list">${todos.slice(0, 8).map((c) => `<label class="item check-item small"><span><input type="checkbox" data-done="${c.id}" /> ${escapeHtml(c.item)}</span></label>`).join("") || `<div class="small muted">待辦都完成了 🎉</div>`}</div>
+      ${todos.length > 8 ? `<div class="small muted">還有 ${todos.length - 8} 項</div>` : ""}
+      ${shop.length ? `<div class="small muted" style="margin-top:6px">🛒 購物清單還有 ${shop.length} 項</div>` : ""}
+    </div>
+    <button type="button" class="card today-card today-money-card" data-go="expenses">
+      <div class="row between"><h3>💰 本月花費</h3><span class="small muted">${escapeHtml(l.month || "")}</span></div>
+      <div class="today-money">${nt(l.total)}${l.budget ? `<span class="small muted">／預算 ${nt(l.budget)}</span>` : ""}</div>
+      ${l.budget ? meter(l.total, l.budget) : `<div class="small muted">還沒設定月預算，點這裡設定</div>`}
+    </button>`;
+  b.querySelectorAll("[data-go]").forEach((x) => x.addEventListener("click", () => openPanel(x.dataset.go)));
+  $("#td-brief", b)?.addEventListener("click", (e) => {
+    e.target.disabled = true;
+    e.target.textContent = "產生中…";
+    action({ action: "brief_now" });
+  });
+  $("#td-add", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const item = e.target.item.value.trim();
+    if (!item) return;
+    action({ action: "checklist_add", list: "待辦", item });
+    e.target.reset();
+  });
+  b.querySelectorAll("[data-done]").forEach((x) => x.addEventListener("change", () => action({ action: "checklist_toggle", id: Number(x.dataset.done), done: x.checked })));
+}
+
+/** 個人帳本：本月總額、預算、分類、明細 */
+function renderLedgerPanel(st, b) {
+  els.panelTitle.textContent = "💰 記帳";
+  const l = st.ledger || { items: [], by_category: {}, months: [], total: 0, budget: 0, count: 0, month: "" };
+  const cats = Object.entries(l.by_category || {}).sort((x, y) => y[1] - x[1]);
+  const left = l.budget ? l.budget - l.total : 0;
+  b.innerHTML = `
+    <div class="card">
+      <div class="row between"><h3>${escapeHtml(l.month)} 花費</h3><span class="small muted">${l.count} 筆</span></div>
+      <div class="today-money">${nt(l.total)}</div>
+      ${l.budget ? `${meter(l.total, l.budget)}<div class="small ${left < 0 ? "error" : "muted"}">${left >= 0 ? `預算 ${nt(l.budget)}，還剩 ${nt(left)}` : `已超出預算 ${nt(-left)}`}</div>` : ""}
+      <form class="row inline-form" id="lg-budget" style="gap:6px;margin-top:10px"><input name="amount" type="number" inputmode="numeric" min="0" step="100" placeholder="每月預算（NT$）" value="${l.budget || ""}" style="flex:1" /><button class="btn small">${l.budget ? "修改預算" : "設定預算"}</button></form>
+      <div class="small muted">花到八成、超過預算時，會在聊天和手機通知你。</div>
+    </div>
+    ${cats.length ? `<div class="card"><h3>分類</h3>${cats.map(([c, v]) => `<div class="cat-row"><span>${escapeHtml(c)}</span>${meter(v, l.total, true)}<b>${nt(v)}</b></div>`).join("")}</div>` : ""}
+    <div class="card"><h3>明細</h3>
+      <p class="small muted">在聊天說「午餐 120」或拍收據，AI 會產生記帳卡片，按確認才會記進來。</p>
+      <div class="list">${(l.items || []).map((x) => `<div class="item small"><div><b>${escapeHtml(x.description)}</b><div class="muted">${escapeHtml(String(x.date).slice(5))}・${escapeHtml(x.category)}${x.currency !== "TWD" ? `・${escapeHtml(x.currency)} ${escapeHtml(x.amount)}` : ""}</div></div>
+        <div class="row" style="gap:6px"><b>${nt(x.twd)}</b><button class="btn danger small" data-del-exp="${x.id}" aria-label="刪除">✕</button></div></div>`).join("") || `<div class="small muted">這個月還沒有記帳</div>`}</div>
+    </div>
+    ${(l.months || []).length > 1 ? `<div class="card"><h3>最近幾個月</h3><div class="list">${l.months.map((m) => `<div class="item small"><span>${escapeHtml(m.month)}（${m.count} 筆）</span><b>${nt(m.total)}</b></div>`).join("")}</div></div>` : ""}`;
+  $("#lg-budget", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    action({ action: "budget_set", amount: Number(e.target.amount.value) || 0 });
+  });
+  b.querySelectorAll("[data-del-exp]").forEach((x) => x.addEventListener("click", () => confirm("確定刪除這筆？") && action({ action: "delete_expense", id: Number(x.dataset.delExp) })));
+}
+
+/** 記憶頁：關於我、各類記憶（可改可刪）、已取代或過期的（可恢復）、暫停記憶、匯出 */
+function renderPersonalMemories(st, b) {
+  els.panelTitle.textContent = "🧠 記憶";
+  const s = S.settings || {};
+  const mems = st.memories || [];
+  const arch = st.memoryArchive || [];
+  const groups = ["偏好", "決定", "預訂", "資訊", "待辦"];
+  const auto = (m) => (m.source ? m.source === "auto" : m.author === "AI 自動整理");
+  const item = (m) => `<div class="item small"><div>${escapeHtml(m.content)}
+      <div class="muted"><span class="tag ${auto(m) ? "" : "tag-you"}">${auto(m) ? "AI 整理" : "你說的"}</span> ${dayText(m.ts)}${m.expires ? `・到 ${escapeHtml(String(m.expires).slice(5))}` : ""}</div></div>
+      <div class="row" style="gap:6px"><button class="btn small" data-edit-mem="${m.id}">改</button><button class="btn danger small" data-del-mem="${m.id}">刪</button></div></div>`;
+  const sections = groups
+    .map((g) => {
+      const list = mems.filter((m) => m.category === g);
+      return list.length ? `<div class="card"><h3>${g}（${list.length}）</h3><div class="list">${list.slice().reverse().map(item).join("")}</div></div>` : "";
+    })
+    .join("");
+  b.innerHTML = `
+    ${backToHub()}
+    <p class="small muted">AI 聊天時會記下你的偏好、決定和重要的事，每次回答前都會先看這裡。說錯的可以改、可以刪；過期或被新資訊取代的會收到最下面，不會直接消失。</p>
+    <div class="card"><label class="row between"><span><b>暫停記憶</b><br><span class="small muted">暫停期間的對話不會被記下來</span></span><input type="checkbox" id="mem-pause" ${s.memoryPaused ? "checked" : ""} /></label></div>
+    <div class="card"><h3>🙋 關於我</h3><div class="small muted">AI 每次都會看這段。AI 會自動補充，你也可以自己改。</div>
+      <form class="form" id="core-form"><textarea name="text" rows="5" maxlength="800" placeholder="例如：住台北中山區，有兩個小孩；不吃香菜；週末常去爬山">${escapeHtml(st.core || "")}</textarea><button class="btn primary-sm">儲存</button></form></div>
+    <div class="card"><form class="form" id="mem-form">
+      <textarea name="content" rows="2" placeholder="手動新增，例如：媽媽對花生過敏" required></textarea>
+      <div class="row" style="gap:6px"><select name="category" style="flex:1">${groups.map((c) => `<option>${c}</option>`).join("")}</select><button class="btn primary-sm" style="white-space:nowrap">新增記憶</button></div>
+    </form></div>
+    ${sections || `<div class="card small muted">還沒有記憶。在聊天說「記住…」，或聊幾句之後 AI 會自動整理。</div>`}
+    ${arch.length ? `<details class="card"><summary>已取代、過期的記憶（${arch.length}）</summary><div class="list">${arch.map((m) => `<div class="item small"><div><span class="muted">${escapeHtml(m.content)}</span>
+        <div class="muted">${m.status === "expired" ? "已過期" : "已被新資訊取代"}・${dayText(m.updated || m.ts)}</div></div>
+        <div class="row" style="gap:6px"><button class="btn small" data-restore="${m.id}">恢復</button><button class="btn danger small" data-del-mem="${m.id}">刪</button></div></div>`).join("")}</div></details>` : ""}
+    <div class="card"><a class="btn" href="/api/export?room=${ROOM}" download>⬇️ 匯出我的資料（JSON）</a><div class="small muted" style="margin-top:6px">聊天文字、記憶、清單、提醒、帳本、保管箱清單（不含照片）。</div></div>`;
+  bindBack(b);
+  $("#mem-pause", b).addEventListener("change", (e) => action({ action: "settings", memoryPaused: e.target.checked }));
+  $("#core-form", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    action({ action: "core_save", text: e.target.text.value });
+    e.target.querySelector("button").textContent = "已儲存";
+  });
+  $("#mem-form", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    action({ action: "add_memory", content: f.get("content"), category: f.get("category") });
+  });
+  b.querySelectorAll("[data-edit-mem]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const m = mems.find((y) => y.id === Number(x.dataset.editMem));
+      const content = prompt("修改這條記憶：", m.content);
+      if (content && content.trim() && content.trim() !== m.content) action({ action: "edit_memory", id: m.id, content: content.trim(), expires: m.expires || "" });
+    }),
+  );
+  b.querySelectorAll("[data-del-mem]").forEach((x) => x.addEventListener("click", () => confirm("確定刪除這條記憶？") && action({ action: "delete_memory", id: Number(x.dataset.delMem) })));
+  b.querySelectorAll("[data-restore]").forEach((x) => x.addEventListener("click", () => action({ action: "restore_memory", id: Number(x.dataset.restore) })));
+}
+
+// ---------- 手機通知（Web Push） ----------
+
+const isIOS = () => /iPhone|iPad|iPod/.test(navigator.userAgent);
+const isStandalone = () => window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true;
+
+function b64ToBytes(s) {
+  const pad = s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4);
+  return Uint8Array.from(atob(pad), (c) => c.charCodeAt(0));
+}
+
+async function pushSubscription() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+/** 這支手機的通知狀態（設定頁顯示） */
+async function pushStatusText() {
+  if (isIOS() && !isStandalone()) return "iPhone 要先把這個網頁「加入主畫面」，再從主畫面的圖示打開，才能開啟通知（Safari 分享按鈕 → 加入主畫面）。";
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return "這個瀏覽器不支援通知。";
+  if (Notification.permission === "denied") return "通知被封鎖了：請到手機設定 → 通知，找到這個 App 打開。";
+  const sub = await pushSubscription().catch(() => null);
+  const n = S.settings?.pushDevices ?? 0;
+  return sub && Notification.permission === "granted" ? `✅ 這支手機已開啟通知（這個空間共 ${n} 台裝置）` : `還沒開啟${n ? `（其他 ${n} 台裝置已開啟）` : ""}`;
+}
+
+async function enablePush() {
+  if (isIOS() && !isStandalone()) return alert("iPhone 要先「加入主畫面」，再從主畫面的圖示打開，才能開啟通知。");
+  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return alert("這個瀏覽器不支援通知");
+  const perm = await Notification.requestPermission();
+  if (perm !== "granted") return alert("沒有允許通知。要開啟的話請到手機設定 → 通知，找到這個 App 打開。");
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const k = await api("/api/push/key");
+    if (!k.ok) throw new Error(k.error || "拿不到通知金鑰");
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(k.key) });
+    const r = await api("/api/push/subscribe", { subscription: sub.toJSON() });
+    if (!r.ok) throw new Error(r.error || "開啟失敗");
+  } catch (e) {
+    alert(`開啟通知失敗：${e.message || e}`);
+  }
+}
+
+async function disablePush() {
+  const sub = await pushSubscription().catch(() => null);
+  // 瀏覽器的訂閱可能還有其他空間在用，只把這個空間的拿掉
+  if (sub) await api("/api/push/unsubscribe", { endpoint: sub.endpoint });
+}
+
 /** 個人助理的設定：只有本人，沒有邀請家人、旅程設定、回覆時機 */
 function renderPersonalSettings(st, b) {
   els.panelTitle.textContent = "⚙️ 設定";
@@ -1404,7 +1614,17 @@ function renderPersonalSettings(st, b) {
       <div>🤖 AI：${s.gemini ? "你的 Gemini 金鑰優先，額度用完改用 Workers AI" : "⚠️ 還沒填 Gemini 金鑰，目前只用 Workers AI（到下方「API 金鑰」填）"}</div>
       <div>🔍 網路搜尋：${s.tavily ? "✅ Tavily" : "⚠️ 未設定（AI 不能上網查資料）"}</div>
     </div>
-    <div class="card"><div class="stack"><button class="btn" data-go="keys">🔑 API 金鑰</button></div></div>
+    <div class="card"><h3>🔔 手機通知</h3>
+      <div class="small muted" id="push-state">檢查中…</div>
+      <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap"><button class="btn" id="push-on">開啟這支手機的通知</button><button class="btn small" id="push-test">傳一則測試</button><button class="btn small" id="push-off">關閉</button></div>
+      <div class="small muted" style="margin-top:6px">提醒時間到、早報、花費快超過預算時會通知你。</div>
+    </div>
+    <div class="card"><h3>☀️ 每日早報</h3>
+      <label class="row between small"><span>每天自動發早報（天氣、提醒、待辦、本月花費）</span><input type="checkbox" id="brief-auto" ${s.autoBrief !== false ? "checked" : ""} /></label>
+      <label class="row between small" style="margin-top:6px"><span>幾點發</span><select id="brief-hour">${[5, 6, 7, 8, 9, 10, 11].map((h) => `<option value="${h}" ${Number(s.briefHour ?? 7) === h ? "selected" : ""}>${h}:00</option>`).join("")}</select></label>
+      <button class="btn small" id="brief-now" style="margin-top:8px">現在發一次</button>
+    </div>
+    <div class="card"><div class="stack"><button class="btn" data-go="memories">🧠 記憶（關於我、暫停記憶）</button><button class="btn" data-go="keys">🔑 API 金鑰</button><a class="btn" href="/api/export?room=${ROOM}" download>⬇️ 匯出我的資料</a></div></div>
     <div class="card"><h3>🔒 更改密碼</h3>
       <form class="form" id="pw-form">
         <input name="admin" type="password" placeholder="新密碼（至少 6 個字）" autocomplete="new-password" />
@@ -1436,6 +1656,23 @@ function renderPersonalSettings(st, b) {
     e.target.checked ? startAutoLocation() : stopAutoLocation();
   });
   b.querySelectorAll("[data-go]").forEach((x) => x.addEventListener("click", () => openPanel(x.dataset.go)));
+  const refreshPush = () => pushStatusText().then((t) => { const el = $("#push-state", b); if (el) el.textContent = t; });
+  refreshPush();
+  $("#push-on", b).addEventListener("click", async () => {
+    await enablePush();
+    setTimeout(refreshPush, 800);
+  });
+  $("#push-off", b).addEventListener("click", async () => {
+    await disablePush();
+    setTimeout(refreshPush, 800);
+  });
+  $("#push-test", b).addEventListener("click", () => action({ action: "push_test" }));
+  $("#brief-auto", b).addEventListener("change", (e) => action({ action: "settings", autoBrief: e.target.checked }));
+  $("#brief-hour", b).addEventListener("change", (e) => action({ action: "settings", briefHour: Number(e.target.value) }));
+  $("#brief-now", b).addEventListener("click", (e) => {
+    e.target.textContent = "產生中…";
+    action({ action: "brief_now" });
+  });
   $("#pw-form", b).addEventListener("submit", (e) => {
     e.preventDefault();
     const admin = String(new FormData(e.target).get("admin")).trim();

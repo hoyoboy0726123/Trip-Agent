@@ -295,6 +295,13 @@ export default {
         return room.fetch(new Request("https://room/ws", { headers }));
       }
 
+      // 個人助理：手機推播訂閱、匯出資料
+      const direct: Record<string, string> = { "/api/push/key": "/push/key", "/api/push/subscribe": "/push/subscribe", "/api/push/unsubscribe": "/push/unsubscribe", "/api/export": "/export" };
+      if (direct[path]) {
+        headers.set("x-origin", url.origin);
+        return room.fetch(new Request(`https://room${direct[path]}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));
+      }
+
       if (path === "/api/photo" && req.method === "POST") {
         return room.fetch(new Request("https://room/photo", { method: "POST", headers, body: req.body }));
       }

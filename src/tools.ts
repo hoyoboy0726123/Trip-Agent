@@ -7,6 +7,10 @@ export interface RoomApi {
   members(): string[];
   memberLocation(name?: string): { name: string; lat: number; lon: number; accuracy: number | null; ts: number; area: string | null }[];
   addMemory(content: string, category: string, author: string): number;
+  /** remember 工具用：個人助理會擋敏感資料、記憶暫停時不記 */
+  remember(content: string, category: string, author: string, expires?: string): unknown;
+  /** 個人帳本：某個月的花費、分類、預算 */
+  ledger(month?: string): unknown;
   deleteMemory(id: number): boolean;
   searchHistory(keyword: string, limit: number): { ts: number; author: string; text: string }[];
   updateItinerary(date: string, fields: { title?: string; detail?: string; status?: string }, author: string): unknown;
@@ -772,7 +776,22 @@ export const TOOLS: Tool[] = [
   },
   {
     label: "💰 記帳",
-    decl: (p) => ({
+    decl: (p) => p.kind === "personal" ? {
+      name: "add_expense",
+      description: "記一筆個人花費（例如「午餐 120」「加油 1500」或收據照片）。會在回答下方產生確認卡片，使用者按確認才寫入帳本。",
+      parameters: {
+        type: "object",
+        properties: {
+          description: { type: "string", description: "項目，例如「全聯：牛奶、雞蛋」" },
+          amount: { type: "number" },
+          currency: { type: "string", description: "幣別代碼，預設 TWD" },
+          category: { type: "string", enum: PERSONAL_CATEGORIES },
+          date: { type: "string", description: "日期 YYYY-MM-DD，預設今天。收據上的民國年要加 1911（民國 113 年＝2024 年）" },
+          replaces: REPLACES_PARAM,
+        },
+        required: ["description", "amount"],
+      },
+    } : ({
       name: "add_expense",
       description: `記一筆旅費並分帳。例如「晚餐 3 萬 ${p.currency} 我付的」。payer 預設為發問者，split_among 預設為全部旅伴（見系統提示的旅伴名單），只有特定人分攤時才填，成員說誰就照填誰（名單裡沒有也照填，不可以換成別人）。`,
       parameters: {
@@ -791,6 +810,7 @@ export const TOOLS: Tool[] = [
       },
     }),
     async run(args, ctx) {
+      if (ctx.profile.kind === "personal") return personalExpense(args, ctx);
       const local = ctx.profile.currency;
       const currency = String(args.currency || local).toUpperCase();
       const amount = Number(args.amount);
@@ -851,12 +871,17 @@ export const TOOLS: Tool[] = [
   },
   {
     label: "📊 帳目統計",
-    decl: {
+    decl: (p) => p.kind === "personal" ? {
+      name: "expense_summary",
+      description: "個人花費統計：某個月（預設這個月）的總花費、各分類、預算還剩多少、最近幾筆，以及最近幾個月的總額。",
+      parameters: { type: "object", properties: { month: { type: "string", description: "月份 YYYY-MM，預設這個月" } } },
+    } : {
       name: "expense_summary",
       description: "旅費統計：總花費、每人付了多少、每人應付多少、誰該給誰多少錢（結算）、分類與每日花費。",
       parameters: { type: "object", properties: {} },
     },
-    async run(_args, { room }) {
+    async run(args, { room, profile }) {
+      if (profile.kind === "personal") return room.ledger(args.month ? String(args.month) : undefined);
       return room.expenseSummary();
     },
   },
@@ -888,7 +913,7 @@ export const TOOLS: Tool[] = [
             title: "刪除帳目確認",
             confirm: "確認刪除",
             summary: `刪除 #${id} ${ex.date} ${ex.description} ${amount}`,
-            rows: [["日期", ex.date], ["項目", ex.description], ["金額", amount], ["付款人", ex.payer]],
+            rows: [["日期", ex.date], ["項目", ex.description], ["金額", amount], ...(profile.kind === "personal" ? [] : [["付款人", ex.payer] as [string, string]])],
           },
         });
       }
@@ -903,14 +928,15 @@ export const TOOLS: Tool[] = [
       parameters: {
         type: "object",
         properties: {
-          content: { type: "string", description: "要記住的內容，寫成完整一句話" },
+          content: { type: "string", description: "要記住的內容，寫成完整一句話；日期寫實際日期（不要寫「明天」）" },
           category: { type: "string", enum: ["偏好", "決定", "預訂", "資訊", "待辦"] },
+          expires: { type: "string", description: "只有「過了某天就不再成立」的事才填失效日期 YYYY-MM-DD（例如考試、約會、這週的安排）。人名、家人、年齡、喜好、習慣、住址一律不要填" },
         },
         required: ["content"],
       },
     },
     async run(args, { room, author }) {
-      return { saved_id: room.addMemory(args.content, args.category || "資訊", author) };
+      return room.remember(String(args.content), args.category || "資訊", author, args.expires ? String(args.expires) : undefined);
     },
   },
   {
@@ -1313,10 +1339,56 @@ function declOf(t: Tool, p: TripProfile): ToolDecl {
   return typeof t.decl === "function" ? t.decl(p) : t.decl;
 }
 
-/** 個人助理用不到的旅遊工具（記帳要等第二階段改成個人帳本才開放） */
+/** 個人帳本的分類 */
+const PERSONAL_CATEGORIES = ["餐飲", "交通", "購物", "日用品", "娛樂", "醫療", "帳單", "其他"];
+
+/** 個人助理記帳：沒有分帳，外幣換成台幣 */
+async function personalExpense(args: Record<string, any>, ctx: ToolContext) {
+  const currency = String(args.currency || "TWD").toUpperCase();
+  const amount = Number(args.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return { error: "金額不正確" };
+  let rate: { rate: number; estimated?: boolean };
+  try {
+    rate = await fxRate(ctx, currency, "TWD");
+  } catch (e: any) {
+    return { error: `查不到匯率，暫時無法記帳（${e?.message ?? e}）` };
+  }
+  const twd = Math.round(amount * rate.rate);
+  const p = ctx.profile;
+  const e: ExpenseInput = {
+    description: args.description,
+    amount,
+    currency,
+    amountLocal: twd,
+    amountTwd: twd,
+    payer: ctx.author,
+    splitAmong: [ctx.author],
+    category: PERSONAL_CATEGORIES.includes(args.category) ? args.category : "其他",
+    date: normalizeDate(args.date, p) ?? localDate(p),
+    author: ctx.author,
+  };
+  if (!ctx.propose) return { saved: ctx.room.addExpense(e) };
+  return ctx.propose({
+    kind: "add_expense",
+    payload: e,
+    replaces: Number(args.replaces) || undefined,
+    preview: {
+      title: "記帳確認",
+      confirm: "確認記帳",
+      summary: `${e.date} ${e.description} ${money(amount, currency, p)}`,
+      rows: [
+        ["日期", e.date],
+        ["項目", String(e.description)],
+        ["金額", `${money(amount, currency, p)}${currency !== "TWD" ? `（≈ NT$${twd.toLocaleString("en-US")}${rate.estimated ? "，匯率為估計值" : ""}）` : ""}`],
+        ["分類", e.category],
+      ],
+    },
+  });
+}
+
+/** 個人助理用不到的旅遊工具 */
 const TRAVEL_ONLY = new Set([
   "theme_park_wait_times", "taxi_fare", "train_status", "update_itinerary", "get_member_locations", "disaster_alerts",
-  "add_expense", "expense_summary", "delete_expense",
 ]);
 
 /** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */

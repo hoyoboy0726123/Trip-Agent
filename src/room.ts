@@ -7,8 +7,9 @@ import {
 } from "./profile";
 import { geminiProvider, parseArgs, providerFor, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
-import { disasterAlerts, DRAFT_TOOLS, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
+import { disasterAlerts, DRAFT_TOOLS, homeOf, reverseArea, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
+import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -59,6 +60,31 @@ function parseDiary(raw: string): { title: string; paragraphs: string[]; marks: 
 }
 const MAX_STEPS = 8; // 單次回答最多工具回合（含系統提醒／代為執行）
 const FOREGROUND_MAX_WAIT = 10_000; // 回答問題時，Gemini 額度滿最多等幾毫秒，超過就改用下一個模型
+/** 中文雙字詞：不用向量資料庫，也能粗略比對兩段文字講的是不是同一件事 */
+function bigrams(s: string): Set<string> {
+  const clean = s.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  const set = new Set<string>();
+  for (let i = 0; i < clean.length - 1; i++) set.add(clean.slice(i, i + 2));
+  return set;
+}
+
+/** 兩句話是不是在講同一件事：雙字詞重疊比例（以短的那句為準） */
+function sameFact(a: string, b: string): boolean {
+  const x = bigrams(a), y = bigrams(b);
+  if (!x.size || !y.size) return a.trim() === b.trim();
+  let hit = 0;
+  for (const g of x) if (y.has(g)) hit++;
+  return hit / Math.min(x.size, y.size) >= 0.75;
+}
+
+/** 推播只能是純文字：拿掉 Markdown 符號，截成一兩行 */
+function pushText(md: string, max = 120): string {
+  const t = md.replace(/\*\*|__|`|#+\s*|\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+const PUSH_HOSTS = /^https:\/\/([a-z0-9-]+\.)*(googleapis\.com|push\.apple\.com|mozilla\.com|mozaws\.net|notify\.windows\.com)\//;
+
 const MEMORY_EVERY = 4; // 每 4 則新的成員訊息自動整理一次長期記憶
 const RECALL_LIMIT = 8; // 從較舊的聊天中自動找回的相關訊息數
 const PHOTO_BYTES_LIMIT = 700_000_000; // 每個旅程的照片總量上限（免費方案整個帳號只有 5 GB）
@@ -250,6 +276,11 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     // 票券保管箱的資料夾（可以一層層放）；票券的 folder_id 是 NULL＝放在最外層
     this.sql.exec("CREATE TABLE IF NOT EXISTS doc_folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER, ts INTEGER, author TEXT)");
     if (!this.sql.exec("PRAGMA table_info(documents)").toArray().some((c) => c.name === "folder_id")) this.sql.exec("ALTER TABLE documents ADD COLUMN folder_id INTEGER");
+    // 個人助理：手機推播訂閱；記憶 v2（狀態、來源、到期日、被哪一條取代）
+    this.sql.exec("CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT, ts INTEGER, ua TEXT)");
+    for (const col of ["status TEXT DEFAULT 'active'", "source TEXT", "expires TEXT", "superseded_by INTEGER", "updated INTEGER"]) {
+      if (!this.sql.exec("PRAGMA table_info(memories)").toArray().some((c) => c.name === col.split(" ")[0])) this.sql.exec(`ALTER TABLE memories ADD COLUMN ${col}`);
+    }
     // 日記挑照片用：AI 看過每張照片的說明
     this.sql.exec("CREATE TABLE IF NOT EXISTS photo_notes (photo_id TEXT PRIMARY KEY, kind TEXT, score INTEGER, note TEXT, ts INTEGER, v INTEGER)");
     if (!this.sql.exec("PRAGMA table_info(photo_notes)").toArray().some((c) => c.name === "v")) this.sql.exec("ALTER TABLE photo_notes ADD COLUMN v INTEGER");
@@ -320,6 +351,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       ownerGemini: !!this.env.GEMINI_API_KEY,
       workersModel: this.env.WORKERS_AI_MODEL,
       geminiModel: this.env.GEMINI_MODEL,
+      briefHour: Number(this.setting("brief_hour", "7")), // 個人助理早報幾點發
+      memoryPaused: this.setting("memory_paused") === "1",
+      budget: Number(this.setting("budget_month", "0")) || 0,
+      pushDevices: this.sql.exec("SELECT COUNT(*) AS n FROM push_subs").one().n as number,
     };
   }
 
@@ -481,6 +516,37 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     if (user.ver !== Number(this.setting("auth_version", "1"))) return Response.json({ ok: false, error: "請重新登入" }, { status: 401 });
     if (url.pathname === "/me") return Response.json({ ok: true });
     if (url.pathname === "/album") return this.album("member", req, url);
+    if (url.pathname === "/push/key") return Response.json({ ok: true, key: (await this.vapidKeys()).publicKey });
+    if (url.pathname === "/push/subscribe" && req.method === "POST") {
+      const b = (await req.json().catch(() => ({}))) as any;
+      const endpoint = String(b?.subscription?.endpoint ?? "");
+      const p256dh = String(b?.subscription?.keys?.p256dh ?? ""), auth = String(b?.subscription?.keys?.auth ?? "");
+      // 只接受正牌推播服務的網址，伺服器才不會被拿來對任意網址發請求
+      if (!PUSH_HOSTS.test(endpoint) || !/^[\w-]{40,120}$/.test(p256dh) || !/^[\w-]{10,40}$/.test(auth)) return Response.json({ ok: false, error: "通知訂閱資料不正確" }, { status: 400 });
+      this.sql.exec(
+        "INSERT INTO push_subs VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, ts = excluded.ts",
+        endpoint, p256dh, auth, Date.now(), String(req.headers.get("user-agent") ?? "").slice(0, 200),
+      );
+      // 每個空間最多 10 台裝置，太舊的拿掉
+      this.sql.exec("DELETE FROM push_subs WHERE endpoint NOT IN (SELECT endpoint FROM push_subs ORDER BY ts DESC LIMIT 10)");
+      const origin = req.headers.get("x-origin");
+      if (origin && /^https:\/\//.test(origin)) this.setSetting("push_subject", origin);
+      this.broadcast({ type: "settings", settings: this.settings() });
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/push/unsubscribe" && req.method === "POST") {
+      const b = (await req.json().catch(() => ({}))) as any;
+      this.sql.exec("DELETE FROM push_subs WHERE endpoint = ?", String(b?.endpoint ?? ""));
+      this.broadcast({ type: "settings", settings: this.settings() });
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/export") {
+      if (!user.admin) return Response.json({ ok: false, error: "只有管理員可以匯出" }, { status: 403 });
+      const date = this.today().replaceAll("-", "");
+      return new Response(JSON.stringify(this.exportData(), null, 1), {
+        headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename="trip-agent-${date}.json"`, "cache-control": "no-store" },
+      });
+    }
 
     if (url.pathname === "/ws") {
       const pair = new WebSocketPair();
@@ -760,9 +826,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       }
       case "settings":
         if (msg.replyMode === "all" || msg.replyMode === "mention") this.setSetting("reply_mode", msg.replyMode);
-        for (const [k, key] of [["autoBrief", "auto_brief"], ["autoDiary", "auto_diary"], ["autoAlerts", "auto_alerts"]] as const) {
+        for (const [k, key] of [["autoBrief", "auto_brief"], ["autoDiary", "auto_diary"], ["autoAlerts", "auto_alerts"], ["memoryPaused", "memory_paused"]] as const) {
           if (typeof msg[k] === "boolean") this.setSetting(key, msg[k] ? "1" : "0");
         }
+        if (Number.isInteger(msg.briefHour) && msg.briefHour >= 5 && msg.briefHour <= 11) this.setSetting("brief_hour", String(msg.briefHour));
         this.broadcast({ type: "settings", settings: this.settings() });
         break;
 
@@ -772,6 +839,36 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         break;
       case "delete_memory":
         this.deleteMemory(Number(msg.id));
+        break;
+      // ---- 個人助理：記憶頁、預算、推播 ----
+      case "edit_memory": {
+        const content = String(msg.content ?? "").trim().slice(0, 500);
+        if (!content) return reply(false, "內容不能是空的");
+        const expires = /^\d{4}-\d{2}-\d{2}$/.test(String(msg.expires ?? "")) ? String(msg.expires) : null;
+        this.sql.exec("UPDATE memories SET content = ?, expires = ?, source = 'user', updated = ? WHERE id = ?", content, expires, Date.now(), Number(msg.id));
+        this.broadcastState();
+        break;
+      }
+      case "restore_memory":
+        this.sql.exec("UPDATE memories SET status = 'active', superseded_by = NULL, expires = NULL, updated = ? WHERE id = ?", Date.now(), Number(msg.id));
+        this.broadcastState();
+        break;
+      case "core_save":
+        this.setSetting("core_profile", String(msg.text ?? "").trim().slice(0, 800));
+        this.broadcastState();
+        break;
+      case "budget_set": {
+        const amount = Math.max(0, Math.round(Number(msg.amount) || 0));
+        this.setSetting("budget_month", String(amount));
+        // 改了預算：這個月的超支提醒重新算
+        this.setSetting(`budget_alert_${this.today().slice(0, 7)}`, "0");
+        this.broadcast({ type: "settings", settings: this.settings() });
+        this.broadcastState();
+        break;
+      }
+      case "push_test":
+        if (!(this.sql.exec("SELECT COUNT(*) AS n FROM push_subs").one().n as number)) return reply(false, "這個空間還沒有開啟通知的裝置");
+        await this.pushAll({ title: "🔔 測試通知", body: "手機通知設定成功！提醒、早報和預算提醒都會送到這裡。", tag: "test" });
         break;
       case "update_itinerary":
         this.updateItinerary(String(msg.date), { title: msg.title, detail: msg.detail, status: msg.status }, user.name);
@@ -866,7 +963,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         break;
       }
       case "brief_now":
-        await this.postMorningBrief(this.today());
+        if (this.isPersonal()) await this.postPersonalBrief(this.today());
+        else await this.postMorningBrief(this.today());
         break;
       case "diary_now":
         await this.writeDiary(this.today());
@@ -1261,9 +1359,37 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   }
 
   addMemory(content: string, category: string, author: string): number {
-    const id = this.sql.exec("INSERT INTO memories (ts, category, content, author) VALUES (?, ?, ?, ?) RETURNING id", Date.now(), category, content.slice(0, 500), author).one().id as number;
+    return this.insertMemory(content, category, author, author === "AI 自動整理" ? "auto" : "user", null);
+  }
+
+  private insertMemory(content: string, category: string, author: string, source: "user" | "auto", expires: string | null): number {
+    const id = this.sql
+      .exec(
+        "INSERT INTO memories (ts, category, content, author, status, source, expires, updated) VALUES (?, ?, ?, ?, 'active', ?, ?, ?) RETURNING id",
+        Date.now(), category, content.slice(0, 500), author, source, expires, Date.now(),
+      )
+      .one().id as number;
     this.broadcastState();
     return id;
+  }
+
+  /** remember 工具：個人助理不記敏感資料，記憶暫停時也不記 */
+  remember(content: string, category: string, author: string, expires?: string) {
+    if (this.isPersonal()) {
+      if (this.setting("memory_paused") === "1") return { error: "記憶目前暫停中（工具箱 → 記憶 可以恢復），這次沒有記下來" };
+      const bad = this.memoryGuard(content);
+      if (bad) return { error: bad };
+    }
+    const exp = expires && /^\d{4}-\d{2}-\d{2}$/.test(expires) ? expires : null;
+    return { saved_id: this.insertMemory(content, category, author, "user", exp), ...(exp ? { expires: exp } : {}) };
+  }
+
+  /** 個人助理不記身分證字號、信用卡號、密碼 */
+  private memoryGuard(content: string): string | null {
+    if (/[A-Z][12]\d{8}/.test(content)) return "內容看起來有身分證字號，為了安全不記下來";
+    if (/(?:\d[ -]?){13,19}/.test(content) && /卡|card/i.test(content)) return "內容看起來有信用卡號，為了安全不記下來";
+    if (/密碼|password|\bPIN\b/i.test(content)) return "密碼類的資料不要記在這裡，為了安全不記下來";
+    return null;
   }
 
   deleteMemory(id: number): boolean {
@@ -1313,6 +1439,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       )
       .one().id as number;
     this.broadcastState();
+    if (this.isPersonal()) this.ctx.waitUntil(this.checkBudget());
     return { id, ...e };
   }
 
@@ -1544,8 +1671,14 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       }
       if (p.status !== "active") return;
       await this.deliverReminders();
-      // 個人助理：早報、做夢之後的階段再加；旅遊日記、災害警報是旅遊專用
-      if (p.kind === "personal") return;
+      // 個人助理：每天整理一次記憶（過期的失效）、依設定的時間發早報；旅遊日記、災害警報是旅遊專用
+      if (p.kind === "personal") {
+        const now = zoned(Date.now(), p.timezone);
+        this.dailyMaintenance(now.date);
+        const hour = Number(this.setting("brief_hour", "7"));
+        if (this.settings().autoBrief && now.hour >= hour && now.hour < hour + 3 && this.setting("brief_sent") !== now.date) await this.postPersonalBrief(now.date);
+        return;
+      }
       const now = zoned(Date.now(), p.timezone);
       const inTrip = now.date >= p.startDate && now.date <= p.endDate;
       const s = this.settings();
@@ -1581,6 +1714,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     for (const r of due) {
       this.sql.exec("UPDATE reminders SET sent = 1 WHERE id = ?", r.id);
       this.postAiMessage(`⏰ **提醒**：${r.message}\n\n（${r.author} 設定的提醒）`, { kind: "reminder" });
+      if (this.isPersonal()) this.ctx.waitUntil(this.pushAll({ title: "⏰ 提醒", body: String(r.message), tag: `reminder-${r.id}` }));
     }
     if (due.length) this.broadcastState();
   }
@@ -1920,8 +2054,26 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     return this.sql.exec("SELECT * FROM itinerary ORDER BY date").toArray();
   }
 
+  /** 有效的記憶（已被取代、過期的不算） */
   private memories() {
-    return this.sql.exec("SELECT * FROM memories ORDER BY ts").toArray();
+    return this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') = 'active' ORDER BY ts").toArray();
+  }
+
+  /** 個人助理的記憶多了以後，只挑跟這次問題相關的：雙字詞比對＋最近記的＋待辦與預訂 */
+  private relevantMemories(text: string): { list: Record<string, SqlStorageValue>[]; total: number } {
+    const all = this.memories();
+    if (all.length <= 40) return { list: all, total: all.length };
+    const q = bigrams(text);
+    const scored = all.map((m, i) => {
+      const g = bigrams(String(m.content));
+      let hit = 0;
+      for (const x of q) if (g.has(x)) hit++;
+      const recent = i >= all.length - 8 ? 0.5 : 0;
+      const urgent = m.category === "待辦" || m.category === "預訂" ? 0.3 : 0;
+      return { m, score: (q.size ? hit / Math.sqrt(q.size) : 0) + recent + urgent };
+    });
+    const list = scored.sort((a, b) => b.score - a.score).slice(0, 25).map((x) => x.m).sort((a, b) => Number(a.ts) - Number(b.ts));
+    return { list, total: all.length };
   }
 
   private state() {
@@ -1946,6 +2098,14 @@ ${transcript || "（今天群組沒什麼對話）"}`;
         .map((r) => ({ ts: r.pin_ts, by: r.pin_by, message: this.publicMessage(r) })),
       locations: this.memberLocation(),
       gemini: this.ownLimiter.usage(),
+      ...(p.kind === "personal"
+        ? {
+            ledger: this.ledger(),
+            core: this.setting("core_profile"),
+            memoryArchive: this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') != 'active' ORDER BY COALESCE(updated, ts) DESC LIMIT 60").toArray(),
+            brief: this.latestBrief(),
+          }
+        : {}),
     };
   }
 
@@ -2051,6 +2211,166 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       .join("\n");
   }
 
+  // ================= 個人助理：帳本、預算、推播、早報、每日整理、匯出 =================
+
+  /** 個人帳本：某個月（預設這個月）的總花費（台幣）、分類、預算、最近幾筆，以及最近幾個月的總額 */
+  ledger(month?: string) {
+    const m = month && /^\d{4}-\d{2}$/.test(month) ? month : this.today().slice(0, 7);
+    const rows = this.sql.exec("SELECT * FROM expenses WHERE substr(date, 1, 7) = ? ORDER BY date DESC, id DESC", m).toArray();
+    const byCategory: Record<string, number> = {};
+    let total = 0;
+    for (const r of rows) {
+      const v = Number(r.amount_twd) || 0;
+      total += v;
+      byCategory[r.category as string] = (byCategory[r.category as string] ?? 0) + v;
+    }
+    const budget = Number(this.setting("budget_month", "0")) || 0;
+    return {
+      month: m,
+      total: Math.round(total),
+      budget,
+      remaining: budget ? Math.round(budget - total) : null,
+      count: rows.length,
+      by_category: byCategory,
+      items: rows.slice(0, 100).map((r) => ({ id: r.id, date: r.date, description: r.description, amount: r.amount, currency: r.currency, twd: r.amount_twd, category: r.category })),
+      months: this.sql
+        .exec("SELECT substr(date, 1, 7) AS m, SUM(amount_twd) AS t, COUNT(*) AS n FROM expenses GROUP BY m ORDER BY m DESC LIMIT 6")
+        .toArray()
+        .map((r) => ({ month: r.m as string, total: Math.round(Number(r.t) || 0), count: Number(r.n) })),
+    };
+  }
+
+  /** 記帳後檢查預算：到八成、超支各提醒一次（聊天＋手機推播） */
+  private async checkBudget() {
+    const budget = Number(this.setting("budget_month", "0"));
+    if (!budget) return;
+    const l = this.ledger();
+    const level = l.total >= budget ? 2 : l.total >= budget * 0.8 ? 1 : 0;
+    const key = `budget_alert_${l.month}`;
+    if (level <= Number(this.setting(key, "0"))) return;
+    this.setSetting(key, String(level));
+    const nt = (n: number) => `NT$${Math.round(n).toLocaleString("en-US")}`;
+    const text = level === 2
+      ? `💸 **這個月已經超出預算**：花了 ${nt(l.total)}，預算 ${nt(budget)}，超出 ${nt(l.total - budget)}。`
+      : `⚠️ **這個月的花費到預算的 ${Math.round((l.total / budget) * 100)}% 了**：花了 ${nt(l.total)}，還剩 ${nt(budget - l.total)}。`;
+    this.postAiMessage(text, { kind: "budget" });
+    await this.pushAll({ title: level === 2 ? "💸 超出預算" : "⚠️ 預算快用完了", body: pushText(text), tag: "budget" });
+  }
+
+  private vapidCache: VapidKeys | null = null;
+  private async vapidKeys(): Promise<VapidKeys> {
+    this.vapidCache ??= await this.registry().vapidKeys();
+    return this.vapidCache;
+  }
+
+  /** 推播到這個空間所有開啟通知的裝置（目前只有個人助理用）；失效的訂閱順便刪掉 */
+  private async pushAll(payload: Omit<PushPayload, "url"> & { url?: string }) {
+    if (!this.isPersonal()) return;
+    const subs = this.sql.exec("SELECT * FROM push_subs").toArray();
+    if (!subs.length) return;
+    const keys = await this.vapidKeys();
+    const subject = this.setting("push_subject") || "https://trip-agent.app";
+    let changed = false;
+    for (const sub of subs) {
+      try {
+        const r = await sendPush(
+          { endpoint: sub.endpoint as string, p256dh: sub.p256dh as string, auth: sub.auth as string },
+          { url: `/t/${this.roomId()}`, ...payload },
+          keys,
+          subject,
+        );
+        if (r.gone) {
+          this.sql.exec("DELETE FROM push_subs WHERE endpoint = ?", sub.endpoint);
+          changed = true;
+        } else if (!r.ok) console.error("push failed", r.status);
+      } catch (e) {
+        console.error("push error", e);
+      }
+    }
+    if (changed) this.broadcast({ type: "settings", settings: this.settings() });
+  }
+
+  /** 今天的早報（今天頁顯示用） */
+  private latestBrief(): { ts: number; text: string } | null {
+    const r = this.sql.exec("SELECT ts, text FROM messages WHERE role = 'assistant' AND meta LIKE '%\"kind\":\"brief\"%' ORDER BY ts DESC LIMIT 1").toArray()[0];
+    if (!r || zoned(Number(r.ts), this.p().timezone).date !== this.today()) return null;
+    return { ts: Number(r.ts), text: String(r.text) };
+  }
+
+  /** 個人助理的早報：天氣、今天的提醒與待辦、購物清單、本月花費；AI 只負責寫成好讀的幾行，失敗就用規則組 */
+  private async postPersonalBrief(date: string) {
+    const p = this.p();
+    this.setSetting("brief_sent", date);
+    const owner = p.travelers[0]?.name || "你";
+    const ctx = await this.toolCtx(AI_NAME);
+    const weather = homeOf(p) ? await runTool("get_weather", { days: 1 }, ctx).catch(() => null) : null;
+    const reminders = this.reminderList().filter((r) => String(r.time).startsWith(date));
+    const todos = this.checklistGet("待辦").filter((c) => !c.done);
+    const shopping = this.checklistGet("購物").filter((c) => !c.done);
+    const l = this.ledger();
+    const soon = this.memories().filter((m) => m.expires && String(m.expires) >= date).map((m) => `${m.content}（到 ${m.expires}）`).slice(0, 5);
+    const nt = (n: number) => `NT$${Math.round(n).toLocaleString("en-US")}`;
+    const facts = {
+      日期: `${date}（${"日一二三四五六"[new Date(date + "T00:00:00Z").getUTCDay()]}）`,
+      天氣: weather ?? "（沒有設定住的地方，查不到）",
+      今天的提醒: reminders.map((r) => `${String(r.time).slice(11, 16)} ${r.message}`),
+      待辦: todos.slice(0, 8).map((c) => c.item),
+      購物清單: shopping.slice(0, 8).map((c) => c.item),
+      本月花費: l.budget ? `${nt(l.total)}／預算 ${nt(l.budget)}（剩 ${nt(l.budget - l.total)}）` : nt(l.total),
+      最近要注意的事: soon,
+    };
+    let text: string;
+    try {
+      text = await this.generateText(
+        `你是${owner}的個人助理，語氣溫暖，只根據提供的資料寫，不要編造。`,
+        `請寫今天的早安簡報內文（標題系統會加，你不要寫標題），繁體中文、適合手機閱讀、200 字內、條列：
+1. 天氣與穿著、要不要帶傘（沒有天氣資料就略過）
+2. 今天的提醒（附時間）
+3. 待辦（最多 5 項）；購物清單還有幾項
+4. 本月花費（有預算就寫還剩多少）
+5. 最近要注意的事（沒有就略過）
+資料：${JSON.stringify(facts).slice(0, 4000)}`,
+        false,
+        0.5,
+      );
+    } catch {
+      text = [
+        reminders.length ? `⏰ 今天的提醒：${reminders.map((r) => `${String(r.time).slice(11, 16)} ${r.message}`).join("、")}` : "",
+        todos.length ? `✅ 待辦：${todos.slice(0, 5).map((c) => c.item).join("、")}` : "",
+        shopping.length ? `🛒 購物清單還有 ${shopping.length} 項` : "",
+        `💰 本月花費 ${facts.本月花費}`,
+      ].filter(Boolean).join("\n");
+    }
+    this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
+    this.broadcastState();
+    await this.pushAll({ title: `☀️ 早安，${owner}`, body: pushText(text), tag: "brief" });
+  }
+
+  /** 每天一次：過期的記憶失效 */
+  private dailyMaintenance(today: string) {
+    if (this.setting("maint_date") === today) return;
+    this.setSetting("maint_date", today);
+    this.sql.exec("UPDATE memories SET status = 'expired', updated = ? WHERE COALESCE(status, 'active') = 'active' AND expires IS NOT NULL AND expires < ?", Date.now(), today);
+  }
+
+  /** 匯出：聊天文字、記憶、清單、提醒、帳本、保管箱的清單（照片太大不放） */
+  private exportData() {
+    const p = this.p();
+    const rows = (q: string) => this.sql.exec(q).toArray();
+    return {
+      exported_at: new Date().toISOString(),
+      space: { title: p.title, kind: p.kind ?? "trip", city: p.city, timezone: p.timezone },
+      about_me: this.setting("core_profile"),
+      summary: this.setting("summary"),
+      memories: rows("SELECT id, ts, category, content, author, status, source, expires, superseded_by FROM memories ORDER BY ts"),
+      messages: rows("SELECT ts, author, role, text, photo_id FROM messages ORDER BY ts"),
+      checklist: rows("SELECT list, item, done, ts FROM checklist ORDER BY list, id"),
+      reminders: rows("SELECT due, message, author, sent FROM reminders ORDER BY due"),
+      expenses: rows("SELECT date, description, amount, currency, amount_twd, category FROM expenses ORDER BY date"),
+      documents: rows("SELECT d.ts, d.title, d.note, f.name AS folder FROM documents d LEFT JOIN doc_folders f ON f.id = d.folder_id ORDER BY d.ts"),
+    };
+  }
+
   /** 個人助理的系統提示詞：只有本人，沒有旅程、住宿、分帳 */
   private personalPrompt(trigger?: MessageRow, windowStartTs?: number): string {
     const p = this.p();
@@ -2058,7 +2378,10 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     const recall = trigger && windowStartTs ? this.recallOlder(trigger, windowStartTs) : "";
     const now = zoned(Date.now(), p.timezone);
     const a = p.accommodation;
-    const mems = this.memories().map((m) => `- #${m.id}［${m.category}］${m.content}`).join("\n") || "（目前沒有）";
+    const picked = this.relevantMemories(trigger?.text ?? "");
+    const mems =
+      picked.list.map((m) => `- #${m.id}［${m.category}］${m.content}${m.expires ? `（到 ${m.expires} 為止）` : ""}`).join("\n") || "（目前沒有）";
+    const core = this.setting("core_profile");
     const summary = this.setting("summary");
     const loc = this.memberLocation()
       .map((l) => `${l.area ? `${l.area}附近` : "地名查詢中"}（${Math.round((Date.now() - l.ts) / 60000)} 分鐘前）`)
@@ -2069,7 +2392,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
 ${now.date}（${now.weekday}）${now.time}，時區 ${p.timezone}。
 住的地方：${p.city || "（未設定）"}${a.address ? `（${a.address}）` : ""}${loc ? `\n${owner}最近的位置：${loc}` : ""}
 
-# 長期記憶（關於${owner}的偏好、決定、重要資訊；#編號可用 forget 刪除）
+${core ? `# 關於${owner}\n${core}\n\n` : ""}# 長期記憶（關於${owner}的偏好、決定、重要資訊；#編號可用 forget 刪除）${picked.list.length < picked.total ? `\n（共 ${picked.total} 條，這裡只列出跟這次對話最相關的；找不到就用 search_history）` : ""}
 ${mems}
 ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}
 # 回答規則
@@ -2084,7 +2407,9 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結。不要自己寫 Google 地圖網址或短網址，也不要用自己記得的地址或座標當連結。
 - 要看照片、圖片時用 find_images（圖片會顯示在回答下方），並說明是網路圖片、僅供參考；沒有要求就不要找圖片。
 - 收到照片：辨識內容並說明；說要「存起來」→ save_document（說了資料夾就填 folder）；要找存過的文件、票券 → find_documents。
-- 目前還沒有記帳功能：${owner}說花了多少錢，不要說要幫忙記帳；需要的話可以問要不要加進待辦提醒自己。
+- 記帳：${owner}說花了多少錢、只講「項目＋金額」（例如「午餐 120」「加油 1500」是加汽油的錢），或傳收據照片 → add_expense 產生記帳卡片（收據要讀出店名、日期、總金額；民國年加 1911），等${owner}按確認才寫入，不要說「已記好」。問花了多少、預算還剩多少 → expense_summary。花費不要用 remember 記。
+- 問「今天要做什麼」→ 用 list_reminders 和 get_checklist（待辦）整理給${owner}。
+- remember 只用來記之後還會用到的事。只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址都不要填。
 - 身分證字號、信用卡號、密碼這類敏感資料不要用 remember 記，也提醒${owner}不要在聊天裡傳。`;
   }
 
@@ -2459,18 +2784,44 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const transcript = fresh.slice(-80).map((m) => `${m.role === "assistant" ? AI_NAME : m.author}：${m.text.slice(0, 500)}`).join("\n");
     const existing = this.memories().map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n") || "（無）";
     const personal = this.isPersonal();
-    const intro = personal
-      ? `以下是個人助理和使用者最新的對話，請整理長期記憶：
-1. summary：把「舊摘要」與新對話合併成新的「長期對話摘要」（400 字內；保留使用者的偏好、習慣、做過的決定、進行中的事情、重要資訊）。
-2. memories：萃取新對話中「之後還會用到」且「不在現有記憶裡」的事實，每條一句話。
-   例如：喜歡／不吃什麼、家人與朋友、工作與作息、做了什麼決定、訂了什麼、要做的事；提到的日期一律寫成實際日期（不要寫「明天」「下週」）。
-   不要收錄身分證字號、信用卡號、密碼、病歷細節這類敏感資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。`
+    // 記憶暫停中：這段期間的對話不整理（游標照樣往前，之後也不會補記）
+    if (personal && this.setting("memory_paused") === "1") {
+      this.setSetting("memory_cursor", String(fresh[fresh.length - 1].ts));
+      this.consolidating = false;
+      return;
+    }
+    const today = this.today();
+    const prompt = personal
+      ? `以下是個人助理和使用者最新的對話（今天是 ${today}），請整理長期記憶：
+1. summary：把「舊摘要」與新對話合併成新的「長期對話摘要」（400 字內；保留進行中的事情、做過的決定、重要資訊）。
+2. about_me：更新「關於我」（300 字內）：只放長期穩定的事（家人與朋友、住哪、工作與作息、飲食、興趣、重要偏好）。保留現有內容中仍然正確的部分（包含使用者自己寫的），有新的穩定事實才修改；沒有變化就原樣輸出。
+3. memories：萃取新對話中「之後還會用到」且「不在現有記憶裡」的事實，每條一句話。
+   - 提到的日期一律寫成實際日期（不要寫「明天」「下週」）。
+   - 是在更新某條現有記憶（例如搬家、換工作、時間改了），replaces 填那條記憶的 id；不是就填 0。
+   - 只在短期內有效的事（考試、這週的安排、某天的約），expires 填失效日期 YYYY-MM-DD；長期有效就填空字串。
+   - 對話中已經用 remember 記下、或意思跟現有記憶一樣的，不要再新增，也不要換句話說去取代。
+   - 只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址一律填空字串。
+   - 不要收錄身分證字號、信用卡號、密碼、病歷細節這類敏感資料，也不要收錄閒聊、花費明細（記帳另外記）或 AI 自己的建議。沒有就回空陣列。
+4. remove_ids：現有記憶中已經過時或被推翻的 id（會標成「已取代」保留歷史，不會真的刪掉）。沒有就回空陣列。
+
+舊摘要：
+${this.setting("summary") || "（無）"}
+
+現在的「關於我」：
+${this.setting("core_profile") || "（無）"}
+
+現有記憶：
+${existing}
+
+新對話：
+${transcript}
+
+輸出 JSON：{"summary": "...", "about_me": "...", "memories": [{"content": "...", "category": "偏好|決定|預訂|資訊|待辦", "expires": "", "replaces": 0}], "remove_ids": [數字]}`
       : `以下是家庭旅遊群組最新的對話，請整理群組的長期記憶：
 1. summary：把「舊摘要」與新對話合併成新的「整趟旅程對話摘要」（400 字內；保留每個人的偏好、做過的決定、討論過的店家與地點、待辦、重要資訊）。
 2. memories：萃取新對話中「之後還會用到」且「不在現有記憶裡」的事實，每條一句話、寫清楚是誰。
    例如：誰喜歡／不吃什麼、想買什麼、想去哪、決定了什麼、訂了什麼、待辦事項、聊到的店名與地址。
-   不要收錄住宿地址、航班這些系統已知的資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。`;
-    const prompt = `${intro}
+   不要收錄住宿地址、航班這些系統已知的資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。
 3. remove_ids：現有記憶中已經過時、被新對話推翻、或重複的記憶 id。沒有就回空陣列。
 
 舊摘要：
@@ -2487,11 +2838,30 @@ ${transcript}
       // 背景整理只用 Gemini 一半的額度、不等待，把額度留給回答問題
       const json = parseArgs((await this.generateText(personal ? "你是負責整理個人助理長期記憶的助理，只輸出 JSON。" : "你是負責整理旅遊群組長期記憶的助理，只輸出 JSON。", prompt, true, 0.5)).replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as any;
       if (typeof json.summary === "string" && json.summary.trim()) this.setSetting("summary", json.summary.trim().slice(0, 2000));
-      for (const rid of (json.remove_ids ?? []).slice(0, 20)) {
-        if (Number.isInteger(Number(rid))) this.sql.exec("DELETE FROM memories WHERE id = ?", Number(rid));
-      }
-      for (const m of (json.memories ?? []).slice(0, 20)) {
-        if (m?.content) this.addMemory(String(m.content), String(m.category || "資訊"), "AI 自動整理");
+      if (personal) {
+        if (typeof json.about_me === "string" && json.about_me.trim()) this.setSetting("core_profile", json.about_me.trim().slice(0, 800));
+        // 使用者親口說的記憶，整理時不能當成「重複」移掉，只能被內容真的不同的新事實取代
+        for (const rid of (json.remove_ids ?? []).slice(0, 20)) {
+          if (Number.isInteger(Number(rid))) this.sql.exec("UPDATE memories SET status = 'superseded', updated = ? WHERE id = ? AND COALESCE(status, 'active') = 'active' AND COALESCE(source, 'auto') != 'user'", Date.now(), Number(rid));
+        }
+        const active = this.memories();
+        for (const m of (json.memories ?? []).slice(0, 20)) {
+          const content = String(m?.content ?? "").trim();
+          if (!content || this.memoryGuard(content)) continue;
+          const old = active.find((x) => Number(x.id) === Number(m.replaces));
+          // 跟現有的某條講的是同一件事：不新增、不取代（模型常常把剛記的換句話說再記一次）
+          if (active.some((x) => sameFact(String(x.content), content))) continue;
+          const expires = /^\d{4}-\d{2}-\d{2}$/.test(String(m.expires ?? "")) ? String(m.expires) : null;
+          const id = this.insertMemory(content, String(m.category || "資訊"), "AI 自動整理", "auto", expires);
+          if (old) this.sql.exec("UPDATE memories SET status = 'superseded', superseded_by = ?, updated = ? WHERE id = ?", id, Date.now(), old.id);
+        }
+      } else {
+        for (const rid of (json.remove_ids ?? []).slice(0, 20)) {
+          if (Number.isInteger(Number(rid))) this.sql.exec("DELETE FROM memories WHERE id = ?", Number(rid));
+        }
+        for (const m of (json.memories ?? []).slice(0, 20)) {
+          if (m?.content) this.addMemory(String(m.content), String(m.category || "資訊"), "AI 自動整理");
+        }
       }
       this.setSetting("memory_cursor", String(fresh[fresh.length - 1].ts));
       this.broadcastState();

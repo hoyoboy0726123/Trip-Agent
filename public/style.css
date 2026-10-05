@@ -356,6 +356,20 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .row.between { justify-content: space-between; }
 .small { font-size: 13px; }
 .tag { font-size: 11px; background: var(--red-soft); color: var(--red-ink); border-radius: 6px; padding: 1px 6px; }
+.tag.tag-you { background: #dcefe3; color: #1f7a4d; }
+/* 個人助理：今天頁、帳本 */
+.today-head { display: grid; gap: 2px; margin: 4px 2px 12px; }
+.today-date { font-family: var(--title-font); font-size: 26px; font-weight: 700; }
+.today-card { display: grid; gap: 6px; margin-bottom: 10px; }
+.today-card h3 { margin: 0; }
+.today-money-card { width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.today-money { font-size: 24px; font-weight: 800; font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.meter { flex: 1; height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; min-width: 60px; }
+.meter > span { display: block; height: 100%; border-radius: 999px; background: var(--red); }
+.meter > span.warn { background: #d98a00; }
+.meter > span.over { background: var(--danger); }
+.inline-form input { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font: inherit; font-size: 16px; }
+.cat-row { display: grid; grid-template-columns: 4.5em 1fr auto; gap: 10px; align-items: center; font-size: 14px; padding: 4px 0; font-variant-numeric: tabular-nums; }
 .today { outline: 2px solid var(--red); }
 .btn { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 7px 12px; font-size: 14px; }
 .btn.danger { color: var(--danger); }

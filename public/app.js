@@ -1349,19 +1349,22 @@ function renderPanelInner() {
       b.innerHTML = `
         <div class="card small">
           <h3>AI 使用順序</h3>
-          <ol class="steps">
+          ${isPersonal() ? `<ol class="steps">
+            <li>你自己的 Gemini 金鑰：${s.gemini ? `✅ ${escapeHtml(s.gemini)}` : "❌ 未設定"}</li>
+            <li>備援：網站提供的 Workers AI 免費額度（每天台灣時間早上 8 點重置）</li>
+          </ol>` : `<ol class="steps">
             ${s.ownerGemini ? "<li>網站提供的 Gemini 免費額度</li>" : ""}
             <li>網站提供的 Workers AI 免費額度（每天台灣時間早上 8 點重置）</li>
-            <li>這個${isPersonal() ? "空間" : "旅程"}自己的 Gemini 金鑰：${s.gemini ? `✅ ${escapeHtml(s.gemini)}` : "❌ 未設定"}</li>
-          </ol>
+            <li>這個旅程自己的 Gemini 金鑰：${s.gemini ? `✅ ${escapeHtml(s.gemini)}` : "❌ 未設定"}</li>
+          </ol>`}
           ${s.gemini ? `<div class="muted">自己的 Gemini 用量：<span id="gemini-usage">${escapeHtml(geminiUsageText(S.state?.gemini))}</span></div>` : ""}
         </div>
         <div class="card"><h3>🔍 Tavily 搜尋金鑰</h3>
           <div class="small muted">目前：${escapeHtml(s.tavily || "未設定")}。額度用完時到 <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a> 換一組。</div>
           <form class="row" id="k-tavily"><input name="k" placeholder="新的 tvly-…" autocomplete="off" style="flex:1" /><button class="btn primary-sm">更新</button></form>
         </div>
-        <div class="card"><h3>🤖 Gemini 金鑰（選填）</h3>
-          <div class="small muted">到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> 免費申請。網站提供的免費額度用完時才會用它。</div>
+        <div class="card"><h3>🤖 Gemini 金鑰${isPersonal() ? "" : "（選填）"}</h3>
+          <div class="small muted">到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> 免費申請。${isPersonal() ? "AI 會先用這把金鑰，額度用完才改用 Workers AI；沒有金鑰就只能用 Workers AI。" : "網站提供的免費額度用完時才會用它。"}</div>
           <form class="row" id="k-gemini"><input name="k" placeholder="AIza…" autocomplete="off" style="flex:1" /><button class="btn primary-sm">更新</button></form>
           ${s.gemini ? `<button class="btn small danger" id="k-gemini-del" style="margin-top:6px">移除 Gemini 金鑰</button>` : ""}
         </div>
@@ -1398,7 +1401,7 @@ function renderPersonalSettings(st, b) {
       <input type="checkbox" id="autoloc" ${auto ? "checked" : ""} /></label></div>
     <div class="card small">
       <div>📍 ${escapeHtml(t.city || "未設定住的地方")}｜${escapeHtml(t.timezone)}</div>
-      <div>🤖 AI：Gemini 優先，額度用完改用 Workers AI</div>
+      <div>🤖 AI：${s.gemini ? "你的 Gemini 金鑰優先，額度用完改用 Workers AI" : "⚠️ 還沒填 Gemini 金鑰，目前只用 Workers AI（到下方「API 金鑰」填）"}</div>
       <div>🔍 網路搜尋：${s.tavily ? "✅ Tavily" : "⚠️ 未設定（AI 不能上網查資料）"}</div>
     </div>
     <div class="card"><div class="stack"><button class="btn" data-go="keys">🔑 API 金鑰</button></div></div>

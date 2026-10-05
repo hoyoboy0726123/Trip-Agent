@@ -105,6 +105,11 @@ async function createPersonal(req: Request, env: Env): Promise<Response> {
   const home = b.home ?? {};
   const lat = Number(home.lat), lon = Number(home.lon);
   const hasCoord = home.lat != null && home.lon != null && Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+  // 個人助理不用網站的 Gemini 額度：每個人用自己的金鑰，用完才改用 Workers AI
+  const geminiKey = str(b.geminiKey, 200);
+  if (!geminiKey) return bad("請填你自己的 Gemini API 金鑰");
+  const gErr = await validateGemini(geminiKey);
+  if (gErr) return bad(gErr);
   const tavilyKey = str(b.tavilyKey, 200);
   if (tavilyKey) {
     const tErr = await validateTavily(tavilyKey);
@@ -116,6 +121,7 @@ async function createPersonal(req: Request, env: Env): Promise<Response> {
     roomId, name, password, timezone: str(b.timezone, 60), city: str(home.city, 40),
     home: { address: str(home.address, 300), lat: hasCoord ? lat : null, lon: hasCoord ? lon : null },
     tavilyKey,
+    geminiKey,
   };
   const r = await roomStub(env, roomId).setupPersonal(input);
   if (!r.ok) return bad(r.error ?? "建立失敗", 500);

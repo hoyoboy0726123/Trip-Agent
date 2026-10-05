@@ -110,6 +110,7 @@ export interface PersonalSetupInput {
   city: string;
   home: { address: string; lat: number | null; lon: number | null };
   tavilyKey: string;
+  geminiKey: string;
 }
 
 function newId(): string {
@@ -374,7 +375,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     this.setSetting("pw_room", await hashPassword(crypto.randomUUID()));
     this.setSetting("pw_admin", await hashPassword(input.password));
     this.setSetting("auth_version", "1");
-    await this.storeKeys(input.tavilyKey, "");
+    await this.storeKeys(input.tavilyKey, input.geminiKey);
     this.saveProfile(p);
     this.touchMember(input.name);
     this.postAiMessage(
@@ -1680,8 +1681,11 @@ score：當旅遊日記插圖的價值，大部分照片是 2–4 分：
   /** 日記：長文又要照格式，先用比較會寫的模型（一天一篇，額度跟聊天分開；擁有者金鑰→旅程自己的金鑰），不行再用一般的模型鏈 */
   private async generateLong(system: string, prompt: string): Promise<string> {
     const writer = this.env.GEMINI_WRITER_MODEL;
-    const keys = [this.env.GEMINI_API_KEY ?? "", (await this.keys()).gemini ?? ""].filter(Boolean);
+    const own = (await this.keys()).gemini ?? "";
+    // 個人助理只用自己的金鑰（index 1 = gemini-own）
+    const keys = this.isPersonal() ? ["", own] : [this.env.GEMINI_API_KEY ?? "", own];
     for (const [i, key] of keys.entries()) {
+      if (!key) continue;
       if (!writer) break;
       try {
         const r = await geminiProvider(this.env, i ? "gemini-own" : "gemini", key, undefined, writer).generate({ system, turns: [{ role: "user", parts: [{ text: prompt }] }], timeoutMs: 150_000 });
@@ -1962,6 +1966,12 @@ ${transcript || "（今天群組沒什麼對話）"}`;
 
   /** vision：有照片要辨識時，旅程自己的 Gemini 也排到 Workers AI 前面（看圖比 Gemma 準很多），額度滿了才退回 Gemma */
   private async chain(vision = false): Promise<ProviderId[]> {
+    // 個人助理不用網站的 Gemini：自己的金鑰優先，額度用完才改用 Workers AI
+    if (this.isPersonal()) {
+      const order: ProviderId[] = (await this.keys()).gemini ? ["gemini-own"] : [];
+      if (!(await this.workersAiBlocked())) order.push("workers-ai");
+      return order;
+    }
     const order: ProviderId[] = [];
     const own = !!(await this.keys()).gemini;
     if (this.env.GEMINI_API_KEY) order.push("gemini");

@@ -67,6 +67,8 @@ function renderPersonalSetup() {
       <div id="ps-picks" class="small"></div>
       <label class="field">密碼（至少 6 個字，只有你知道）<input id="ps-pw" type="password" autocomplete="new-password" required /></label>
       <label class="field">再輸入一次密碼<input id="ps-pw2" type="password" autocomplete="new-password" required /></label>
+      <label class="field">你的 Gemini API 金鑰（必填）<input id="ps-gemini" placeholder="AIza…" autocomplete="off" required /></label>
+      <p class="small muted" style="margin-top:-4px">到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> 用 Google 帳號免費申請，按「Create API key」複製貼上。AI 會先用這把金鑰，額度用完才改用備援的 Workers AI。</p>
       <details class="small"><summary>網路搜尋金鑰（選填，之後也可以在設定填）</summary>
         <p class="muted">到 <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a> 免費申請，AI 才能上網查資料。</p>
         <input id="ps-tavily" placeholder="tvly-…" autocomplete="off" />
@@ -114,12 +116,14 @@ function renderPersonalSetup() {
     if (!name) return err("請填你的稱呼");
     if (pw.trim().length < 6) return err("密碼至少 6 個字");
     if (pw !== pw2) return err("兩次輸入的密碼不一樣");
+    const geminiKey = $("#ps-gemini", root).value.trim();
+    if (!geminiKey) return err("請填你自己的 Gemini API 金鑰");
     const btn = $("#ps-go", root);
     btn.disabled = true;
     btn.textContent = "建立中…";
     const place = $("#ps-place", root).value.trim();
     const r = await api("/api/personal", {
-      invite, name, password: pw, tavilyKey: $("#ps-tavily", root).value.trim(),
+      invite, name, password: pw, geminiKey, tavilyKey: $("#ps-tavily", root).value.trim(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       home: P.home ?? { city: place, address: "", lat: null, lon: null },
     });

@@ -368,6 +368,13 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .meter > span { display: block; height: 100%; border-radius: 999px; background: var(--red); }
 .meter > span.warn { background: #d98a00; }
 .meter > span.over { background: var(--danger); }
+.note { display: grid; gap: 8px; margin-bottom: 10px; }
+.note-title { font-size: 16px; line-height: 1.4; }
+.note-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.note-tags .tag { border: 0; cursor: pointer; font: inherit; font-size: 12px; }
+.note-body { max-height: 13em; overflow: auto; }
+.note-body ul, .note-body ol { padding-left: 1.2em; margin: 4px 0; }
+.note-search { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); font: inherit; font-size: 16px; }
 .inline-form input { min-width: 0; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font: inherit; font-size: 16px; }
 .cat-row { display: grid; grid-template-columns: 4.5em 1fr auto; gap: 10px; align-items: center; font-size: 14px; padding: 4px 0; font-variant-numeric: tabular-nums; }
 .today { outline: 2px solid var(--red); }

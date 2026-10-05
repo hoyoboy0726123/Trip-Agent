@@ -857,6 +857,7 @@ function renderChips() {
     null,
     ["list", "清單", () => openPanel("checklist")],
     ["bell", "提醒", () => openPanel("reminders")],
+    ["book", "知識庫", () => openPanel("notes")],
     ["ticket", "保管箱", () => openPanel("tickets")],
     ["bookmark", "記憶", () => openPanel("memories")],
     ["plus", "更多", openMore],
@@ -1231,6 +1232,7 @@ function renderPanelInner() {
     if (S.panel === "today") return renderTodayPanel(st, b);
     if (S.panel === "expenses") return renderLedgerPanel(st, b);
     if (S.panel === "memories") return renderPersonalMemories(st, b);
+    if (S.panel === "notes") return renderNotesPanel(st, b);
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
@@ -1595,6 +1597,46 @@ async function disablePush() {
   if (sub) await api("/api/push/unsubscribe", { endpoint: sub.endpoint });
 }
 
+/** 知識庫：貼連結讓 AI 整理存進來；可以搜尋、看重點、開原始連結、刪除 */
+function renderNotesPanel(st, b) {
+  els.panelTitle.textContent = "📚 知識庫";
+  const notes = st.notes || [];
+  const q = (S.noteQuery || "").trim().toLowerCase();
+  const tagsOf = (n) => { try { return JSON.parse(n.tags || "[]"); } catch { return []; } };
+  const list = q ? notes.filter((n) => `${n.title} ${n.summary} ${n.tags}`.toLowerCase().includes(q)) : notes;
+  b.innerHTML = `
+    ${backToHub()}
+    <p class="small muted">在聊天貼 Facebook／Instagram Reels 或網頁連結，AI 會看完幫你整理重點存進來（影片也看得到）。之後在聊天問「之前存的那個…」也找得到。</p>
+    <input id="note-q" class="note-search" placeholder="搜尋標題、重點、標籤…" value="${escapeHtml(S.noteQuery || "")}" autocomplete="off" />
+    <div class="small muted" style="margin:6px 2px">${q ? `找到 ${list.length} 筆` : `共 ${notes.length} 筆`}</div>
+    ${list.map((n) => `<div class="card note">
+        <div class="row between" style="align-items:flex-start"><b class="note-title">${escapeHtml(n.title)}</b><span class="small muted" style="white-space:nowrap">${dayText(n.ts)}</span></div>
+        ${tagsOf(n).length ? `<div class="note-tags">${tagsOf(n).map((t) => `<button type="button" class="tag" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</button>`).join("")}</div>` : ""}
+        <div class="small msg-text note-body">${md(n.summary || "")}</div>
+        <div class="row" style="gap:6px;flex-wrap:wrap">${n.url ? `<a class="btn small" href="${escapeHtml(n.url)}" target="_blank" rel="noopener">開原始連結</a>` : ""}<button type="button" class="btn small" data-ask="${n.id}">問 AI</button><button type="button" class="btn danger small" data-del-note="${n.id}">刪除</button></div>
+      </div>`).join("") || `<div class="card small muted">${q ? "找不到符合的內容" : "還沒有內容。試試在聊天貼一個 Reels 或網頁連結。"}</div>`}`;
+  bindBack(b);
+  const qi = $("#note-q", b);
+  qi.addEventListener("input", () => {
+    S.noteQuery = qi.value;
+    const pos = qi.selectionStart;
+    renderPanel();
+    const again = $("#note-q", els.panelBody);
+    again?.focus();
+    again?.setSelectionRange(pos, pos);
+  });
+  b.querySelectorAll("[data-tag]").forEach((x) => x.addEventListener("click", () => { S.noteQuery = x.dataset.tag; renderPanel(); }));
+  b.querySelectorAll("[data-del-note]").forEach((x) => x.addEventListener("click", () => confirm("確定從知識庫刪除這筆？") && action({ action: "note_delete", id: Number(x.dataset.delNote) })));
+  b.querySelectorAll("[data-ask]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const n = notes.find((y) => y.id === Number(x.dataset.ask));
+      els.panel.close();
+      els.input.value = `關於知識庫裡的「${n.title}」，`;
+      els.input.focus();
+    }),
+  );
+}
+
 /** 個人助理的設定：只有本人，沒有邀請家人、旅程設定、回覆時機 */
 function renderPersonalSettings(st, b) {
   els.panelTitle.textContent = "⚙️ 設定";
@@ -1826,6 +1868,7 @@ function renderSettingsPanel(st, b) {
 function toolCards() {
   if (isPersonal()) {
     return [
+      ["notes", "book", "知識庫", "貼連結讓 AI 整理存下來"],
       ["tickets", "ticket", "保管箱", "照片、票券、文件，離線可看"],
       ["checklist", "list", "清單", "待辦、購物"],
       ["reminders", "bell", "提醒", "時間到通知你"],

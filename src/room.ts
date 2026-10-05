@@ -164,6 +164,10 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   { tool: "disaster_alerts", test: (t) => /地震|颱風|海嘯|警報|豪雨|火山|洪水/.test(t) },
   { tool: "train_status", test: (t) => /延誤|停駛|誤點|停開|運行狀況|電車.{0,6}(正常|狀況)/.test(t) },
   { tool: "find_nearby", test: (t) => /附近|周邊|周圍|旁邊有什麼/.test(t), alt: ["web_search"] },
+  // 貼了連結：先讀內容（FB／IG 影片也看得到）
+  { tool: "read_webpage", test: (t) => /https?:\/\/\S+/.test(t) },
+  // 個人助理：說要存進知識庫，或整則訊息只有一個連結（就是要存）
+  { tool: "save_note", test: (t) => /(存|收|放|加)(到|進|入)?(我的)?知識庫/.test(t) || /^\s*https?:\/\/\S+\s*$/.test(t) },
 ];
 
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
@@ -278,6 +282,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     if (!this.sql.exec("PRAGMA table_info(documents)").toArray().some((c) => c.name === "folder_id")) this.sql.exec("ALTER TABLE documents ADD COLUMN folder_id INTEGER");
     // 個人助理：手機推播訂閱；記憶 v2（狀態、來源、到期日、被哪一條取代）
     this.sql.exec("CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT, ts INTEGER, ua TEXT)");
+    // 個人助理知識庫：貼連結（文章、FB／IG 影片）或筆記，AI 整理成標題＋重點＋標籤
+    this.sql.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, summary TEXT, content TEXT, url TEXT, tags TEXT, thumb TEXT)");
     for (const col of ["status TEXT DEFAULT 'active'", "source TEXT", "expires TEXT", "superseded_by INTEGER", "updated INTEGER"]) {
       if (!this.sql.exec("PRAGMA table_info(memories)").toArray().some((c) => c.name === col.split(" ")[0])) this.sql.exec(`ALTER TABLE memories ADD COLUMN ${col}`);
     }
@@ -851,6 +857,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       }
       case "restore_memory":
         this.sql.exec("UPDATE memories SET status = 'active', superseded_by = NULL, expires = NULL, updated = ? WHERE id = ?", Date.now(), Number(msg.id));
+        this.broadcastState();
+        break;
+      case "note_delete":
+        this.sql.exec("DELETE FROM notes WHERE id = ?", Number(msg.id));
         this.broadcastState();
         break;
       case "core_save":
@@ -2104,6 +2114,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             core: this.setting("core_profile"),
             memoryArchive: this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') != 'active' ORDER BY COALESCE(updated, ts) DESC LIMIT 60").toArray(),
             brief: this.latestBrief(),
+            notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
           }
         : {}),
     };
@@ -2240,6 +2251,70 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     };
   }
 
+  /** FB／IG 影片交給 Gemini 看畫面＋聽聲音做摘要（Workers AI 看不了影片，沒有 Gemini 就回 null） */
+  async describeVideo(mime: string, base64: string, hint: string): Promise<string | null> {
+    const prompt = `這是一支社群短影片${hint ? `，貼文文字開頭是：「${hint}」` : ""}。請用繁體中文整理：
+1. 一句話主旨
+2. 重點條列：講者說了什麼、畫面上出現什麼（步驟、操作、畫面上的文字）
+3. 提到的工具、網站、店名、地點、價格、數字
+只根據影片內容，聽不清楚、看不清楚的就略過，不要編造。`;
+    for (const id of (await this.chain(true)).filter((x) => x !== "workers-ai")) {
+      try {
+        const r = await (await this.provider(id, 1, 15_000)).generate({
+          system: "你是幫使用者整理影片內容的助理，只根據影片內容，不要編造。",
+          turns: [{ role: "user", parts: [{ image: { mime, data: base64 } }, { text: prompt }] }],
+          timeoutMs: 90_000,
+        });
+        if (r.text.trim()) return r.text.trim();
+      } catch (e) {
+        this.noteQuota(e);
+        if (!(e instanceof RateLimitedError)) console.error(`describeVideo via ${id} failed`, e);
+      }
+    }
+    return null;
+  }
+
+  /** 知識庫：同一個網址再存就更新原本那筆 */
+  noteSave(n: { title: string; summary: string; content?: string; url?: string; tags?: string[]; thumb?: string }, author: string) {
+    if (!n.title.trim() || !n.summary.trim()) return { error: "標題和摘要不能是空的" };
+    const tags = JSON.stringify(n.tags ?? []);
+    const old = n.url ? this.sql.exec("SELECT id FROM notes WHERE url = ?", n.url).toArray()[0] : undefined;
+    let id: number;
+    if (old) {
+      id = Number(old.id);
+      this.sql.exec("UPDATE notes SET ts = ?, title = ?, summary = ?, content = COALESCE(?, content), tags = ? WHERE id = ?", Date.now(), n.title, n.summary, n.content ?? null, tags, id);
+    } else {
+      id = Number(this.sql.exec("INSERT INTO notes (ts, author, title, summary, content, url, tags, thumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", Date.now(), author, n.title, n.summary, n.content ?? null, n.url ?? null, tags, n.thumb ?? null).one().id);
+    }
+    this.broadcastState();
+    return { saved_id: id, updated: !!old, note: "已存進 工具箱 → 知識庫" };
+  }
+
+  /** 知識庫搜尋：關鍵字（標題、摘要、原文、標籤）＋雙字詞相似度 */
+  noteSearch(keyword: string) {
+    const rows = this.sql.exec("SELECT id, ts, title, summary, content, url, tags FROM notes ORDER BY ts DESC").toArray();
+    const fmt = (r: Record<string, SqlStorageValue>) => ({
+      id: r.id, date: this.localTime(Number(r.ts)).slice(0, 10), title: r.title, summary: String(r.summary).slice(0, 600), url: r.url, tags: JSON.parse(String(r.tags || "[]")),
+    });
+    const k = keyword.trim().toLowerCase();
+    if (!k) return { found: rows.length, notes: rows.slice(0, 8).map(fmt) };
+    const words = k.split(/\s+/).filter(Boolean);
+    const q = bigrams(k);
+    const scored = rows
+      .map((r) => {
+        const text = `${r.title} ${r.summary} ${r.content ?? ""} ${r.tags}`.toLowerCase();
+        const exact = words.every((w) => text.includes(w)) ? 2 : 0;
+        const g = bigrams(text);
+        let hit = 0;
+        for (const x of q) if (g.has(x)) hit++;
+        return { r, score: exact + (q.size ? hit / q.size : 0) };
+      })
+      .filter((x) => x.score >= 0.5)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+    return scored.length ? { found: scored.length, notes: scored.map((x) => fmt(x.r)) } : { found: 0, note: "知識庫裡找不到相關的內容" };
+  }
+
   /** 記帳後檢查預算：到八成、超支各提醒一次（聊天＋手機推播） */
   private async checkBudget() {
     const budget = Number(this.setting("budget_month", "0"));
@@ -2368,6 +2443,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       reminders: rows("SELECT due, message, author, sent FROM reminders ORDER BY due"),
       expenses: rows("SELECT date, description, amount, currency, amount_twd, category FROM expenses ORDER BY date"),
       documents: rows("SELECT d.ts, d.title, d.note, f.name AS folder FROM documents d LEFT JOIN doc_folders f ON f.id = d.folder_id ORDER BY d.ts"),
+      notes: rows("SELECT ts, title, summary, content, url, tags FROM notes ORDER BY ts"),
     };
   }
 
@@ -2409,6 +2485,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 收到照片：辨識內容並說明；說要「存起來」→ save_document（說了資料夾就填 folder）；要找存過的文件、票券 → find_documents。
 - 記帳：${owner}說花了多少錢、只講「項目＋金額」（例如「午餐 120」「加油 1500」是加汽油的錢），或傳收據照片 → add_expense 產生記帳卡片（收據要讀出店名、日期、總金額；民國年加 1911），等${owner}按確認才寫入，不要說「已記好」。問花了多少、預算還剩多少 → expense_summary。花費不要用 remember 記。
 - 問「今天要做什麼」→ 用 list_reminders 和 get_checklist（待辦）整理給${owner}。
+- ${owner}貼了連結（只貼連結，或說「存起來／存到知識庫」）：先用 read_webpage 讀內容（Facebook、Instagram 的 Reels 也看得到影片內容），整理成標題＋3–6 點具體重點＋2–5 個標籤，用 save_note 存進知識庫（url 填原始連結，content 放貼文文字），再回覆重點並說已存進「知識庫」。${owner}只是問連結在講什麼，就回答後問要不要存進知識庫。讀不到內容就照實說，請${owner}貼文字或截圖。
+- 問以前存過的文章、影片、資料 → search_notes。
 - remember 只用來記之後還會用到的事。只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址都不要填。
 - 身分證字號、信用卡號、密碼這類敏感資料不要用 remember 記，也提醒${owner}不要在聊天裡傳。`;
   }
@@ -2587,6 +2665,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const system = this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
     const images: AttachedImage[] = [];
     const toolsUsed: string[] = [];
+    const lastResults: Record<string, unknown> = {};
     const drafts: number[] = [];
     const ctx = await this.toolCtx(user.name, {
       photoId: trigger.photo_id,
@@ -2631,7 +2710,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             // 提醒過還是不呼叫：系統自己執行工具，再請模型根據結果回答
             if (need && !forced.has(need) && step < MAX_STEPS - 1) {
               forced.add(need);
-              const note = await this.forceTool(need, provider, history, trigger, user, id, ctx, toolsUsed, image);
+              const note = await this.forceTool(need, provider, history, trigger, user, id, ctx, toolsUsed, image, lastResults);
               if (note) {
                 this.broadcast({ type: "ai_reset", id });
                 turns = [...turns, { role: "model", parts: [{ text: res.text || "（略）" }] }, { role: "user", parts: [{ text: note }] }];
@@ -2673,6 +2752,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             toolsUsed.push(c.name);
             this.broadcast({ type: "ai_tool", id, name: c.name, label: toolLabel(c.name), args: c.args });
             const result = await runTool(c.name, c.args, ctx);
+            lastResults[c.name] = result;
             resultParts.push({ result: { id: c.id, name: c.name, response: result } });
           }
           turns = [...turns, { role: "model", parts: modelParts }, { role: "user", parts: resultParts }];
@@ -2715,7 +2795,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
    */
   private async forceTool(
     need: string, provider: Provider, history: MessageRow[], trigger: MessageRow, user: Attachment,
-    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null,
+    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null, lastResults: Record<string, unknown> = {},
   ): Promise<string | null> {
     const p = this.p();
     let args: Record<string, unknown>;
@@ -2734,6 +2814,28 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       } catch {}
       if (!queries.length) queries = [trigger.text.replace(/給我看|提供|請|幫我找|的?(照片|圖片|相片)|你推薦的/g, "").trim() || trigger.text];
       args = { queries, count: Math.min(queries.length * 2, 6) };
+    } else if (need === "save_note") {
+      // 只貼了連結卻沒存：用剛才讀到的內容（沒讀過就先讀）請模型整理成一筆
+      const url = trigger.text.match(/https?:\/\/[^\s<>"）)]+/)?.[0];
+      let read = lastResults.read_webpage as any;
+      if (!read && url) read = await runTool("read_webpage", { url }, ctx);
+      if (!read || read.error) return null;
+      try {
+        const r = await provider.generate({
+          system: "你只輸出 JSON。",
+          turns: [{ role: "user", parts: [{ text: `把下面讀到的內容整理成知識庫的一筆：title（20 字內，說清楚是什麼）、summary（3–6 點具體重點，Markdown 條列，寫出工具、做法、數字、網址）、tags（2–5 個）。只輸出 JSON：{"title":"...","summary":"...","tags":["..."]}\n內容：${JSON.stringify(read).slice(0, 6000)}` }] }],
+          json: true,
+        });
+        const j = parseArgs(r.text.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as any;
+        args = { title: j.title, summary: j.summary, tags: j.tags, url: read.url || url, content: String(read.caption ?? read.content ?? "").slice(0, 3000) };
+      } catch {
+        return null;
+      }
+      if (!args.title || !args.summary) return null;
+    } else if (need === "read_webpage") {
+      const url = trigger.text.match(/https?:\/\/[^\s<>"）)]+/)?.[0];
+      if (!url) return null;
+      args = { url };
     } else if (need === "find_nearby") {
       const t = trigger.text;
       const category =

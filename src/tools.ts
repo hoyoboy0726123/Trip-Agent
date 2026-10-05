@@ -9,6 +9,11 @@ export interface RoomApi {
   addMemory(content: string, category: string, author: string): number;
   /** remember 工具用：個人助理會擋敏感資料、記憶暫停時不記 */
   remember(content: string, category: string, author: string, expires?: string): unknown;
+  /** 影片交給會看影片的 AI（Gemini）做摘要；沒有就回 null */
+  describeVideo(mime: string, base64: string, hint: string): Promise<string | null>;
+  /** 個人助理知識庫 */
+  noteSave(n: { title: string; summary: string; content?: string; url?: string; tags?: string[]; thumb?: string }, author: string): unknown;
+  noteSearch(keyword: string): unknown;
   /** 個人帳本：某個月的花費、分類、預算 */
   ledger(month?: string): unknown;
   deleteMemory(id: number): boolean;
@@ -424,24 +429,29 @@ export const TOOLS: Tool[] = [
     },
   },
   {
-    label: "📄 閱讀網頁",
+    label: "📄 閱讀連結",
     decl: {
       name: "read_webpage",
-      description: "讀取指定網址的網頁全文（例如搜尋結果中的官方網站），用來確認細節。",
+      description:
+        "讀取網址的內容：一般網頁讀全文；Facebook、Instagram、Threads 的貼文與 Reels 影片會拿到貼文文字，並看影片、聽內容做摘要（video_summary）。" +
+        "成員貼連結、或要確認網頁細節時使用。",
       parameters: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
     },
-    async run(args, { tavilyKey }) {
-      if (!tavilyKey) return { error: "這個旅程還沒設定 Tavily 金鑰" };
+    async run(args, { tavilyKey, room }) {
+      const url = String(args.url ?? "").trim();
+      if (!/^https?:\/\//i.test(url)) return { error: "網址不正確" };
+      if (SOCIAL_HOST.test(url)) return readSocial(url, room);
+      if (!tavilyKey) return readPlain(url);
       const res = await fetch("https://api.tavily.com/extract", {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${tavilyKey}` },
-        body: JSON.stringify({ urls: [args.url] }),
+        body: JSON.stringify({ urls: [url] }),
         signal: AbortSignal.timeout(25_000),
       });
-      if (!res.ok) return { error: `讀取失敗 ${res.status}` };
+      if (!res.ok) return readPlain(url);
       const d: any = await res.json();
       const r = d.results?.[0];
-      return r ? { url: r.url, content: String(r.raw_content ?? "").slice(0, 8000) } : { error: "無法讀取這個網頁" };
+      return r ? { url: r.url, content: String(r.raw_content ?? "").slice(0, 8000) } : readPlain(url);
     },
   },
   {
@@ -921,6 +931,49 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    label: "📚 存進知識庫",
+    decl: {
+      name: "save_note",
+      description:
+        "把整理好的內容存進知識庫（文章、影片、Reels 的重點、筆記），之後可以用 search_notes 找出來。" +
+        "使用者貼連結或說「存到知識庫」時：先用 read_webpage 讀內容，再用這個存。同一個網址再存會更新原本那筆。",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "標題，20 字內，說清楚是什麼" },
+          summary: { type: "string", description: "重點摘要，3–6 點條列（Markdown），寫具體的工具、做法、數字、網址" },
+          url: { type: "string", description: "原始連結" },
+          tags: { type: "array", items: { type: "string" }, description: "2–5 個標籤，例如「前端」「Three.js」「開源」" },
+          content: { type: "string", description: "原文或貼文文字（可留空）" },
+        },
+        required: ["title", "summary"],
+      },
+    },
+    async run(args, { room, author }) {
+      return room.noteSave(
+        {
+          title: String(args.title ?? "").slice(0, 80),
+          summary: String(args.summary ?? "").slice(0, 3000),
+          content: args.content ? String(args.content).slice(0, 6000) : undefined,
+          url: args.url ? String(args.url).slice(0, 500) : undefined,
+          tags: Array.isArray(args.tags) ? args.tags.map((t: unknown) => String(t).trim().slice(0, 20)).filter(Boolean).slice(0, 6) : [],
+        },
+        author,
+      );
+    },
+  },
+  {
+    label: "📚 查知識庫",
+    decl: {
+      name: "search_notes",
+      description: "從知識庫找以前存過的文章、影片、筆記（例如「之前存的那個 3D 開源專案叫什麼」）。",
+      parameters: { type: "object", properties: { keyword: { type: "string", description: "關鍵字，留空＝最近存的" } } },
+    },
+    async run(args, { room }) {
+      return room.noteSearch(String(args.keyword ?? ""));
+    },
+  },
+  {
     label: "🧠 記住",
     decl: {
       name: "remember",
@@ -1339,6 +1392,90 @@ function declOf(t: Tool, p: TripProfile): ToolDecl {
   return typeof t.decl === "function" ? t.decl(p) : t.decl;
 }
 
+// ---------------- 讀連結：Facebook／Instagram 的 Reels、影片 ----------------
+
+/** 社群影片連結：用手機瀏覽器的身分打開，拿貼文文字與影片檔 */
+const SOCIAL_HOST = /^https?:\/\/(?:[a-z0-9-]+\.)*(?:facebook\.com|fb\.watch|fb\.com|instagram\.com|threads\.(?:net|com))\//i;
+const MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+/** Gemini 直接收影片一次最多約 20MB（base64 會變大），超過就只用貼文文字 */
+const VIDEO_MAX_BYTES = 12_000_000;
+
+function decodeEntities(s: string): string {
+  return s
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+function bytesToBase64(u: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function readSocial(url: string, room: RoomApi) {
+  let html: string, finalUrl: string;
+  try {
+    const res = await fetch(url, { headers: { "user-agent": MOBILE_UA, "accept-language": "zh-TW,zh;q=0.9,en;q=0.8" }, redirect: "follow", signal: AbortSignal.timeout(15_000) });
+    html = (await res.text()).slice(0, 600_000);
+    finalUrl = res.url;
+  } catch (e: any) {
+    return { error: `打不開這個連結（${e?.message ?? e}）` };
+  }
+  const og = (k: string) => decodeEntities(html.match(new RegExp(`<meta[^>]+property="og:${k}"[^>]+content="([^"]*)"`))?.[1] ?? "");
+  // 標題常是「觀看次數 · 心情數 | 貼文開頭 | 作者 | Facebook」：拿掉統計數字與網站名
+  const caption = (og("description") || og("title")).trim();
+  const title = og("title").replace(/^[\d.,\s\u00a0萬千次觀看·個心情則留言分享]+\|\s*/, "").replace(/\s*\|\s*(Facebook|Instagram|Threads)\s*$/i, "").trim();
+  if (!caption && !title) return { error: "這則貼文看不到內容（可能需要登入、是私人或限定對象的貼文）。可以把貼文文字複製貼給我，或截圖傳給我。" };
+  const out: Record<string, unknown> = {
+    source: /instagram/i.test(finalUrl) ? "Instagram" : /threads/i.test(finalUrl) ? "Threads" : "Facebook",
+    url: og("url") || finalUrl,
+    title: title.split("\n")[0].slice(0, 120),
+    caption: caption.slice(0, 3000),
+    thumbnail: og("image") || undefined,
+  };
+  const video = og("video") || og("video:url") || og("video:secure_url");
+  if (video && /^https:\/\/[a-z0-9.-]+\.(?:fbcdn\.net|cdninstagram\.com)\//i.test(video)) {
+    try {
+      const v = await fetch(video, { headers: { "user-agent": MOBILE_UA }, signal: AbortSignal.timeout(30_000) });
+      const len = Number(v.headers.get("content-length") || 0);
+      if (!v.ok || len > VIDEO_MAX_BYTES) {
+        await v.body?.cancel();
+        out.video_note = len > VIDEO_MAX_BYTES ? "影片太長，只根據貼文文字整理" : "影片下載失敗，只根據貼文文字整理";
+      } else {
+        const buf = new Uint8Array(await v.arrayBuffer());
+        if (buf.length > VIDEO_MAX_BYTES) out.video_note = "影片太長，只根據貼文文字整理";
+        else {
+          const summary = await room.describeVideo(v.headers.get("content-type") || "video/mp4", bytesToBase64(buf), caption.slice(0, 500));
+          if (summary) out.video_summary = summary;
+          else out.video_note = "目前沒有可以看影片的 AI（需要 Gemini），只根據貼文文字整理";
+        }
+      }
+    } catch (e: any) {
+      out.video_note = `影片讀不到（${e?.message ?? e}），只根據貼文文字整理`;
+    }
+  } else out.video_note = "這則貼文沒有可以下載的影片，只根據貼文文字整理";
+  return out;
+}
+
+/** 沒有 Tavily 金鑰時的一般網頁讀法：直接抓 HTML、拿掉標籤 */
+async function readPlain(url: string) {
+  try {
+    const res = await fetch(url, { headers: { "user-agent": MOBILE_UA, "accept-language": "zh-TW,zh;q=0.9" }, redirect: "follow", signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) return { error: `讀取失敗 ${res.status}` };
+    const type = res.headers.get("content-type") || "";
+    if (!/html|text/.test(type)) return { error: "這不是網頁（可能是檔案或圖片）" };
+    const html = (await res.text()).slice(0, 800_000);
+    const title = decodeEntities(html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] ?? "").trim();
+    const text = decodeEntities(
+      html.replace(/<(script|style|noscript|svg|head)[\s\S]*?<\/\1>/gi, " ").replace(/<br\s*\/?>|<\/(p|div|li|h\d)>/gi, "\n").replace(/<[^>]+>/g, " "),
+    ).replace(/[ \t]+/g, " ").replace(/\n\s*\n+/g, "\n").trim();
+    return text ? { url: res.url, title, content: text.slice(0, 8000) } : { error: "這個網頁讀不到文字內容" };
+  } catch (e: any) {
+    return { error: `打不開這個網頁（${e?.message ?? e}）` };
+  }
+}
+
 /** 個人帳本的分類 */
 const PERSONAL_CATEGORIES = ["餐飲", "交通", "購物", "日用品", "娛樂", "醫療", "帳單", "其他"];
 
@@ -1391,9 +1528,13 @@ const TRAVEL_ONLY = new Set([
   "theme_park_wait_times", "taxi_fare", "train_status", "update_itinerary", "get_member_locations", "disaster_alerts",
 ]);
 
+/** 只有個人助理才有的工具 */
+const PERSONAL_ONLY = new Set(["save_note", "search_notes"]);
+
 /** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */
 export function toolDecls(p: TripProfile): ToolDecl[] {
-  return TOOLS.filter((t) => (!t.only || t.only(p)) && !(p.kind === "personal" && TRAVEL_ONLY.has(nameOf(t)))).map((t) => declOf(t, p));
+  const personal = p.kind === "personal";
+  return TOOLS.filter((t) => (!t.only || t.only(p)) && !(personal ? TRAVEL_ONLY : PERSONAL_ONLY).has(nameOf(t))).map((t) => declOf(t, p));
 }
 
 export function toolLabel(name: string): string {

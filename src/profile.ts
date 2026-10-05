@@ -13,6 +13,8 @@ export interface GuideSource {
 }
 
 export interface TripProfile {
+  /** trip＝家庭旅遊；personal＝個人助理（只有本人、不用 Gemini、沒有旅程日期）。舊資料沒有這欄＝trip */
+  kind?: "trip" | "personal";
   status: TripStatus;
   title: string;
   country: string; // 中文國名

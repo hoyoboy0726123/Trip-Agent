@@ -102,7 +102,7 @@ function applyTrip(trip) {
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws?room=${ROOM}`);
   S.ws = ws;
   if (!els.app.hidden) {
     els.conn.hidden = false;
@@ -133,7 +133,9 @@ function connect() {
 
 setInterval(() => S.ws?.readyState === 1 && S.ws.send(JSON.stringify({ type: "ping" })), 25000);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && S.ws && S.ws.readyState > 1) connect();
+  if (document.visibilityState !== "visible") return;
+  if (S.ws && S.ws.readyState > 1) connect();
+  else if (!S.offline) fetch(`/api/me?room=${ROOM}`).catch(() => {});
 });
 
 function wsSend(obj) {
@@ -165,7 +167,7 @@ function handle(m) {
       S.status = m.status;
       setState(m.state);
       const t = S.trip;
-      rememberTrip({ id: ROOM, title: t.title, flag: t.flag, dates: `${t.startDate} – ${t.endDate}` });
+      rememberTrip({ id: ROOM, title: t.title, flag: t.flag, kind: t.kind || "trip", dates: t.kind === "personal" ? "個人助理" : `${t.startDate} – ${t.endDate}` });
       if (m.status === "initializing") return renderInit(m.initProgress);
       if (m.status === "review") return S.me.admin ? renderReview() : renderWaitReview();
       if (els.panel.open && S.panel === "tripedit") els.panel.close();
@@ -847,7 +849,17 @@ function receiptFlow() {
 function renderChips() {
   const t = S.trip || {};
   const cur = t.currency || "";
-  const chips = [
+  const chips = isPersonal() ? [
+    ["sun", "今天", () => ask("今天天氣如何？我有哪些提醒和待辦？")],
+    ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
+    ["pin", "附上位置", () => attachLocation(false)],
+    null,
+    ["list", "清單", () => openPanel("checklist")],
+    ["bell", "提醒", () => openPanel("reminders")],
+    ["ticket", "保管箱", () => openPanel("tickets")],
+    ["bookmark", "記憶", () => openPanel("memories")],
+    ["plus", "更多", openMore],
+  ] : [
     ["sun", "今天", () => ask("今天的行程和天氣？")],
     ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
     ["receipt", "收據記帳", receiptFlow],
@@ -894,9 +906,19 @@ els.chipsToggle.addEventListener("click", () => {
 
 const MORE_ASKS = ["明天的行程和天氣？", "目前花了多少錢？大家要怎麼分？", "最近有地震或颱風嗎？會影響行程嗎？"];
 
+const MORE_ASKS_PERSONAL = ["我今天有哪些待辦和提醒？", "你記得我哪些事？", "這個週末天氣如何？"];
+
 function moreActions() {
   const t = S.trip || {};
   const cur = t.currency || "";
+  if (isPersonal()) {
+    return [
+      ["camera", "拍照問", () => els.photoInput.click()],
+      ["pin", "附上位置", () => attachLocation(false)],
+      ["sun", "今天", () => ask("今天天氣如何？我有哪些提醒和待辦？")],
+      ["utensils", "附近美食", () => ask("我附近有什麼好吃的？", true)],
+    ];
+  }
   return [
     ["camera", "拍照問", () => els.photoInput.click()],
     ["pin", "附上位置", () => attachLocation(false)],
@@ -913,8 +935,9 @@ function moreActions() {
 
 function openMore() {
   const actions = moreActions();
+  const asks = isPersonal() ? MORE_ASKS_PERSONAL : MORE_ASKS;
   els.moreActions.innerHTML = actions.map(([icon, label], i) => `<button type="button" data-i="${i}"><span class="ag-icon">${svg(icon)}</span>${label}</button>`).join("");
-  els.moreAsks.innerHTML = MORE_ASKS.map((q, i) => `<button type="button" data-q="${i}">${svg("msg")}${escapeHtml(q)}</button>`).join("");
+  els.moreAsks.innerHTML = asks.map((q, i) => `<button type="button" data-q="${i}">${svg("msg")}${escapeHtml(q)}</button>`).join("");
   els.moreActions.querySelectorAll("button").forEach((b) =>
     b.addEventListener("click", () => {
       els.more.close();
@@ -924,7 +947,7 @@ function openMore() {
   els.moreAsks.querySelectorAll("button").forEach((b) =>
     b.addEventListener("click", () => {
       els.more.close();
-      ask(MORE_ASKS[Number(b.dataset.q)]);
+      ask(asks[Number(b.dataset.q)]);
     }),
   );
   if (!els.more.open) els.more.showModal();
@@ -1001,7 +1024,7 @@ function clearAttachment() {
   if (S.pending.photoUrl) URL.revokeObjectURL(S.pending.photoUrl);
   S.pending.photoUrl = null;
   els.attachImg.removeAttribute("src");
-  els.input.placeholder = "問旅伴 AI 任何事…";
+  els.input.placeholder = isPersonal() ? "跟你的助理說…" : "問旅伴 AI 任何事…";
   clearLocation();
   els.attach.hidden = true;
 }
@@ -1042,6 +1065,14 @@ function setState(state) {
   const now = todayLocal();
   const day = Math.floor((Date.parse(now + "T00:00:00Z") - Date.parse(t.startDate + "T00:00:00Z")) / 86400e3) + 1;
   els.todayTitle.textContent = t.title;
+  if (t.kind === "personal") {
+    els.dayBadge.textContent = dateLabel(now);
+    els.nextCard.hidden = els.ncToggle.hidden = true;
+    for (const tab of ["translator", "itinerary", "expenses"]) els.tabbar.querySelector(`[data-tab="${tab}"]`).hidden = true;
+    if (!S.pending.photo) els.input.placeholder = "跟你的助理說…";
+    if (S.panel && !["settings", "tripedit", "keys", "diary-edit"].includes(S.panel)) renderPanel();
+    return;
+  }
   els.dayBadge.textContent = day < 1 ? `倒數 ${1 - day} 天` : now <= t.endDate ? `Day ${day}` : "旅程結束";
   renderNextCard(state, now);
   els.tabbar.querySelector('[data-tab="translator"]').hidden = !hasTranslator();
@@ -1315,6 +1346,21 @@ function renderPanelInner() {
     case "keys": {
       els.panelTitle.textContent = "🔑 API 金鑰";
       const s = S.settings;
+      if (isPersonal()) {
+        b.innerHTML = `
+        <div class="card small"><h3>AI</h3>個人助理只用 Cloudflare Workers AI（${escapeHtml(s.workersModel || "")}），不會把你的資料送到 Gemini。</div>
+        <div class="card"><h3>🔍 Tavily 搜尋金鑰</h3>
+          <div class="small muted">目前：${escapeHtml(s.tavily || "未設定")}。到 <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a> 免費申請，AI 才能上網查資料。</div>
+          <form class="row" id="k-tavily"><input name="k" placeholder="tvly-…" autocomplete="off" style="flex:1" /><button class="btn primary-sm">更新</button></form>
+        </div>
+        <p class="small muted">🔐 金鑰加密保存，只有伺服器用得到，畫面上看不到完整內容。</p>`;
+        $("#k-tavily", b).addEventListener("submit", (e) => {
+          e.preventDefault();
+          const k = e.target.k.value.trim();
+          if (k) action({ action: "update_keys", tavily: k });
+        });
+        break;
+      }
       b.innerHTML = `
         <div class="card small">
           <h3>AI 使用順序</h3>
@@ -1351,7 +1397,84 @@ function renderPanelInner() {
   }
 }
 
+/** 個人助理的設定：只有本人，沒有邀請家人、旅程設定、回覆時機 */
+function renderPersonalSettings(st, b) {
+  els.panelTitle.textContent = "⚙️ 設定";
+  const s = S.settings;
+  const t = S.trip;
+  const auto = store("ta-autoloc") === 1;
+  const others = (store("ta-trips") || []).filter((x) => x.id !== ROOM);
+  b.innerHTML = `
+    <div class="card"><div class="row between"><div><b>${escapeHtml(S.me.name)}</b> <span class="tag">個人助理</span></div>
+      <div class="row" style="gap:6px"><a class="btn" href="/">🏠 首頁</a><button class="btn" id="logout">登出</button></div></div>
+      ${others.length ? `<div class="small muted" style="margin-top:8px">切換到：${others.map((x) => `<a href="/t/${escapeHtml(x.id)}">${escapeHtml(x.flag || "🌏")} ${escapeHtml(x.title)}</a>`).join("、")}</div>` : ""}
+    </div>
+    <div class="card"><label class="row between"><span>自動分享我的位置給 AI<br><span class="small muted">每 5 分鐘更新，問「附近」時更準</span></span>
+      <input type="checkbox" id="autoloc" ${auto ? "checked" : ""} /></label></div>
+    <div class="card small">
+      <div>📍 ${escapeHtml(t.city || "未設定住的地方")}｜${escapeHtml(t.timezone)}</div>
+      <div>🤖 AI：Cloudflare Workers AI（${escapeHtml(s.workersModel || "")}），不使用 Gemini</div>
+      <div>🔍 網路搜尋：${s.tavily ? "✅ Tavily" : "⚠️ 未設定（AI 不能上網查資料）"}</div>
+    </div>
+    <div class="card"><div class="stack"><button class="btn" data-go="keys">🔑 網路搜尋金鑰</button></div></div>
+    <div class="card"><h3>🔒 更改密碼</h3>
+      <form class="form" id="pw-form">
+        <input name="admin" type="password" placeholder="新密碼（至少 6 個字）" autocomplete="new-password" />
+        <button class="btn primary-sm">更改</button>
+        <span class="small muted">改完要用新密碼重新登入。</span>
+      </form>
+    </div>
+    <div class="card"><h3>🧹 清除資料</h3>
+      <p class="small muted">只會清除勾選的項目，<b>清除後無法復原</b>。</p>
+      <form class="form" id="reset-form">
+        <div class="checks">
+          <label><input type="checkbox" name="chat" /> 聊天紀錄（含照片、位置）</label>
+          <label><input type="checkbox" name="memory" /> 長期記憶與摘要</label>
+          <label><input type="checkbox" name="tools" /> 清單、提醒、保管箱</label>
+        </div>
+        <button class="btn danger">清除勾選的資料</button>
+      </form>
+    </div>
+    <div class="card"><h3>🗑 刪除個人助理</h3>
+      <p class="small muted">聊天、照片、記憶、金鑰全部刪除，網址也會失效，<b>無法復原</b>。</p>
+      <button class="btn danger" id="delete-trip">刪除這個個人助理</button>
+    </div>`;
+  $("#logout", b).addEventListener("click", async () => {
+    await fetch("/api/logout", { method: "POST" });
+    location.href = "/";
+  });
+  $("#autoloc", b).addEventListener("change", (e) => {
+    store("ta-autoloc", e.target.checked ? 1 : 0);
+    e.target.checked ? startAutoLocation() : stopAutoLocation();
+  });
+  b.querySelectorAll("[data-go]").forEach((x) => x.addEventListener("click", () => openPanel(x.dataset.go)));
+  $("#pw-form", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const admin = String(new FormData(e.target).get("admin")).trim();
+    if (admin.length < 6) return alert("密碼至少 6 個字");
+    if (confirm("確定更改密碼？改完要用新密碼重新登入。")) action({ action: "update_passwords", roomPassword: "", adminPassword: admin });
+  });
+  $("#reset-form", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const names = { chat: "聊天紀錄", memory: "長期記憶與摘要", tools: "清單、提醒、保管箱" };
+    const picked = Object.keys(names).filter((k) => f.get(k));
+    if (!picked.length) return alert("請至少勾選一項");
+    const typed = prompt(`即將清除：${picked.map((k) => names[k]).join("、")}\n清除後無法復原。\n\n確定的話請輸入「清除」`);
+    if (typed?.trim() !== "清除") return;
+    action({ action: "reset", ...Object.fromEntries(picked.map((k) => [k, true])) });
+    e.target.reset();
+  });
+  $("#delete-trip", b).addEventListener("click", () => {
+    const typed = prompt(`刪除後所有資料都無法復原。\n\n確定的話請輸入「${t.title}」`);
+    if (typed == null) return;
+    if (typed.trim() !== t.title) return alert("名稱不符，沒有刪除");
+    action({ action: "delete_trip", confirm: typed.trim() });
+  });
+}
+
 function renderSettingsPanel(st, b) {
+  if (isPersonal()) return renderPersonalSettings(st, b);
   els.panelTitle.textContent = "⚙️ 設定";
   const s = S.settings;
   const t = S.trip;
@@ -1476,6 +1599,14 @@ function renderSettingsPanel(st, b) {
 // ================= 工具箱分頁 =================
 
 function toolCards() {
+  if (isPersonal()) {
+    return [
+      ["tickets", "ticket", "保管箱", "照片、票券、文件，離線可看"],
+      ["checklist", "list", "清單", "待辦、購物"],
+      ["reminders", "bell", "提醒", "時間到通知你"],
+      ["memories", "bookmark", "記憶", "AI 記得你的事，可以刪改"],
+    ];
+  }
   return [
     ["itinerary", "calendar", "行程", "每天的安排，可以修改"],
     ["tickets", "ticket", "票券保管箱", "門票、訂位憑證，離線可看"],
@@ -1494,7 +1625,8 @@ function renderToolPanel(st, b) {
       // 旅遊指南卡片直接露出幾個重點：時差、貨幣、緊急電話（取前兩個號碼）
       const sos = (String(t.emergency || "").match(/\d{3,4}/g) || []).slice(0, 2).join("／");
       const facts = [t.diff, t.currency && `${t.currency}（${t.currencySymbol}）`, sos && `緊急 ${sos}`].filter(Boolean);
-      b.innerHTML = `
+      b.innerHTML = isPersonal() ? `
+        <div class="tb-grid">${toolCards().map(([id, icon, name, desc]) => `<button class="tb-card" data-go="${id}"><span class="tb-icon">${svg(icon)}</span><b>${name}</b><span class="small muted">${desc}</span></button>`).join("")}</div>` : `
         <button class="tb-feature" data-go="travel">
           <span class="tb-feature-top"><span class="tb-icon-big">${svg("compass")}</span>
             <span style="flex:1;min-width:0"><span class="tb-feature-title">${escapeHtml(t.country || "")}旅遊指南</span><span class="small muted" style="display:block">入境、插座、交通、退稅、緊急電話</span></span>
@@ -1745,14 +1877,16 @@ function showSos(msg) {
 // ---------- ✅ 清單 ----------
 
 let checklistTab = "行李";
+const checklistTabs = () => (isPersonal() ? ["待辦", "購物"] : ["行李", "購物", "待辦"]);
 function renderChecklistPanel(st, b) {
   els.panelTitle.textContent = "✅ 清單";
+  if (!checklistTabs().includes(checklistTab)) checklistTab = checklistTabs()[0];
   const all = st.checklist ?? [];
   const items = all.filter((c) => c.list === checklistTab);
   const left = items.filter((c) => !c.done).length;
   b.innerHTML = `
     ${backToHub()}
-    <div class="tr-dir">${["行李", "購物", "待辦"].map((t) => `<button data-tab="${t}" class="${t === checklistTab ? "active" : ""}">${t}（${all.filter((c) => c.list === t && !c.done).length}）</button>`).join("")}</div>
+    <div class="tr-dir">${checklistTabs().map((t) => `<button data-tab="${t}" class="${t === checklistTab ? "active" : ""}">${t}（${all.filter((c) => c.list === t && !c.done).length}）</button>`).join("")}</div>
     <div class="card"><div class="list">
       ${items.length
         ? items.map((c) => `<label class="item check-item ${c.done ? "done" : ""}">
@@ -1783,7 +1917,7 @@ function renderChecklistPanel(st, b) {
 // ---------- 🎫 票券保管箱（可以分資料夾，沒放進資料夾的在最外層） ----------
 
 function renderTicketsPanel(st, b) {
-  els.panelTitle.textContent = "🎫 票券保管箱";
+  els.panelTitle.textContent = isPersonal() ? "🗂 保管箱" : "🎫 票券保管箱";
   const docs = st?.documents ?? store(`ta-docs-${ROOM}`) ?? [];
   const folders = st?.docFolders ?? store(`ta-docfolders-${ROOM}`) ?? [];
   const byId = new Map(folders.map((f) => [f.id, f]));
@@ -1811,7 +1945,7 @@ function renderTicketsPanel(st, b) {
   };
   b.innerHTML = `
     ${backToHub()}
-    <p class="small muted">門票、訂位確認、QR Code 存在這裡，全家都看得到；<b>打開過一次之後，沒網路也能看</b>。可以建資料夾分類，沒放進資料夾的就在最外層。也可以在聊天傳照片說「存成票券」。</p>
+    <p class="small muted">${isPersonal() ? "照片、票券、文件存在這裡，只有你看得到" : "門票、訂位確認、QR Code 存在這裡，全家都看得到"}；<b>打開過一次之後，沒網路也能看</b>。可以建資料夾分類，沒放進資料夾的就在最外層。也可以在聊天傳照片說「存起來」。</p>
     <nav class="doc-crumbs"><button type="button" data-go="">🎫 全部</button>${trail.map((f) => `<span>›</span><button type="button" data-go="${f.id}">📁 ${escapeHtml(f.name)}</button>`).join("")}</nav>
     ${st ? `<div class="doc-tools">
       <button type="button" class="btn small" id="doc-add">${S.docUpload ? "收起上傳" : "＋ 上傳票券"}</button>
@@ -1943,7 +2077,9 @@ function renderRemindersPanel(st, b) {
   const rs = st.reminders ?? [];
   b.innerHTML = `
     ${backToHub()}
-    <p class="small muted">時間到了會在群組發訊息通知全家（<b>當地時間</b>，${escapeHtml(S.trip.diff)}）。也可以在聊天說「明天早上 9:30 提醒大家出門」。</p>
+    ${isPersonal()
+      ? `<p class="small muted">時間到了會在聊天裡通知你。也可以在聊天說「明天早上 8 點提醒我繳費」。</p>`
+      : `<p class="small muted">時間到了會在群組發訊息通知全家（<b>當地時間</b>，${escapeHtml(S.trip.diff)}）。也可以在聊天說「明天早上 9:30 提醒大家出門」。</p>`}
     <div class="card"><div class="list">
       ${rs.length
         ? rs.map((r) => `<div class="item small"><div><b>${escapeHtml(r.time)}</b><div>${escapeHtml(r.message)}</div><div class="muted">${escapeHtml(r.by)}</div></div><button class="btn danger small" data-del="${r.id}">刪除</button></div>`).join("")
@@ -1977,9 +2113,9 @@ function renderDiaryPanel(st, b) {
     ${backToHub()}
     <div class="card diary-top">
       <p class="small muted">旅途中每晚 22:00（當地時間）AI 會用當天的對話和照片寫一篇日記，整理成圖文版的日記網頁。</p>
-      <a class="diary-main" href="/api/album" target="_blank" rel="noopener">${svg("book")}打開日記網頁</a>
+      <a class="diary-main" href="/api/album?room=${ROOM}" target="_blank" rel="noopener">${svg("book")}打開日記網頁</a>
       <div class="diary-row">
-        <a class="btn" href="/api/album?print=1" target="_blank" rel="noopener">下載 PDF</a>
+        <a class="btn" href="/api/album?room=${ROOM}&print=1" target="_blank" rel="noopener">下載 PDF</a>
         <button type="button" class="btn" id="diary-share">分享給親友</button>
       </div>
       <div class="small muted">${share ? "分享連結已開啟：拿到連結的人不用登入就能看日記和照片。" : S.me.admin ? "分享連結還沒開啟，按「分享給親友」會先問你要不要開啟。" : "分享連結要由管理員開啟。"}</div>
@@ -1990,7 +2126,7 @@ function renderDiaryPanel(st, b) {
           const photos = JSON.parse(d.photo_ids || "[]");
           const excerpt = String(d.text || "").replace(/\s+/g, " ").slice(0, 100);
           return `<div class="diary-card">
-            <a href="/api/album#${escapeHtml(d.date)}" target="_blank" rel="noopener">
+            <a href="/api/album?room=${ROOM}#${escapeHtml(d.date)}" target="_blank" rel="noopener">
               ${photos[0] ? `<img src="/api/photo/${escapeHtml(photos[0])}" loading="lazy" alt="" />` : ""}
               <div class="diary-card-body">
                 <div class="diary-kicker">DAY ${dayNo(d.date)}・${dateLabel(d.date)}・${photos.length} 張照片</div>

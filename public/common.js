@@ -62,6 +62,22 @@ function money(n, symbol = S.trip?.currencySymbol ?? "") {
 
 // ---------- API ----------
 
+// 一支手機可以同時登入好幾個空間（家庭旅遊、個人助理）：每個 API 請求都帶上這一頁是哪個空間，
+// 伺服器才知道要用哪一個登入。沒辦法帶標頭的（<img>、日記網頁連結）由伺服器用最近打開的空間
+if (ROOM) {
+  const rawFetch = window.fetch.bind(window);
+  window.fetch = (input, init = {}) => {
+    if (typeof input === "string" && input.startsWith("/api/")) {
+      const headers = new Headers(init.headers || {});
+      if (!headers.has("x-room")) headers.set("x-room", ROOM);
+      init = { ...init, headers };
+    }
+    return rawFetch(input, init);
+  };
+}
+
+const isPersonal = () => S.trip?.kind === "personal";
+
 async function api(path, body, opts = {}) {
   const res = await fetch(path, {
     method: body === undefined ? "GET" : "POST",

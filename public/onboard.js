@@ -18,7 +18,7 @@ function renderLanding() {
     <div class="hero">
       <div class="hero-logo">🧳</div>
       <h1>旅伴 AI</h1>
-      <p class="muted">家族旅行的 AI 群組助理</p>
+      <p class="muted">家族旅行的 AI 群組助理，也可以當你的個人助理</p>
     </div>
     <ul class="hero-list card">
       <li>💬 全家一起聊天，AI 即時回答</li>
@@ -28,23 +28,110 @@ function renderLanding() {
       <li>⏰ 提醒、每日早報、災害警報、旅遊日記</li>
     </ul>
     <div class="stack">
-      <button class="primary on-blue" id="go-new">✨ 建立新旅程</button>
+      <button class="primary on-blue" id="go-new">🧳 建立家庭旅遊</button>
+      <button class="btn big-btn" id="go-personal">🙋 建立個人助理<span class="small muted" style="display:block;font-weight:400">只有你看得到，會記得你說過的事</span></button>
       <button class="btn big-btn" id="go-join">🔗 我有旅程連結</button>
       <a class="intro-link" href="/intro">第一次用？看完整介紹與使用方式 →</a>
     </div>
-    ${trips.length ? `<h3 class="section-title">最近的旅程</h3><div class="stack">${trips.map((t) => `
+    ${trips.length ? `<h3 class="section-title">最近使用</h3><div class="stack">${trips.map((t) => `
       <a class="trip-link card" href="/t/${escapeHtml(t.id)}"><span class="trip-flag">${escapeHtml(t.flag || "🌏")}</span>
         <span><b>${escapeHtml(t.title)}</b><span class="small muted">${escapeHtml(t.dates || "")}</span></span></a>`).join("")}</div>` : ""}
-    <p class="small muted center">建立旅程需要邀請碼，請向提供這個網站的人索取。</p>`);
+    <p class="small muted center">建立旅程或個人助理需要邀請碼，請向提供這個網站的人索取。</p>`);
   $("#go-new", root).addEventListener("click", () => {
     W.step = W.invite ? Math.max(W.step, 1) : 0;
     renderWizard();
   });
+  $("#go-personal", root).addEventListener("click", renderPersonalSetup);
   $("#go-join", root).addEventListener("click", () => {
     const v = prompt("貼上家人傳給你的旅程網址（或旅程代碼）");
     const code = String(v || "").trim().match(/(?:\/t\/)?([a-z0-9]{6,20})\/?$/)?.[1];
     if (code) location.href = `/t/${code}`;
     else if (v) alert("看不懂這個網址，請確認是完整的旅程網址");
+  });
+}
+
+// ================= 建立個人助理（只有一頁） =================
+
+function renderPersonalSetup() {
+  document.title = "建立個人助理｜旅伴 AI";
+  const P = { home: null };
+  const root = showScreen(`
+    <form id="ps-form" class="card form" novalidate>
+      <div class="center"><div class="hero-logo">🙋</div><h2>建立個人助理</h2>
+        <p class="small muted">只有你一個人用：會記得你說過的事、幫你設提醒、管待辦和購物清單、收好照片與文件。<br>AI 只用 Cloudflare Workers AI，不會送到 Gemini。</p></div>
+      ${W.invite ? "" : `<label class="field">邀請碼<input id="ps-invite" autocomplete="off" required /></label>`}
+      <label class="field">你的稱呼<input id="ps-name" maxlength="16" placeholder="例如：爸爸、小美" autocomplete="nickname" required /></label>
+      <label class="field">你住的地方（選填，天氣和「附近」會用到）
+        <div class="row" style="gap:6px"><input id="ps-place" placeholder="例如：台北市大安區" style="flex:1" /><button type="button" class="btn" id="ps-search">搜尋</button></div>
+      </label>
+      <div id="ps-picks" class="small"></div>
+      <label class="field">密碼（至少 6 個字，只有你知道）<input id="ps-pw" type="password" autocomplete="new-password" required /></label>
+      <label class="field">再輸入一次密碼<input id="ps-pw2" type="password" autocomplete="new-password" required /></label>
+      <details class="small"><summary>網路搜尋金鑰（選填，之後也可以在設定填）</summary>
+        <p class="muted">到 <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a> 免費申請，AI 才能上網查資料。</p>
+        <input id="ps-tavily" placeholder="tvly-…" autocomplete="off" />
+      </details>
+      <p id="ps-error" class="error" hidden></p>
+      <button type="submit" class="primary" id="ps-go">建立</button>
+      <a class="small muted center" href="/">← 回首頁</a>
+    </form>`);
+  $("#ps-name", root).value = store("ta-name") || "";
+  const err = (t) => {
+    const el = $("#ps-error", root);
+    el.textContent = t;
+    el.hidden = !t;
+  };
+  $("#ps-search", root).addEventListener("click", async () => {
+    const q = $("#ps-place", root).value.trim();
+    const invite = W.invite || $("#ps-invite", root)?.value.trim();
+    if (!q) return;
+    if (!invite) return err("請先填邀請碼");
+    const picks = $("#ps-picks", root);
+    picks.textContent = "搜尋中…";
+    const r = await api("/api/places", { q, invite, countryCode: "" });
+    if (!r.ok) {
+      picks.textContent = r.error || "找不到這個地方";
+      return;
+    }
+    picks.innerHTML = r.places.length
+      ? r.places.map((x, i) => `<button type="button" class="btn small" data-i="${i}" style="display:block;margin:4px 0;text-align:left">${escapeHtml(x.address)}</button>`).join("")
+      : "找不到，換個寫法試試（例如：大安區）";
+    picks.querySelectorAll("[data-i]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const x = r.places[Number(b.dataset.i)];
+        P.home = { city: x.name, address: x.address, lat: x.lat, lon: x.lon };
+        picks.innerHTML = `✅ ${escapeHtml(x.address)}`;
+      }),
+    );
+  });
+  $("#ps-form", root).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    err("");
+    const invite = W.invite || $("#ps-invite", root)?.value.trim();
+    const name = $("#ps-name", root).value.trim();
+    const pw = $("#ps-pw", root).value, pw2 = $("#ps-pw2", root).value;
+    if (!invite) return err("請填邀請碼");
+    if (!name) return err("請填你的稱呼");
+    if (pw.trim().length < 6) return err("密碼至少 6 個字");
+    if (pw !== pw2) return err("兩次輸入的密碼不一樣");
+    const btn = $("#ps-go", root);
+    btn.disabled = true;
+    btn.textContent = "建立中…";
+    const place = $("#ps-place", root).value.trim();
+    const r = await api("/api/personal", {
+      invite, name, password: pw, tavilyKey: $("#ps-tavily", root).value.trim(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      home: P.home ?? { city: place, address: "", lat: null, lon: null },
+    });
+    if (!r.ok) {
+      btn.disabled = false;
+      btn.textContent = "建立";
+      return err(r.error || "建立失敗");
+    }
+    W.invite = invite;
+    saveWizard();
+    store("ta-name", name);
+    location.href = `/t/${r.room}`;
   });
 }
 
@@ -389,16 +476,17 @@ async function renderLogin(otherRoom) {
     return;
   }
   document.title = `${info.title}｜旅伴 AI`;
+  const personal = info.kind === "personal";
   const root = showScreen(`
     <form id="login-form" class="login-card card">
       <div class="login-logo">${escapeHtml(info.flag)}</div>
       <h1>${escapeHtml(info.title)}</h1>
-      <p class="muted">${escapeHtml(info.startDate)} – ${escapeHtml(info.endDate)}　${escapeHtml(info.country)}${info.city ? `・${escapeHtml(info.city)}` : ""}</p>
-      ${otherRoom ? `<p class="small notice">你現在登入的是另一個旅程，登入這個旅程後會切換過來。</p>` : ""}
-      <label class="field">你的稱呼<input id="login-name" maxlength="16" placeholder="例如：爸爸、媽媽、哥哥" autocomplete="nickname" required /></label>
+      <p class="muted">${personal ? "個人助理・只有本人能進入" : `${escapeHtml(info.startDate)} – ${escapeHtml(info.endDate)}　${escapeHtml(info.country)}${info.city ? `・${escapeHtml(info.city)}` : ""}`}</p>
+      ${otherRoom ? `<p class="small notice">這支手機也登入了其他旅程或助理，登入這裡之後兩邊都會保留，可以從首頁切換。</p>` : ""}
+      <label class="field">你的稱呼<input id="login-name" maxlength="16" placeholder="${personal ? "建立時填的稱呼" : "例如：爸爸、媽媽、哥哥"}" autocomplete="nickname" required /></label>
       <label class="field">密碼<input id="login-password" type="password" autocomplete="current-password" required /></label>
       <p id="login-error" class="error" hidden></p>
-      <button type="submit" class="primary">進入群聊</button>
+      <button type="submit" class="primary">${personal ? "進入" : "進入群聊"}</button>
       <a class="small muted center" href="/">← 回首頁</a>
     </form>`);
   $("#login-name", root).value = store("ta-name") || "";

@@ -101,6 +101,17 @@ export interface SetupInput {
   geminiKey: string;
 }
 
+/** 建立個人助理（由 /api/personal 呼叫） */
+export interface PersonalSetupInput {
+  roomId: string;
+  name: string;
+  password: string;
+  timezone: string;
+  city: string;
+  home: { address: string; lat: number | null; lon: number | null };
+  tavilyKey: string;
+}
+
 function newId(): string {
   return Date.now().toString(36) + crypto.randomUUID().slice(0, 6);
 }
@@ -341,6 +352,49 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     return { ok: true };
   }
 
+  /** 個人助理：只有本人，建好就能用（沒有 AI 研究目的地的初始化），AI 只用 Workers AI */
+  async setupPersonal(input: PersonalSetupInput): Promise<{ ok: boolean; error?: string; title?: string }> {
+    if (this.profile()) return { ok: false, error: "這個空間已經建立過了" };
+    const tz = validTimezone(input.timezone) ? input.timezone : "Asia/Taipei";
+    const today = zoned(Date.now(), tz).date;
+    const home = input.home.lat != null && input.home.lon != null ? { lat: input.home.lat, lon: input.home.lon } : null;
+    const p: TripProfile = {
+      kind: "personal",
+      status: "active",
+      title: `${input.name}的助理`,
+      country: "台灣", countryCode: "TW", countryIso3: "TWN", city: input.city, center: home,
+      startDate: today, endDate: today,
+      timezone: tz, currency: "TWD", currencySymbol: "NT$", language: "中文", langCode: "zh-TW", readingName: "",
+      travelers: [{ name: input.name, kind: "大人" }],
+      accommodation: { name: "家", address: input.home.address, lat: home?.lat ?? null, lon: home?.lon ?? null, note: "" },
+      flights: "", emergency: "報案 110、救護車／消防 119", taxi: null, guide: { ...EMPTY_GUIDE }, initNotes: [],
+    };
+    this.setSetting("room_id", input.roomId);
+    // 只有本人能進來：旅伴密碼設成沒人知道的亂數，只能用自己的密碼（管理員）登入
+    this.setSetting("pw_room", await hashPassword(crypto.randomUUID()));
+    this.setSetting("pw_admin", await hashPassword(input.password));
+    this.setSetting("auth_version", "1");
+    await this.storeKeys(input.tavilyKey, "");
+    this.saveProfile(p);
+    this.touchMember(input.name);
+    this.postAiMessage(
+      `👋 嗨 ${input.name}，我是你的個人助理，這裡的對話只有你看得到。\n\n` +
+        `- **記住事情**：說「記住我不吃香菜」，之後問我都找得到\n` +
+        `- **提醒**：「明天早上 8 點提醒我繳信用卡費」\n` +
+        `- **清單**：「把牛奶加到購物清單」「待辦有哪些？」\n` +
+        `- **查資料**：天氣、附近美食、怎麼去、上網搜尋${input.tavilyKey ? "" : "（要先到 設定 → API 金鑰 填 Tavily）"}\n` +
+        `- **保管箱**：照片、票券、文件傳給我說「存起來」\n\n` +
+        `🔒 這個空間的 AI 只用 Cloudflare Workers AI，不會把你的資料送到 Gemini。`,
+      { kind: "welcome" },
+    );
+    await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    return { ok: true, title: p.title };
+  }
+
+  private isPersonal(): boolean {
+    return this.profile()?.kind === "personal";
+  }
+
   private async storeKeys(tavily?: string, gemini?: string) {
     if (typeof tavily === "string") {
       this.setSetting("key_tavily", await encryptText(this.env, tavily.trim()));
@@ -408,7 +462,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     const p = this.profile();
     if (url.pathname === "/info") {
       if (!p) return Response.json({ exists: false });
-      return Response.json({ exists: true, title: p.title, flag: flagEmoji(p.countryCode), country: p.country, city: p.city, startDate: p.startDate, endDate: p.endDate, status: p.status });
+      if (p.kind === "personal") return Response.json({ exists: true, kind: "personal", title: p.title, flag: "🙋", status: p.status });
+      return Response.json({ exists: true, kind: "trip", title: p.title, flag: flagEmoji(p.countryCode), country: p.country, city: p.city, startDate: p.startDate, endDate: p.endDate, status: p.status });
     }
     if (!p) return Response.json({ ok: false, error: "找不到這個旅程（可能已被刪除）" }, { status: 404 });
 
@@ -616,6 +671,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   private shouldReply(text: string, hasPhoto: boolean, toAi = false): boolean {
     if (!text && !hasPhoto) return false; // 單純分享位置不打擾 AI
     if (toAi) return true; // 回覆 AI 的訊息＝在問 AI，「只回 @AI」模式也要回答
+    if (this.isPersonal()) return true; // 個人助理只有本人，每則都回
     if (this.settings().replyMode === "all") return true;
     return /@(ai|AI|旅伴|助理|小幫手)/.test(text) || text.startsWith("/ai") || (hasPhoto && /@/.test(text));
   }
@@ -1487,6 +1543,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       }
       if (p.status !== "active") return;
       await this.deliverReminders();
+      // 個人助理：早報、做夢之後的階段再加；旅遊日記、災害警報是旅遊專用
+      if (p.kind === "personal") return;
       const now = zoned(Date.now(), p.timezone);
       const inTrip = now.date >= p.startDate && now.date <= p.endDate;
       const s = this.settings();
@@ -1621,6 +1679,7 @@ score：當旅遊日記插圖的價值，大部分照片是 2–4 分：
 
   /** 日記：長文又要照格式，先用比較會寫的模型（一天一篇，額度跟聊天分開；擁有者金鑰→旅程自己的金鑰），不行再用一般的模型鏈 */
   private async generateLong(system: string, prompt: string): Promise<string> {
+    if (this.isPersonal()) return this.generateText(system, prompt, false, 1, 4096);
     const writer = this.env.GEMINI_WRITER_MODEL;
     const keys = [this.env.GEMINI_API_KEY ?? "", (await this.keys()).gemini ?? ""].filter(Boolean);
     for (const [i, key] of keys.entries()) {
@@ -1865,7 +1924,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
   private state() {
     const p = this.p();
     return {
-      trip: { ...p, flag: flagEmoji(p.countryCode), diff: diffFromTaiwan(p.timezone) },
+      trip: { ...p, flag: p.kind === "personal" ? "🙋" : flagEmoji(p.countryCode), diff: diffFromTaiwan(p.timezone) },
       itinerary: this.itinerary(),
       memories: this.memories(),
       expenses: this.expenseSummary(),
@@ -1904,6 +1963,8 @@ ${transcript || "（今天群組沒什麼對話）"}`;
 
   /** vision：有照片要辨識時，旅程自己的 Gemini 也排到 Workers AI 前面（看圖比 Gemma 準很多），額度滿了才退回 Gemma */
   private async chain(vision = false): Promise<ProviderId[]> {
+    // 個人助理不送 Gemini（免費層的內容可能被人工審閱），只用 Workers AI
+    if (this.isPersonal()) return (await this.workersAiBlocked()) ? [] : ["workers-ai"];
     const order: ProviderId[] = [];
     const own = !!(await this.keys()).gemini;
     if (this.env.GEMINI_API_KEY) order.push("gemini");
@@ -1983,7 +2044,45 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       .join("\n");
   }
 
+  /** 個人助理的系統提示詞：只有本人，沒有旅程、住宿、分帳 */
+  private personalPrompt(trigger?: MessageRow, windowStartTs?: number): string {
+    const p = this.p();
+    const owner = p.travelers[0]?.name || "使用者";
+    const recall = trigger && windowStartTs ? this.recallOlder(trigger, windowStartTs) : "";
+    const now = zoned(Date.now(), p.timezone);
+    const a = p.accommodation;
+    const mems = this.memories().map((m) => `- #${m.id}［${m.category}］${m.content}`).join("\n") || "（目前沒有）";
+    const summary = this.setting("summary");
+    const loc = this.memberLocation()
+      .map((l) => `${l.area ? `${l.area}附近` : "地名查詢中"}（${Math.round((Date.now() - l.ts) / 60000)} 分鐘前）`)
+      .join("");
+    return `你是「${AI_NAME}」，${owner}的個人 AI 助理。這個空間只有${owner}一個人，對話內容其他人看不到。
+
+# 現在
+${now.date}（${now.weekday}）${now.time}，時區 ${p.timezone}。
+住的地方：${p.city || "（未設定）"}${a.address ? `（${a.address}）` : ""}${loc ? `\n${owner}最近的位置：${loc}` : ""}
+
+# 長期記憶（關於${owner}的偏好、決定、重要資訊；#編號可用 forget 刪除）
+${mems}
+${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}
+# 回答規則
+- 一律使用繁體中文與台灣用語，語氣自然親切，適合手機閱讀：精簡、條列、重點加粗。不要用 LaTeX 或 $…$ 數學式。
+- 營業時間、價格、新聞、天氣、交通等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
+- 工具回傳 error 代表失敗：要如實說沒有完成，不可以說已完成。
+- ${owner}說「記住…」、說了偏好、做了決定、提到重要的個人資訊 → 用 remember 記下來；只有 remember 成功後才能說「已記住」。要忘掉某件事 → forget。
+- 問以前說過的事：先看「長期記憶」和「以前聊過」，不夠再用 search_history。
+- 「幾點提醒我…」→ create_reminder（時間用 ${p.timezone} 的 YYYY-MM-DD HH:mm）；問有哪些提醒 → list_reminders。
+- 待辦、購物：明確說「加到待辦／購物清單」才用 add_checklist_items（list 填「待辦」或「購物」）；做完、買了 → update_checklist_item；問清單 → get_checklist。只是隨口提到要做的事，就在回答最後問一句要不要加進待辦。
+- 天氣 → get_weather；附近有什麼 → find_nearby（near 留空會用${owner}的位置，沒有位置就用住的地方）；怎麼去 → plan_route；匯率 → convert_currency。
+- 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結。不要自己寫 Google 地圖網址或短網址，也不要用自己記得的地址或座標當連結。
+- 要看照片、圖片時用 find_images（圖片會顯示在回答下方），並說明是網路圖片、僅供參考；沒有要求就不要找圖片。
+- 收到照片：辨識內容並說明；說要「存起來」→ save_document（說了資料夾就填 folder）；要找存過的文件、票券 → find_documents。
+- 目前還沒有記帳功能：${owner}說花了多少錢，不要說要幫忙記帳；需要的話可以問要不要加進待辦提醒自己。
+- 身分證字號、信用卡號、密碼這類敏感資料不要用 remember 記，也提醒${owner}不要在聊天裡傳。`;
+  }
+
   private systemPrompt(trigger?: MessageRow, windowStartTs?: number): string {
+    if (this.isPersonal()) return this.personalPrompt(trigger, windowStartTs);
     const p = this.p();
     const recall = trigger && windowStartTs ? this.recallOlder(trigger, windowStartTs) : "";
     const now = zoned(Date.now(), p.timezone);
@@ -2352,11 +2451,19 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 
     const transcript = fresh.slice(-80).map((m) => `${m.role === "assistant" ? AI_NAME : m.author}：${m.text.slice(0, 500)}`).join("\n");
     const existing = this.memories().map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n") || "（無）";
-    const prompt = `以下是家庭旅遊群組最新的對話，請整理群組的長期記憶：
+    const personal = this.isPersonal();
+    const intro = personal
+      ? `以下是個人助理和使用者最新的對話，請整理長期記憶：
+1. summary：把「舊摘要」與新對話合併成新的「長期對話摘要」（400 字內；保留使用者的偏好、習慣、做過的決定、進行中的事情、重要資訊）。
+2. memories：萃取新對話中「之後還會用到」且「不在現有記憶裡」的事實，每條一句話。
+   例如：喜歡／不吃什麼、家人與朋友、工作與作息、做了什麼決定、訂了什麼、要做的事；提到的日期一律寫成實際日期（不要寫「明天」「下週」）。
+   不要收錄身分證字號、信用卡號、密碼、病歷細節這類敏感資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。`
+      : `以下是家庭旅遊群組最新的對話，請整理群組的長期記憶：
 1. summary：把「舊摘要」與新對話合併成新的「整趟旅程對話摘要」（400 字內；保留每個人的偏好、做過的決定、討論過的店家與地點、待辦、重要資訊）。
 2. memories：萃取新對話中「之後還會用到」且「不在現有記憶裡」的事實，每條一句話、寫清楚是誰。
    例如：誰喜歡／不吃什麼、想買什麼、想去哪、決定了什麼、訂了什麼、待辦事項、聊到的店名與地址。
-   不要收錄住宿地址、航班這些系統已知的資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。
+   不要收錄住宿地址、航班這些系統已知的資料，也不要收錄閒聊或 AI 自己的建議。沒有就回空陣列。`;
+    const prompt = `${intro}
 3. remove_ids：現有記憶中已經過時、被新對話推翻、或重複的記憶 id。沒有就回空陣列。
 
 舊摘要：
@@ -2371,7 +2478,7 @@ ${transcript}
 輸出 JSON：{"summary": "...", "memories": [{"content": "...", "category": "偏好|決定|預訂|資訊|待辦"}], "remove_ids": [數字]}`;
     try {
       // 背景整理只用 Gemini 一半的額度、不等待，把額度留給回答問題
-      const json = parseArgs((await this.generateText("你是負責整理旅遊群組長期記憶的助理，只輸出 JSON。", prompt, true, 0.5)).replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as any;
+      const json = parseArgs((await this.generateText(personal ? "你是負責整理個人助理長期記憶的助理，只輸出 JSON。" : "你是負責整理旅遊群組長期記憶的助理，只輸出 JSON。", prompt, true, 0.5)).replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as any;
       if (typeof json.summary === "string" && json.summary.trim()) this.setSetting("summary", json.summary.trim().slice(0, 2000));
       for (const rid of (json.remove_ids ?? []).slice(0, 20)) {
         if (Number.isInteger(Number(rid))) this.sql.exec("DELETE FROM memories WHERE id = ?", Number(rid));

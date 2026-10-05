@@ -7,6 +7,8 @@ import type { Env } from "./types";
 
 export interface RoomMeta {
   id: string;
+  /** trip＝家庭旅遊，personal＝個人助理；舊資料沒有這欄＝trip */
+  kind?: "trip" | "personal";
   title: string;
   country: string;
   flag: string;
@@ -31,6 +33,7 @@ export class Registry extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS attempts (ip TEXT PRIMARY KEY, count INTEGER, ts INTEGER);
       CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
     `);
+    if (!this.sql.exec("PRAGMA table_info(rooms)").toArray().some((c) => c.name === "kind")) this.sql.exec("ALTER TABLE rooms ADD COLUMN kind TEXT");
     this.ownerLimiter = new GeminiLimiter(limitsFrom(env), {
       load: () => JSON.parse(this.get("owner_gemini_day") || '{"day":"","count":0}'),
       save: (v) => this.set("owner_gemini_day", JSON.stringify(v)),
@@ -73,8 +76,8 @@ export class Registry extends DurableObject<Env> {
 
   registerRoom(m: RoomMeta) {
     this.sql.exec(
-      "INSERT INTO rooms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      m.id, m.created, m.title, m.country, m.flag, m.city, m.startDate, m.endDate, m.creator, m.status, m.lastActive,
+      "INSERT INTO rooms (id, created, title, country, flag, city, start_date, end_date, creator, status, last_active, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      m.id, m.created, m.title, m.country, m.flag, m.city, m.startDate, m.endDate, m.creator, m.status, m.lastActive, m.kind ?? "trip",
     );
   }
 
@@ -93,7 +96,7 @@ export class Registry extends DurableObject<Env> {
     return this.sql.exec("SELECT * FROM rooms ORDER BY created DESC").toArray().map((r) => ({
       id: r.id as string, title: r.title as string, country: r.country as string, flag: r.flag as string, city: r.city as string,
       startDate: r.start_date as string, endDate: r.end_date as string, creator: r.creator as string, status: r.status as string,
-      created: r.created as number, lastActive: r.last_active as number,
+      created: r.created as number, lastActive: r.last_active as number, kind: r.kind === "personal" ? "personal" : "trip",
     }));
   }
 

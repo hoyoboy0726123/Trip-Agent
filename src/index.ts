@@ -1,6 +1,6 @@
-import { clearSessionCookie, createSessionCookie, newRoomId, readSession, safeEqual, sign } from "./auth";
+import { createSessionCookie, newRoomId, pickSession, readSessions, safeEqual, sessionCookie, sign } from "./auth";
 import { flagEmoji } from "./profile";
-import { checkDates, cleanTravelers, validateGemini, validateTavily, type SetupInput } from "./room";
+import { checkDates, cleanTravelers, validateGemini, validateTavily, type PersonalSetupInput, type SetupInput } from "./room";
 import { searchPlaces } from "./tools";
 import type { Env, SessionUser } from "./types";
 
@@ -90,7 +90,42 @@ async function createTrip(req: Request, env: Env): Promise<Response> {
     startDate, endDate, creator: me, status: "initializing", created: Date.now(), lastActive: Date.now(),
   });
   const user: SessionUser = { room: roomId, name: me, admin: true, ver: 1 };
-  return json({ ok: true, room: roomId }, { headers: { "set-cookie": await createSessionCookie(env, user) } });
+  return json({ ok: true, room: roomId }, { headers: { "set-cookie": await createSessionCookie(env, user, await readSessions(req, env)) } });
+}
+
+/** 個人助理：只有本人一個人用，建好就能聊，不必等 AI 查目的地資料 */
+async function createPersonal(req: Request, env: Env): Promise<Response> {
+  const b = await readJson(req);
+  const inviteErr = await inviteOk(req, env, b.invite);
+  if (inviteErr) return bad(inviteErr, 403);
+  const name = str(b.name, 16);
+  if (!name) return bad("請填寫你的稱呼");
+  const password = str(b.password, 64);
+  if (password.length < 6) return bad("密碼至少 6 個字");
+  const home = b.home ?? {};
+  const lat = Number(home.lat), lon = Number(home.lon);
+  const hasCoord = home.lat != null && home.lon != null && Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+  const tavilyKey = str(b.tavilyKey, 200);
+  if (tavilyKey) {
+    const tErr = await validateTavily(tavilyKey);
+    if (tErr) return bad(tErr);
+  }
+  if (!(await registry(env).allowCreate(ipOf(req)))) return bad("今天建立的空間太多了，請明天再試", 429);
+  const roomId = newRoomId();
+  const input: PersonalSetupInput = {
+    roomId, name, password, timezone: str(b.timezone, 60), city: str(home.city, 40),
+    home: { address: str(home.address, 300), lat: hasCoord ? lat : null, lon: hasCoord ? lon : null },
+    tavilyKey,
+  };
+  const r = await roomStub(env, roomId).setupPersonal(input);
+  if (!r.ok) return bad(r.error ?? "建立失敗", 500);
+  const today = new Date().toISOString().slice(0, 10);
+  await registry(env).registerRoom({
+    id: roomId, kind: "personal", title: r.title ?? `${name}的助理`, country: "台灣", flag: "🙋", city: input.city,
+    startDate: today, endDate: today, creator: name, status: "active", created: Date.now(), lastActive: Date.now(),
+  });
+  const user: SessionUser = { room: roomId, name, admin: true, ver: 1 };
+  return json({ ok: true, room: roomId }, { headers: { "set-cookie": await createSessionCookie(env, user, await readSessions(req, env)) } });
 }
 
 async function ownerApi(req: Request, env: Env, path: string): Promise<Response> {
@@ -132,7 +167,7 @@ export default {
     if (path === "/api/places" && req.method === "POST") {
       // 引導設置（用邀請碼）或管理員改住宿（用登入）都可以查地點
       const b = await readJson(req);
-      const session = await readSession(req, env);
+      const session = await readSessions(req, env);
       if (!session) {
         const err = await inviteOk(req, env, b.invite);
         if (err) return bad(err, 403);
@@ -146,6 +181,7 @@ export default {
       }
     }
     if (path === "/api/rooms" && req.method === "POST") return createTrip(req, env);
+    if (path === "/api/personal" && req.method === "POST") return createPersonal(req, env);
     if (path.startsWith("/api/owner/")) return ownerApi(req, env, path);
 
     const info = path.match(/^\/api\/room\/([a-z0-9]+)$/);
@@ -165,11 +201,19 @@ export default {
       });
       const data = (await res.json()) as { ok: boolean; user?: SessionUser; error?: string };
       if (!data.ok || !data.user) return json(data, { status: res.status });
-      return json(data, { headers: { "set-cookie": await createSessionCookie(env, data.user) } });
+      // 登入新的空間不會把手機上其他空間的登入擠掉
+      return json(data, { headers: { "set-cookie": await createSessionCookie(env, data.user, await readSessions(req, env)) } });
     }
 
+    // 只登出目前這個空間，其他空間保持登入
     if (path === "/api/logout" && req.method === "POST") {
-      return json({ ok: true }, { headers: { "set-cookie": clearSessionCookie() } });
+      const set = await readSessions(req, env);
+      const room = req.headers.get("x-room") || set?.cur || "";
+      if (set) {
+        delete set.rooms[room];
+        if (set.cur === room) set.cur = Object.keys(set.rooms).at(-1) ?? "";
+      }
+      return json({ ok: true }, { headers: { "set-cookie": await sessionCookie(env, set) } });
     }
 
     // ---------- 旅遊日記分享連結：不用登入，看不看得到由那個旅程的分享碼決定（管理員可隨時關閉） ----------
@@ -179,23 +223,38 @@ export default {
       return roomStub(env, share[1]).fetch(new Request(`https://room/share/${share[2]}${url.search}`, { headers: { "x-origin": url.origin } }));
     }
 
-    // ---------- 要登入（依 cookie 裡的旅程轉給那個旅程房間） ----------
+    // ---------- 要登入（依請求指定的空間，或最近用的空間，轉給那個房間） ----------
     if (path.startsWith("/api/") || path === "/ws") {
-      const user = await readSession(req, env);
-      if (!user) return bad("請先登入", 401);
-      const headers = new Headers(req.headers);
-      headers.set("x-user-name", encodeURIComponent(user.name));
-      headers.set("x-user-admin", user.admin ? "1" : "0");
-      headers.set("x-user-ver", String(user.ver));
+      const set = await readSessions(req, env);
+      const want = req.headers.get("x-room") || url.searchParams.get("room") || null;
+      const user = pickSession(set, want);
+      if (!user || !set) {
+        // 這支手機沒登入過這個空間：告訴前端，讓它顯示登入畫面
+        if (path === "/api/me" && want) return json({ ok: false, error: "請先登入", other: set?.cur || null }, { status: 401 });
+        return bad("請先登入", 401);
+      }
+      const headersFor = (u: SessionUser) => {
+        const h = new Headers(req.headers);
+        h.set("x-user-name", encodeURIComponent(u.name));
+        h.set("x-user-admin", u.admin ? "1" : "0");
+        h.set("x-user-ver", String(u.ver));
+        return h;
+      };
+      const headers = headersFor(user);
       const room = roomStub(env, user.room);
 
       if (path === "/api/me") {
-        // 手機上登入的是別的旅程：告訴前端，讓它顯示登入畫面
-        const want = url.searchParams.get("room");
-        if (want && want !== user.room) return json({ ok: false, error: "請先登入這個旅程", other: user.room }, { status: 401 });
         const res = await room.fetch(new Request("https://room/me", { headers }));
-        if (!res.ok) return json({ ok: false, error: "請重新登入" }, { status: 401, headers: { "set-cookie": clearSessionCookie() } });
-        return json({ ok: true, user: { room: user.room, name: user.name, admin: user.admin } });
+        if (!res.ok) {
+          // 密碼改過或空間被刪：只登出這個空間
+          delete set.rooms[user.room];
+          if (set.cur === user.room) set.cur = Object.keys(set.rooms).at(-1) ?? "";
+          return json({ ok: false, error: "請重新登入" }, { status: 401, headers: { "set-cookie": await sessionCookie(env, set) } });
+        }
+        const body = { ok: true, user: { room: user.room, name: user.name, admin: user.admin } };
+        // 打開哪個空間，哪個就是「最近用的」：沒帶空間代碼的請求（圖片、日記網頁）才會送對地方
+        if (set.cur === user.room) return json(body);
+        return json(body, { headers: { "set-cookie": await sessionCookie(env, { ...set, cur: user.room }) } });
       }
 
       // 旅遊日記網頁（日記＋照片），可列印成 PDF；?print=1 打開就直接列印
@@ -235,7 +294,17 @@ export default {
       }
 
       const photo = path.match(/^\/api\/photo\/([\w-]+)$/);
-      if (photo && req.method === "GET") return room.fetch(new Request(`https://room/photo/${photo[1]}`, { headers }));
+      if (photo && req.method === "GET") {
+        const res = await room.fetch(new Request(`https://room/photo/${photo[1]}`, { headers }));
+        if (res.status !== 404 || want) return res;
+        // <img> 沒辦法帶空間代碼：同時開著兩個空間時，照片可能在另一個空間
+        for (const [id, u] of Object.entries(set.rooms)) {
+          if (id === user.room) continue;
+          const other = await roomStub(env, id).fetch(new Request(`https://room/photo/${photo[1]}`, { headers: headersFor({ room: id, ...u }) }));
+          if (other.ok) return other;
+        }
+        return res;
+      }
 
       return bad("Not found", 404);
     }

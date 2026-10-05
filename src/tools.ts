@@ -1313,9 +1313,15 @@ function declOf(t: Tool, p: TripProfile): ToolDecl {
   return typeof t.decl === "function" ? t.decl(p) : t.decl;
 }
 
-/** 這個旅程可以用的工具（有些只在特定國家提供） */
+/** 個人助理用不到的旅遊工具（記帳要等第二階段改成個人帳本才開放） */
+const TRAVEL_ONLY = new Set([
+  "theme_park_wait_times", "taxi_fare", "train_status", "update_itinerary", "get_member_locations", "disaster_alerts",
+  "add_expense", "expense_summary", "delete_expense",
+]);
+
+/** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */
 export function toolDecls(p: TripProfile): ToolDecl[] {
-  return TOOLS.filter((t) => !t.only || t.only(p)).map((t) => declOf(t, p));
+  return TOOLS.filter((t) => (!t.only || t.only(p)) && !(p.kind === "personal" && TRAVEL_ONLY.has(nameOf(t)))).map((t) => declOf(t, p));
 }
 
 export function toolLabel(name: string): string {

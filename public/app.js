@@ -215,6 +215,10 @@ function handle(m) {
       S.settings = m.settings;
       if (["settings", "keys", "diary", "memo"].includes(S.panel)) renderPanel();
       break;
+    case "health_result":
+      healthResult = m;
+      if (S.panel === "health") renderPanel();
+      break;
     case "note_text":
       S.noteText[m.id] = m.text;
       if (S.panel === "notes") renderPanel();
@@ -1268,6 +1272,7 @@ function renderPanelInner() {
     if (S.panel === "notes") return renderNotesPanel(st, b);
     if (S.panel === "calendar") return renderCalendarPanel(st, b);
     if (S.panel === "memo") return renderMemoPanel(st, b);
+    if (S.panel === "health") return renderHealthPanel(st, b);
     if (S.panel === "iddocs") return renderIdDocsPanel(st, b);
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
@@ -1470,6 +1475,16 @@ function renderTodayPanel(st, b) {
           : `<div class="small muted">接下來沒有行程。在聊天說「下週三下午 3 點看牙醫」就會加進來。</div>`;
       })()}
     </div>
+    ${(() => {
+      const h = st.health;
+      if (!h) return "";
+      const rows = [
+        ...(h.alerts || []).filter((a) => a.level === "red").map((a) => `🚨 ${escapeHtml(a.text.replace(/\*\*/g, "").slice(0, 40))}…`),
+        ...(h.task ? [`🩺 722 量血壓第 ${Math.min(h.task.day, 7)} 天`] : []),
+        ...(h.meds || []).filter((m) => m.refill_in != null && m.refill_in >= 0 && m.refill_in <= 3).map((m) => `💊 ${escapeHtml(m.name)}：${m.refill_in === 0 ? "今天" : `${m.refill_in} 天後`}可以領藥`),
+      ];
+      return rows.length ? `<div class="card today-card">${rows.map((r) => `<button type="button" class="item small link-row" data-go="health">${r}</button>`).join("")}</div>` : "";
+    })()}
     ${(() => {
       const ids = (st.idDocs || []).filter((d) => d.days <= 60);
       const busy = (st.memos || []).filter((x) => x.status === "recording" || x.status === "processing");
@@ -1943,6 +1958,7 @@ function renderPersonalSettings(st, b) {
           <label><input type="checkbox" name="chat" /> 聊天紀錄（含照片、位置）</label>
           <label><input type="checkbox" name="memory" /> 長期記憶與摘要</label>
           <label><input type="checkbox" name="tools" /> 清單、提醒、保管箱、日記、語音備忘、證件</label>
+          <label><input type="checkbox" name="health" /> 健康管家的紀錄（量測、用藥、健康檔案）</label>
         </div>
         <button class="btn danger">清除勾選的資料</button>
       </form>
@@ -1992,7 +2008,7 @@ function renderPersonalSettings(st, b) {
   $("#reset-form", b).addEventListener("submit", (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const names = { chat: "聊天紀錄", memory: "長期記憶與摘要", tools: "清單、提醒、保管箱、日記、語音備忘、證件" };
+    const names = { chat: "聊天紀錄", memory: "長期記憶與摘要", tools: "清單、提醒、保管箱、日記、語音備忘、證件", health: "健康管家的紀錄" };
     const picked = Object.keys(names).filter((k) => f.get(k));
     if (!picked.length) return alert("請至少勾選一項");
     const typed = prompt(`即將清除：${picked.map((k) => names[k]).join("、")}\n清除後無法復原。\n\n確定的話請輸入「清除」`);
@@ -2137,6 +2153,7 @@ function toolCards() {
   if (isPersonal()) {
     return [
       ["calendar", "calendar", "行事曆", "行程、提醒、訂閱到手機日曆"],
+      ["health", "heart", "健康管家", "血壓血糖、用藥、健檢提醒"],
       ["notes", "book", "知識庫", "連結、筆記、文件、照片"],
       ["memo", "mic", "語音備忘", "錄音、會議記錄自動整理"],
       ["checklist", "list", "清單", "待辦、購物"],

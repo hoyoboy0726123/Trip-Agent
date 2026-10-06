@@ -3,7 +3,7 @@
 // 照片走「快取優先」：照片網址不會變，看過一次就存起來，離線也能看票券。
 const SHELL_CACHE = "ta-shell-v1";
 const PHOTO_CACHE = "ta-photos-v1";
-const SHELL = ["/", "/index.html", "/common.js", "/onboard.js", "/app.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/vendor/marked.min.js", "/vendor/purify.min.js"];
+const SHELL = ["/", "/index.html", "/common.js", "/onboard.js", "/app.js", "/health.js", "/style.css", "/manifest.webmanifest", "/icon.svg", "/vendor/marked.min.js", "/vendor/purify.min.js"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(

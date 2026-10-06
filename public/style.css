@@ -528,3 +528,47 @@ details.guide li + li { margin-top: 4px; }
 .link-row { display: flex; justify-content: space-between; gap: 8px; width: 100%; border: 0; background: transparent; padding: 4px 0; text-align: left; color: inherit; font: inherit; }
 .memo-act .btn { flex: none; white-space: nowrap; }
 .note-full h1, .note-full h2, .note-full h3, .note-full h4 { font-size: 15px; margin: 12px 0 4px; }
+
+/* 健康管家 */
+.h-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.h-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.h-tile { display: grid; gap: 2px; text-align: left; font: inherit; color: inherit; cursor: pointer; align-content: start; }
+.h-num { font-size: 26px; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.h-alert { display: grid; gap: 8px; border-left: 4px solid #f59e0b; }
+.h-alert.red { border-left-color: #dc2626; background: #fff1f0; }
+.h-setup { display: grid; gap: 6px; border-left: 4px solid var(--red); }
+.h-722 { display: grid; gap: 8px; }
+.h-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.h-day { display: grid; justify-items: center; gap: 3px; padding: 6px 0; border-radius: 8px; border: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.h-day.today { border-color: var(--red); color: var(--red-ink); font-weight: 700; }
+.h-day i { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted); }
+.h-day i.on { background: #16a34a; border-color: #16a34a; }
+.h-result { display: grid; gap: 6px; border-left: 4px solid #16a34a; }
+.h-flag { padding: 8px 10px; border-radius: 8px; background: #fff7e6; }
+.h-flag.red { background: #fff1f0; }
+.h-form h3, .h-med-form h3 { margin: 0; }
+.h-when summary { cursor: pointer; }
+.icon-x { border: 0; background: transparent; color: var(--muted); font-size: 14px; padding: 2px 6px; cursor: pointer; }
+.h-chart { width: 100%; height: auto; display: block; margin: 6px 0; }
+.h-grid-line { stroke: var(--line); stroke-width: 1; }
+.h-ref { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
+/* 面板裡的 svg 預設有描邊（給圖示用），圖表的字不要 */
+.h-chart text { stroke: none; }
+.h-ref-t, .h-axis { fill: var(--muted); font-size: 10px; }
+.h-ref-t { font-weight: 700; }
+.h-line { fill: none; stroke-width: 1.5; opacity: .55; }
+.h-line.c1, .h-dot.c1 { stroke: #c2362b; }
+.h-line.c2, .h-dot.c2 { stroke: #1d4ed8; }
+.h-dot { stroke-width: 2; fill: currentColor; }
+.h-dot.c1 { fill: #c2362b; }
+.h-dot.c2 { fill: #1d4ed8; }
+.h-dot.alt { fill: var(--card); }
+.h-key { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 3px; }
+.h-key.c1 { background: #c2362b; }
+.h-key.c2 { background: #1d4ed8; }
+.h-med { display: grid; gap: 2px; }
+.h-screen { display: grid; gap: 4px; padding: 10px 0; border-top: 1px dashed var(--line); }
+.h-screen:first-of-type { border-top: 0; }
+.tag.warn { background: #fff1f0; color: #c0271a; }
+.tag.ok { background: #e8f5ec; color: #1f7a45; }
+.h-disclaimer { margin-top: 12px; }

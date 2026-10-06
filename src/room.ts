@@ -7,10 +7,12 @@ import {
 } from "./profile";
 import { geminiProvider, isQuotaError, parseArgs, providerFor, uploadGeminiFile, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
-import { disasterAlerts, DRAFT_TOOLS, homeOf, reverseArea, type EventInput, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
+import { disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type EventInput, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
+import { isHealthTopic, redFlagText, type Flag } from "./health";
+import { HealthStore } from "./health-store";
 import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -99,7 +101,19 @@ function sameFact(a: string, b: string): boolean {
 function systemMade(m: { meta: string | null }): boolean {
   if (!m.meta) return false;
   try {
-    return !!JSON.parse(m.meta).kind;
+    const j = JSON.parse(m.meta);
+    return !!j.kind || !!j.health;
+  } catch {
+    return false;
+  }
+}
+
+/** 健康管家的對話與提醒：跟一般聊天分開，不給 Gemini 看、不進記憶 */
+function healthMessage(m: { meta: string | null }): boolean {
+  if (!m.meta) return false;
+  try {
+    const j = JSON.parse(m.meta);
+    return !!j.health || String(j.kind ?? "").startsWith("health");
   } catch {
     return false;
   }
@@ -312,6 +326,10 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   { tool: "read_webpage", test: (t) => /https?:\/\/\S+/.test(t) },
   // 個人助理：說要存進知識庫，或整則訊息只有一個連結（就是要存）
   { tool: "save_note", test: (t) => /(存|收|放|加)(到|進|入)?(我的)?知識庫/.test(t) || /^\s*https?:\/\/\S+\s*$/.test(t) },
+  // 健康管家（只在健康對話裡有這些工具）：報數字要記、說用藥要存、問狀況要先查，模型常常嘴上說好了卻沒呼叫
+  { tool: "health_log", test: (t) => /血壓.{0,10}\d{2,3}\s*[\/／]\s*\d{2,3}|\d{2,3}\s*[\/／]\s*\d{2,3}.{0,6}血壓|血糖.{0,10}\d{2,3}|體重.{0,6}\d{2,3}/.test(t) },
+  { tool: "health_meds", test: (t) => /開始(吃|服用|使用)|改吃|(停|不吃)(了|掉)?.{0,8}藥|藥.{0,6}(不吃了|停了)|慢箋|領藥/.test(t) },
+  { tool: "health_status", test: (t) => /(最近|這週|這個月|上次|目前).{0,10}(血壓|血糖|體重|健康).{0,10}(怎麼樣|如何|狀況|正常嗎|好嗎|趨勢)|該做.{0,6}(健檢|篩檢|檢查|疫苗)/.test(t) },
 ];
 
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
@@ -1415,6 +1433,54 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         this.sql.exec("DELETE FROM memos WHERE id = ?", Number(msg.id));
         this.broadcastState();
         break;
+      // ---- 健康管家 ----
+      case "health_profile":
+        this.health().saveProfile(msg.profile ?? {});
+        this.broadcastState();
+        break;
+      case "health_log": {
+        const r = this.health().addVital({ kind: msg.kind, v1: msg.v1, v2: msg.v2, v3: msg.v3, context: msg.context, date: msg.date, time: msg.time }, "app");
+        if ("error" in r) return reply(false, r.error);
+        this.send(ws, { type: "health_result", grade: r.grade, flags: r.flags });
+        await this.afterVital(r.flags);
+        break;
+      }
+      case "health_delete":
+        this.health().deleteVital(Number(msg.id));
+        this.broadcastState();
+        break;
+      case "med_save": {
+        const r = this.health().medSave(msg.med ?? {});
+        if ("error" in r) return reply(false, r.error);
+        this.broadcastState();
+        break;
+      }
+      case "med_stop":
+        this.health().medStop(Number(msg.id));
+        this.broadcastState();
+        break;
+      case "med_delete":
+        this.health().medDelete(Number(msg.id));
+        this.broadcastState();
+        break;
+      case "screen_mark":
+        this.health().markScreening(String(msg.code ?? ""), msg.last ? String(msg.last) : null);
+        this.broadcastState();
+        break;
+      case "task_start": {
+        const r = this.health().startTask(msg.start ? String(msg.start) : undefined);
+        if ("error" in r) return reply(false, r.error);
+        this.broadcastState();
+        break;
+      }
+      case "task_cancel":
+        this.health().cancelTask();
+        this.broadcastState();
+        break;
+      case "alert_seen":
+        this.health().seeAlert(Number(msg.id));
+        this.broadcastState();
+        break;
       case "iddoc_add": {
         const r = this.idDocAdd({ kind: msg.kind, holder: msg.holder, expires: msg.expires, last4: msg.last4 }, user.name);
         if ("error" in r) return reply(false, String(r.error));
@@ -1452,6 +1518,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         if (msg.itinerary) {
           this.resetItinerary(p);
           cleared.push("行程");
+        }
+        if (msg.health && this.isPersonal()) {
+          this.health().clear();
+          cleared.push("健康紀錄");
         }
         if (msg.tools) {
           this.sql.exec("DELETE FROM checklist WHERE author NOT IN ('預設', 'AI 初始化')");
@@ -1794,7 +1864,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     const tWhere = words.map(() => "(source LIKE ? OR result LIKE ?)").join(" AND ");
     const tLikes = likes.flatMap((l) => [l, l]);
     const rows = [
-      ...this.sql.exec(`SELECT ts, author, text FROM messages WHERE ${where} ORDER BY ts DESC LIMIT ?`, ...likes, limit).toArray(),
+      ...this.sql.exec(`SELECT ts, author, text FROM messages WHERE ${where} AND COALESCE(meta, '') NOT LIKE '%"health%' ORDER BY ts DESC LIMIT ?`, ...likes, limit).toArray(),
       ...this.sql.exec(`SELECT ts, author, '［翻譯］' || source || ' → ' || result AS text FROM translations WHERE ${tWhere} ORDER BY ts DESC LIMIT ?`, ...tLikes, limit).toArray(),
     ];
     return rows
@@ -2067,6 +2137,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         await this.maybeDream(now);
         await this.processMemos();
         await this.processFiles();
+        await this.healthTick();
         await this.checkIdExpiry(now.date);
         await this.maybePersonalDiary(now);
         await this.syncEmbeddings();
@@ -2516,6 +2587,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             brief: this.latestBrief(),
             notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb, inbox, file_id, LENGTH(COALESCE(content, '')) AS clen FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
             files: this.sql.exec("SELECT id, ts, name, bytes, status, error, note_id FROM files WHERE status != 'done' ORDER BY id DESC LIMIT 20").toArray(),
+            health: this.health().summary(),
             events: this.eventList(shiftDays(this.today(), -7), shiftDays(this.today(), 90)),
             cards: this.sql.exec("SELECT id, ts, kind, title, body FROM cards WHERE status = 'pending' ORDER BY ts DESC LIMIT 10").toArray(),
             dreamOps: this.sql.exec("SELECT id, ts, op, before, after, reason, undone FROM dream_ops ORDER BY id DESC LIMIT 20").toArray(),
@@ -2618,7 +2690,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     };
     const q = grams(trigger.text);
     if (q.size < 2) return "";
-    const older = this.sql.exec<MessageRow>("SELECT * FROM messages WHERE ts < ? AND text != '' ORDER BY ts DESC LIMIT 3000", windowStartTs).toArray();
+    const older = this.sql.exec<MessageRow>("SELECT * FROM messages WHERE ts < ? AND text != '' ORDER BY ts DESC LIMIT 3000", windowStartTs).toArray().filter((m) => !healthMessage(m));
     return older
       .map((m) => {
         const g = grams(m.text);
@@ -3782,6 +3854,113 @@ ${body}`;
     this.ctx.waitUntil(job);
   }
 
+  // ================= 健康管家：資料在 health-store.ts，規則在 health.ts；這裡接聊天、推播、排程 =================
+
+  private healthStore: HealthStore | null = null;
+  private health(): HealthStore {
+    return (this.healthStore ??= new HealthStore(this.sql, () => this.p().timezone));
+  }
+
+  /** 把這則訊息標成健康對話（不給 Gemini 看、不進記憶） */
+  private markHealth(id: string) {
+    const row = this.sql.exec("SELECT meta FROM messages WHERE id = ?", id).toArray()[0];
+    if (!row) return;
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = JSON.parse(String(row.meta || "{}"));
+    } catch {}
+    this.sql.exec("UPDATE messages SET meta = ? WHERE id = ?", JSON.stringify({ ...meta, health: true }), id);
+  }
+
+  /** 記了一筆量測：紅色警示在聊天裡發固定文字並推播到手機 */
+  private async afterVital(flags: Flag[]) {
+    this.broadcastState();
+    for (const f of flags.filter((x) => x.level === "red")) {
+      this.postAiMessage(`🚨 ${f.text}`, { kind: "health_alert", health: true });
+      await this.pushAll({ title: "🚨 健康警示", body: pushText(f.text), tag: "health-alert" });
+    }
+  }
+
+  private async healthTick() {
+    if (!this.isPersonal()) return;
+    const list = this.health().tick();
+    for (const r of list) {
+      this.postAiMessage(r.text, { kind: "health" });
+      if (r.push) await this.pushAll({ ...r.push, tag: `health-${r.key}` });
+    }
+    if (list.length) this.broadcastState();
+  }
+
+  healthLog(args: Record<string, unknown>) {
+    const kind = String(args.kind ?? "");
+    const input =
+      kind === "bp" ? { kind, v1: args.systolic, v2: args.diastolic, v3: args.pulse, context: args.context, date: args.date, time: args.time }
+      : kind === "glucose" ? { kind, v1: args.glucose, context: args.context, date: args.date, time: args.time }
+      : { kind, v1: args.weight, v2: args.waist, date: args.date, time: args.time };
+    const r = this.health().addVital(input, "chat");
+    if ("error" in r) return r;
+    this.ctx.waitUntil(this.afterVital(r.flags));
+    const v = r.vital;
+    const what = v.kind === "bp" ? `血壓 ${v.v1}/${v.v2}${v.v3 ? `、脈搏 ${v.v3}` : ""}` : v.kind === "glucose" ? `血糖 ${v.v1} mg/dL` : `體重 ${v.v1} 公斤${v.v2 ? `、腰圍 ${v.v2} 公分` : ""}`;
+    return { saved: `${v.date} ${v.time} ${what}`, grade: r.grade, alerts: r.flags.map((f) => f.text), note: "已記錄到健康管家" };
+  }
+
+  healthStatus() {
+    const { vitals: _vitals, conditionChoices: _c, ...s } = this.health().summary();
+    return {
+      ...s,
+      screenings: s.screenings.filter((x) => x.status === "due" || x.status === "none").map((x) => ({ name: x.name, status: x.status === "due" ? "該做了" : "沒有紀錄", last: x.last, rule: x.rule })),
+      note: "數字與判讀都是程式依指引算的；說明時照這些判讀，不要自己改",
+    };
+  }
+
+  healthMeds(args: Record<string, unknown>) {
+    const action = String(args.action ?? "list");
+    const store = this.health();
+    if (action === "add") {
+      const r = store.medSave(args);
+      this.broadcastState();
+      return "error" in r ? r : { added: args.name, note: "已加到用藥清單；劑量和用法以醫師、藥袋為準" };
+    }
+    if (action === "stop") {
+      const m = store.medFind(String(args.name ?? ""));
+      if (!m) return { error: `用藥清單裡找不到「${args.name}」`, meds: store.meds().map((x) => x.name) };
+      store.medStop(Number(m.id));
+      this.broadcastState();
+      return { stopped: m.name };
+    }
+    return { meds: store.meds().map((m) => ({ name: m.name, dose: m.dose, freq: m.freq, purpose: m.purpose, refill_next: m.refill_next, refill_left: m.refill_left })) };
+  }
+
+  healthProfile(args: Record<string, unknown>) {
+    const store = this.health();
+    const patch: Record<string, unknown> = { ...args };
+    if (typeof args.add_condition === "string" && args.add_condition.trim()) patch.conditions = [...(store.profile().conditions ?? []), args.add_condition.trim()];
+    const p = store.saveProfile(patch);
+    this.broadcastState();
+    return { saved: p };
+  }
+
+  /** 健康對話的系統提示詞（Cloudflare 的模型） */
+  private healthPrompt(): string {
+    const p = this.p();
+    const owner = p.travelers[0]?.name || "使用者";
+    const now = zoned(Date.now(), p.timezone);
+    return `你是「健康管家」，幫${owner}整理自己的健康紀錄、準備看診。你不是醫師：不做診斷、不說「你得了／確診」，不建議開始、停止或調整任何藥物或劑量（這些一律請他問醫師或藥師）。
+
+# 現在
+${now.date}（${now.weekday}）${now.time}
+
+# 規則
+- 數字、分級、是否達標、該做哪些檢查：一律用 health_status 或 health_log 回傳的程式判讀，不要自己計算或改寫。查不到就說資料不足。
+- ${owner}報數字（例如「血壓 135/85」「早上空腹血糖 110」「體重 72.5」）→ 用 health_log 記下來，回覆程式判讀；有 alerts 就照原文完整轉述。
+- 說開始吃、停了某個藥，或拿到慢箋、下次領藥日 → health_meds。身高、生日、慢性病、過敏、家族史、吸菸 → health_profile。
+- 問最近的血壓、血糖、體重，或該做哪些健檢、疫苗 → 先用 health_status，再用白話說明，寫出依據的數字和日期。
+- 解釋時用「可能和…有關，建議請醫師評估」；可以給生活習慣層面的建議（飲食、運動、睡眠、正確量血壓的方法）。
+- 要提醒吃藥、量血壓 → create_reminder；回診 → add_event；問以前存的檢查報告 → search_notes。
+- 一律繁體中文、台灣用語，精簡條列。提到症狀或異常數值時，最後加一句：「健康管家是紀錄整理與衛教參考，不能取代醫師診斷；用藥請問醫師或藥師。」`;
+  }
+
   // ================= 證件到期：只記種類、持有人、到期日、末四碼，到期前提醒 =================
 
   private idSteps(kind: string): number[] {
@@ -4081,6 +4260,7 @@ ${transcript || "（沒什麼對話）"}`;
       memos: rows("SELECT ts, title, seconds, summary, actions, transcript FROM memos WHERE status = 'done' ORDER BY ts"),
       id_docs: rows("SELECT kind, holder, last4, expires FROM id_docs ORDER BY expires"),
       files: rows("SELECT ts, name, bytes, status, pages, chars FROM files ORDER BY ts"),
+      ...(p.kind === "personal" ? { health: this.health().exportData() } : {}),
     };
   }
 
@@ -4125,6 +4305,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - ${owner}貼了連結（只貼連結，或說「存起來／存到知識庫」）：先用 read_webpage 讀內容（Facebook、Instagram 的 Reels 也看得到影片內容），整理成標題＋3–6 點具體重點＋2–5 個標籤，用 save_note 存進知識庫（url 填原始連結，content 放貼文文字），再回覆重點並說已存進「知識庫」。${owner}只是問連結在講什麼，就回答後問要不要存進知識庫。讀不到內容就照實說，請${owner}貼文字或截圖。
 - 問以前存過的文章、影片、資料、保管箱裡的照片文件 → search_notes；回答用到的內容在句尾加上來源連結，例如 [1](#note-12)（網址用結果裡的 ref）。
 - 行事曆：約會、會議、看診、上課、出遊、繳費截止這類「某天的事」→ add_event（產生確認卡片，按確認才寫入；說了提前提醒就填 remind_minutes）；問這週、某天有什麼事、有沒有空 → list_events；改時間、取消 → update_event／delete_event。只是「幾點提醒我做某件事」用 create_reminder。日期一律換成實際日期再填。
+- 血壓、血糖、用藥、症狀、檢查數值這類健康問題由「健康管家」處理（會自動切換）：你不要回答醫療細節，請${owner}直接說「健康管家，…」或到「工具箱 → 健康管家」。
 - 證件到期（護照、身分證、駕照、健保卡…）→ id_expiry（action add）：只記種類、持有人、到期日和號碼末四碼，絕對不要記完整號碼；問哪些證件快到期 → id_expiry（action list）。
 - 錄音（語音備忘）整理好的會議記錄、逐字稿，以及上傳的文件（PDF、Word、PPT、Excel…）都存在知識庫：問開會說了什麼、文件裡寫什麼 → search_notes。結果裡的 passages 是原文段落，回答細節要根據 passages，並附上來源連結；段落開頭有【第 N 頁】就說在第幾頁。
 - remember 只用來記之後還會用到的事。只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址都不要填。
@@ -4281,14 +4462,34 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
   private async runAgent(trigger: MessageRow, user: Attachment) {
     const id = newId();
     const p = this.p();
-    const order = await this.chain(!!trigger.photo_id);
-    const decls = toolDecls(p);
+    let order = await this.chain(!!trigger.photo_id);
+    let decls = toolDecls(p);
+    // 健康話題：整輪改由 Cloudflare 的模型回答（Gemini 條款禁止用來提供醫療建議），對話標記成健康、不進一般記憶。
+    // 紅旗症狀直接給固定的就醫提示，不交給 AI 分析
+    let health = false;
+    if (this.isPersonal() && !trigger.photo_id) {
+      const flag = redFlagText(trigger.text);
+      if (flag) {
+        this.markHealth(trigger.id);
+        const row = this.insertMessage({ id, author: AI_NAME, role: "assistant", text: flag, photo_id: null, lat: null, lon: null, meta: JSON.stringify({ kind: "health_alert", health: true }) });
+        this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
+        return;
+      }
+      if (isHealthTopic(trigger.text)) {
+        health = true;
+        this.markHealth(trigger.id);
+        order = (await this.workersAiBlocked()) ? [] : ["workers-ai"];
+        decls = healthToolDecls(p);
+      }
+    }
     const available = new Set(decls.map((d) => d.name));
 
     if (!order.length) {
       const row = this.insertMessage({
-        id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true }),
-        text: "抱歉，今天的免費 AI 額度用完了 🙇\n\n管理員可以到 下方「設定」→ API 金鑰，填入自己的 Gemini 金鑰（免費申請）就能繼續使用；或等台灣時間早上 8 點額度重置。",
+        id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true, ...(health ? { health: true } : {}) }),
+        text: health
+          ? "健康管家今天的 AI 額度用完了（Cloudflare 免費額度，台灣時間早上 8 點恢復）🙇\n\n血壓、血糖、體重還是可以到「工具箱 → 健康管家」直接記錄。"
+          : "抱歉，今天的免費 AI 額度用完了 🙇\n\n管理員可以到 下方「設定」→ API 金鑰，填入自己的 Gemini 金鑰（免費申請）就能繼續使用；或等台灣時間早上 8 點額度重置。",
       });
       this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
       return;
@@ -4301,9 +4502,10 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     }
     // 附了位置就先把地名查好，AI 才不會自己猜在哪裡
     if (trigger.lat != null) await this.ensureArea(trigger.author);
-    const history = this.recentMessages(HISTORY_WINDOW);
-    if (this.isPersonal()) await this.prepareMemoryQuery(trigger.text);
-    const system = this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
+    // 一般對話看不到健康對話（不會傳給 Gemini）；健康對話可以看一般對話
+    const history = this.recentMessages(HISTORY_WINDOW).filter((m) => health || !healthMessage(m));
+    if (this.isPersonal() && !health) await this.prepareMemoryQuery(trigger.text);
+    const system = health ? this.healthPrompt() : this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
     const images: AttachedImage[] = [];
     const toolsUsed: string[] = [];
     const lastResults: Record<string, unknown> = {};
@@ -4406,6 +4608,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             provider: provider.id, providerLabel: PROVIDER_LABEL[provider.id], model: provider.model, tools: [...new Set(toolsUsed)].map(toolLabel),
             ...(images.length ? { images } : {}),
             ...(drafts.length ? { drafts } : {}),
+            ...(health ? { health: true } : {}),
           }),
         });
         this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });
@@ -4424,7 +4627,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const noOwn = !(await this.keys()).gemini;
     const row = this.insertMessage({
       // 中途產生的確認卡片還是附上，成員照樣可以確認
-      id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true, ...(drafts.length ? { drafts } : {}) }),
+      id, author: AI_NAME, role: "assistant", photo_id: null, lat: null, lon: null, meta: JSON.stringify({ error: true, ...(drafts.length ? { drafts } : {}), ...(health ? { health: true } : {}) }),
       text: `抱歉，AI 暫時無法回答 🙇${noOwn ? "\n\n如果常常遇到，管理員可以到 下方「設定」→ API 金鑰填入自己的 Gemini 金鑰。" : ""}\n\n\`${lastError.slice(0, 200)}\``,
     });
     this.broadcast({ type: "ai_done", id, message: this.publicMessage(row) });

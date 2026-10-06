@@ -14,6 +14,11 @@ export interface RoomApi {
   /** 個人助理知識庫 */
   noteSave(n: { title: string; summary: string; content?: string; url?: string; tags?: string[]; thumb?: string }, author: string): unknown;
   noteSearch(keyword: string): unknown;
+  /** 健康管家（只在健康對話裡給 Cloudflare 的模型用） */
+  healthLog(args: Record<string, unknown>): unknown;
+  healthStatus(): unknown;
+  healthMeds(args: Record<string, unknown>): unknown;
+  healthProfile(args: Record<string, unknown>): unknown;
   /** 證件到期（只記種類、持有人、到期日、末四碼） */
   idDocAdd(d: { kind?: unknown; holder?: unknown; expires?: unknown; last4?: unknown }, author: string): unknown;
   idDocList(): unknown;
@@ -1114,6 +1119,91 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    label: "🩺 記錄量測",
+    decl: {
+      name: "health_log",
+      description: "記錄血壓、血糖、體重（使用者報數字時用）。回傳程式判讀 grade 和固定提醒 alerts，照原文回覆，不要自己改判讀。",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["bp", "glucose", "weight"], description: "bp 血壓、glucose 血糖、weight 體重" },
+          systolic: { type: "number", description: "收縮壓" },
+          diastolic: { type: "number", description: "舒張壓" },
+          pulse: { type: "number", description: "脈搏（可留空）" },
+          glucose: { type: "number", description: "血糖 mg/dL" },
+          context: { type: "string", enum: ["fasting", "pre", "post", "bed", "random", "morning", "evening", "other"], description: "血糖：空腹 fasting、餐前 pre、餐後 2 小時 post、睡前 bed、其他 random；血壓：早上 morning、晚上 evening、其他 other（沒說就留空）" },
+          weight: { type: "number", description: "體重公斤" },
+          waist: { type: "number", description: "腰圍公分（可留空）" },
+          date: { type: "string", description: "量測日期 YYYY-MM-DD（今天就留空）" },
+          time: { type: "string", description: "量測時間 HH:mm（可留空）" },
+        },
+        required: ["kind"],
+      },
+    },
+    async run(args, { room }) {
+      return room.healthLog(args);
+    },
+  },
+  {
+    label: "🩺 健康整理",
+    decl: {
+      name: "health_status",
+      description: "取得健康管家整理好的資料：基本資料、BMI、最近的血壓血糖體重與程式判讀、7 天與 30 天血壓平均、722 結果、目前用藥、該做的健檢篩檢疫苗。回答健康問題前先查。",
+      parameters: { type: "object", properties: {} },
+    },
+    async run(_args, { room }) {
+      return room.healthStatus();
+    },
+  },
+  {
+    label: "💊 用藥清單",
+    decl: {
+      name: "health_meds",
+      description: "用藥清單：list 列出；add 新增（說開始吃某個藥、拿到慢箋）；stop 停用（說不吃了）。只記錄，不要建議劑量或要不要吃。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["list", "add", "stop"] },
+          name: { type: "string", description: "藥名（照使用者說的或藥袋上的）" },
+          dose: { type: "string", description: "劑量，例如 5mg" },
+          freq: { type: "string", description: "用法，例如 每天早餐後 1 顆" },
+          purpose: { type: "string", description: "用途，例如 高血壓" },
+          refill_next: { type: "string", description: "慢箋下次可以領藥的日期 YYYY-MM-DD" },
+          refill_left: { type: "number", description: "慢箋還剩幾次" },
+        },
+        required: ["action"],
+      },
+    },
+    async run(args, { room }) {
+      return room.healthMeds(args);
+    },
+  },
+  {
+    label: "🩺 健康檔案",
+    decl: {
+      name: "health_profile",
+      description: "更新健康檔案：性別、生日、身高、慢性病、過敏、家族史、吸菸、嚼檳榔。使用者提到這些時用。",
+      parameters: {
+        type: "object",
+        properties: {
+          sex: { type: "string", enum: ["M", "F"] },
+          birth: { type: "string", description: "生日 YYYY-MM-DD" },
+          height: { type: "number", description: "身高公分" },
+          add_condition: { type: "string", description: "新增一項慢性病，例如 高血壓、糖尿病" },
+          allergies: { type: "string", description: "過敏（藥物、食物）" },
+          familyCrc: { type: "boolean", description: "一等親有大腸癌" },
+          familyLung: { type: "boolean", description: "父母、子女、兄弟姊妹有肺癌" },
+          smoking: { type: "string", enum: ["never", "former", "current"] },
+          packYears: { type: "number", description: "吸菸包年（每天幾包 × 抽幾年）" },
+          betel: { type: "boolean", description: "嚼檳榔（含已戒）" },
+        },
+      },
+    },
+    async run(args, { room }) {
+      return room.healthProfile(args);
+    },
+  },
+  {
     label: "🪪 證件到期",
     decl: {
       name: "id_expiry",
@@ -1758,10 +1848,19 @@ const TRAVEL_ONLY = new Set([
 /** 只有個人助理才有的工具 */
 const PERSONAL_ONLY = new Set(["save_note", "search_notes", "add_event", "list_events", "update_event", "delete_event", "id_expiry"]);
 
+/** 健康管家專用：只在健康對話（Cloudflare 的模型）裡提供，一般聊天的 Gemini 拿不到健康資料 */
+const HEALTH_ONLY = new Set(["health_log", "health_status", "health_meds", "health_profile"]);
+const HEALTH_EXTRA = new Set(["create_reminder", "list_reminders", "add_event", "list_events", "search_notes"]);
+
 /** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */
 export function toolDecls(p: TripProfile): ToolDecl[] {
   const personal = p.kind === "personal";
-  return TOOLS.filter((t) => (!t.only || t.only(p)) && !(personal ? TRAVEL_ONLY : PERSONAL_ONLY).has(nameOf(t))).map((t) => declOf(t, p));
+  return TOOLS.filter((t) => (!t.only || t.only(p)) && !HEALTH_ONLY.has(nameOf(t)) && !(personal ? TRAVEL_ONLY : PERSONAL_ONLY).has(nameOf(t))).map((t) => declOf(t, p));
+}
+
+/** 健康對話的工具：健康管家四個＋提醒、行事曆、知識庫 */
+export function healthToolDecls(p: TripProfile): ToolDecl[] {
+  return TOOLS.filter((t) => HEALTH_ONLY.has(nameOf(t)) || HEALTH_EXTRA.has(nameOf(t))).map((t) => declOf(t, p));
 }
 
 export function toolLabel(name: string): string {

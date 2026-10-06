@@ -135,7 +135,7 @@ const avg = (xs: number[]) => (xs.length ? Math.round(xs.reduce((a, b) => a + b,
 
 /** 一段期間的血壓統計：整體、早上、晚上平均，以及單筆 <130/80 的比例 */
 export function bpSummary(vitals: Vital[], from: string, to: string) {
-  const bp = vitals.filter((v) => v.kind === "bp" && v.date >= from && v.date <= to);
+  const bp = vitals.filter((v) => v.kind === "bp" && v.context !== "clinic" && v.date >= from && v.date <= to);
   const mean = (list: Vital[]) => (list.length ? [avg(list.map((v) => v.v1))!, avg(list.map((v) => v.v2 ?? 0))!] as [number, number] : null);
   const below = bp.filter((v) => v.v1 < BP_TARGET[0] && (v.v2 ?? 0) < BP_TARGET[1]).length;
   return {
@@ -297,4 +297,96 @@ const HEALTH_RE =
 /** 健康話題：整輪改由 Cloudflare 的模型回答（Gemini 條款禁止提供醫療建議） */
 export function isHealthTopic(text: string): boolean {
   return HEALTH_RE.test(text);
+}
+
+// ================= 檢驗數值：項目對應、依指引的判讀 =================
+
+/** 報告上的項目名稱 → 標準代碼（順序有關：糖化血色素要比血色素先比對） */
+const LAB_CODES: [string, RegExp][] = [
+  ["hba1c", /HBA1C|A1C|糖化/i],
+  ["glucose_ac", /GLU(COSE)?[\s-]*\(?A\.?C\)?|AC[\s-]*SUGAR|飯前血糖|空腹血糖|血糖.*(飯前|空腹)/i],
+  ["glucose_pc", /GLU(COSE)?[\s-]*\(?P\.?C\)?|PC[\s-]*SUGAR|飯後血糖|餐後血糖/i],
+  ["ldl", /LDL|低密度/i],
+  ["hdl", /HDL|高密度/i],
+  ["tg", /^\s*TG\b|TRIGLYCERIDE|三酸甘油/i],
+  ["tc", /T[-.\s]?CHO|CHOLESTEROL|總膽固醇/i],
+  ["egfr", /E[-\s]?GFR|腎絲球/i],
+  ["uacr", /UACR|\bACR\b|白蛋白.{0,6}肌酸酐|ALBUMIN.{0,12}CREA/i],
+  ["upcr", /UPCR|\bPCR\b|蛋白.{0,6}肌酸酐|PROTEIN.{0,12}CREA/i],
+  ["cre", /CREA(TININE)?|肌酸酐/i],
+  ["bun", /\bBUN\b|尿素氮/i],
+  ["ua", /URIC|尿酸/i],
+  ["ast", /\bAST\b|\bGOT\b|SGOT/i],
+  ["alt", /\bALT\b|\bGPT\b|SGPT/i],
+  ["hb", /^\s*(HGB|HB)\b|HEMOGLOBIN|血色素/i],
+  ["tsh", /\bTSH\b|甲狀腺刺激素/i],
+];
+
+export const LAB_NAMES: Record<string, string> = {
+  hba1c: "糖化血色素 HbA1c", glucose_ac: "空腹血糖", glucose_pc: "飯後血糖", ldl: "低密度膽固醇 LDL", hdl: "高密度膽固醇 HDL", tg: "三酸甘油酯",
+  tc: "總膽固醇", egfr: "腎絲球過濾率 eGFR", uacr: "尿白蛋白／肌酸酐比 UACR", upcr: "尿蛋白／肌酸酐比 UPCR", cre: "肌酸酐", bun: "尿素氮", ua: "尿酸", ast: "AST(GOT)", alt: "ALT(GPT)", hb: "血色素", tsh: "甲狀腺刺激素 TSH",
+};
+
+export function labCode(name: string): string | null {
+  // 比值類（TC/HDL ratio、BUN/Cre 比值）不是單一項目，除了尿蛋白、尿白蛋白比都不歸類
+  const ratio = /RATIO|比值|比$|比\s/i.test(name);
+  for (const [code, re] of LAB_CODES) {
+    if (ratio && code !== "uacr" && code !== "upcr") continue;
+    if (re.test(name)) return code;
+  }
+  return null;
+}
+
+/** LDL 目標（台灣血脂指引 2022）：已有冠心病或中風 <70；糖尿病、慢性腎病 <100；其他依危險因子數 <115／<130／<160 */
+export function ldlTarget(p: HealthProfile, age: number | null, hdl: number | null): { target: number; why: string } {
+  const c = p.conditions ?? [];
+  if (c.includes("心臟病") || c.includes("中風")) return { target: 70, why: "已有心血管疾病" };
+  if (c.includes("糖尿病") || c.includes("慢性腎病")) return { target: 100, why: c.includes("糖尿病") ? "糖尿病" : "慢性腎病" };
+  let n = 0;
+  if (c.includes("高血壓")) n++;
+  if (age != null && ((p.sex === "M" && age > 45) || (p.sex === "F" && age > 55))) n++;
+  if (p.smoking === "current") n++;
+  if (hdl != null && ((p.sex === "F" && hdl < 50) || (p.sex !== "F" && hdl < 40))) n++;
+  return n >= 2 ? { target: 115, why: `${n} 個危險因子` } : n === 1 ? { target: 130, why: "1 個危險因子" } : { target: 160, why: "沒有危險因子" };
+}
+
+/** 依指引寫死的判讀（只針對常見項目；其他照報告上的參考值） */
+export function labNote(code: string | null, value: number | null, p: HealthProfile, age: number | null, hdl: number | null): string | null {
+  if (!code || value == null) return null;
+  switch (code) {
+    case "glucose_ac": return value < 100 ? "正常（<100，國健署）" : value < 126 ? "糖尿病前期範圍（100–125，國健署）" : "落在糖尿病範圍（≥126，要由醫師確認）";
+    case "hba1c": return value < 5.7 ? "正常（<5.7%）" : value < 6.5 ? "糖尿病前期範圍（5.7–6.4%）" : "落在糖尿病範圍（≥6.5%，要由醫師確認）";
+    case "ldl": {
+      const t = ldlTarget(p, age, hdl);
+      return `${value < t.target ? "達標" : "高於目標"}（依台灣血脂指引 2022，${t.why}：目標 <${t.target}）`;
+    }
+    case "tg": return value >= 500 ? "很高（≥500，有胰臟炎風險，請盡快就醫）" : value >= 150 ? "偏高（≥150）" : "正常（<150）";
+    case "hdl": return (p.sex === "F" ? value < 50 : value < 40) ? `偏低（${p.sex === "F" ? "女 <50" : "男 <40"}）` : "正常";
+    case "egfr": return value >= 90 ? "G1（≥90）" : value >= 60 ? "G2（60–89）" : value >= 45 ? "G3a（45–59），建議請醫師評估腎功能" : value >= 30 ? "G3b（30–44），建議請醫師評估腎功能" : value >= 15 ? "G4（15–29），建議找腎臟科" : "G5（<15），建議找腎臟科";
+    case "uacr": return value < 30 ? "A1 正常（<30）" : value < 300 ? "A2 中度增加（30–299，要 3–6 個月內複驗確認）" : "A3 重度增加（≥300）";
+    case "ua": return value > 7 ? "高尿酸（>7.0）" : "正常";
+    default: return null;
+  }
+}
+
+/** 報告上的數字（可能是「<5」「112 H」「陰性」）→ 數值；讀不出來回 null */
+export function labNumber(text: string): number | null {
+  const m = String(text ?? "").replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+  return m ? Number(m[0]) : null;
+}
+
+/** 文字裡第一個日期（藥袋的「下次領藥日 115/10/20」） */
+export function findDate(text: string): string | null {
+  const m = String(text ?? "").match(/\d{2,4}\s*[/.\-年]\s*\d{1,2}\s*[/.\-月]\s*\d{1,2}/);
+  return m ? normDate(m[0].replace(/\s/g, "")) : null;
+}
+
+/** 民國或西元日期文字 → YYYY-MM-DD（115/09/15、2026-09-15、20260915） */
+export function normDate(text: string): string | null {
+  const s = String(text ?? "").trim();
+  let m = s.match(/^(\d{2,3})[/.\-年](\d{1,2})[/.\-月](\d{1,2})/);
+  if (m && Number(m[1]) < 200) return `${Number(m[1]) + 1911}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  m = s.match(/^(\d{4})[/.\-年]?(\d{1,2})[/.\-月]?(\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  return null;
 }

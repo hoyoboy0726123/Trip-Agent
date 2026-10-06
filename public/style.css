@@ -530,7 +530,7 @@ details.guide li + li { margin-top: 4px; }
 .note-full h1, .note-full h2, .note-full h3, .note-full h4 { font-size: 15px; margin: 12px 0 4px; }
 
 /* 健康管家 */
-.h-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.h-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .h-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .h-tile { display: grid; gap: 2px; text-align: left; font: inherit; color: inherit; cursor: pointer; align-content: start; }
 .h-num { font-size: 26px; font-variant-numeric: tabular-nums; line-height: 1.2; }
@@ -580,3 +580,28 @@ details.guide li + li { margin-top: 4px; }
 .ai-card.health { border-color: #b7e0c4; }
 .ai-card.health .ai-avatar { background: #e3f3e9; color: #1f7a45; }
 .ai-card.health .ai-name { color: #1f7a45; }
+
+/* 健康管家：拍照確認、檢驗、健康存摺匯入 */
+.h-actions { gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.h-scan { display: flex; gap: 10px; align-items: flex-start; }
+.h-scan-img { flex: none; display: grid; gap: 2px; justify-items: center; color: var(--muted); text-decoration: none; }
+.h-scan-img img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+.h-scan-items { display: grid; gap: 6px; }
+.h-scan-row { display: grid; grid-template-columns: 22px minmax(0, 1fr) 4.8em 4.2em; gap: 4px; align-items: center; }
+.h-scan-row input:not([type="checkbox"]) { padding: 6px; font-size: 14px; min-width: 0; }
+.h-scan-row .h-scan-ref { grid-column: 2 / -1; margin-top: -2px; }
+.h-scan-row.warn input:not([type="checkbox"]) { background: #fff3cd; color: #222; }
+.h-lab { border-top: 1px solid var(--line); padding: 9px 0; }
+.card > h3 + .h-lab { border-top: 0; }
+.h-lab > summary { list-style: none; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; cursor: pointer; }
+.h-lab > summary::-webkit-details-marker { display: none; }
+.h-lab-name { font-weight: 600; font-size: 14px; }
+.h-lab-val { text-align: right; white-space: nowrap; }
+.h-lab-note { grid-column: 1 / -1; }
+.h-lab.warn .h-lab-note { color: #b45309; }
+.h-lab .list { margin-top: 6px; }
+.h-lab .msg-text { margin-top: 6px; white-space: pre-wrap; }
+.h-imp-list { margin: 6px 0; padding-left: 20px; }
+.h-imp-meds { display: grid; gap: 8px; }
+.h-imp-meds label { display: flex; gap: 8px; align-items: flex-start; }
+.h-imp-meds input { margin-top: 3px; }

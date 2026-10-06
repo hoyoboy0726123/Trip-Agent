@@ -4,7 +4,7 @@
  */
 import {
   bmiInfo, bp722, bpClass, bpFlags, bpSummary, daysBetween, glucoseClass, glucoseFlags, next722Days, screeningPlan, screeningStatus, shiftDate, waistInfo,
-  ageOn, GLU_CONTEXT, type Flag, type HealthProfile, type Vital, type VitalKind,
+  ageOn, labCode, labNote, labNumber, LAB_NAMES, GLU_CONTEXT, type Flag, type HealthProfile, type Vital, type VitalKind,
 } from "./health";
 import { localToUtc, zoned } from "./profile";
 
@@ -13,6 +13,21 @@ export interface HealthReminder {
   text: string;
   push?: { title: string; body: string };
 }
+
+export interface LabInput {
+  date?: unknown;
+  name?: unknown;
+  value?: unknown;
+  unit?: unknown;
+  ref?: unknown;
+  flag?: unknown;
+}
+
+/** 檢驗判讀裡要提醒的字（用來把卡片標成黃色） */
+const LAB_WARN = /高於目標|偏高|偏低|糖尿病|前期|G3|G4|G5|A2|A3|很高|高尿酸/;
+const SCREEN_CODES = new Set(["adult", "hbc", "pap", "hpv", "mammo", "fit", "oral", "ldct", "hp", "flu", "tdap", "pneumo", "zoster", "covid"]);
+const str = (v: unknown, n: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+const isDate = (v: unknown): v is string => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && v > "1950-01-01";
 
 const CONDITIONS = ["高血壓", "糖尿病", "高血脂", "慢性腎病", "心臟病", "中風", "痛風", "氣喘", "甲狀腺疾病"];
 const RANGES: Record<VitalKind, [number, number][]> = {
@@ -32,7 +47,14 @@ export class HealthStore {
       CREATE TABLE IF NOT EXISTS health_tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, start TEXT, status TEXT, result TEXT, ts INTEGER);
       CREATE TABLE IF NOT EXISTS health_alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, level TEXT, text TEXT, seen INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS health_sent (key TEXT PRIMARY KEY, ts INTEGER);
+      CREATE TABLE IF NOT EXISTS labs (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, code TEXT, name TEXT, value TEXT, num REAL, unit TEXT, ref TEXT, flag TEXT, kind TEXT DEFAULT 'lab', source TEXT, ts INTEGER);
+      CREATE UNIQUE INDEX IF NOT EXISTS labs_uniq ON labs(kind, date, name, value);
+      CREATE TABLE IF NOT EXISTS health_scans (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, photo_id TEXT, status TEXT, data TEXT, error TEXT);
     `);
+    // 健保藥品代碼（健康存摺匯入、之後查交互作用用）
+    try {
+      this.sql.exec("ALTER TABLE meds ADD COLUMN code TEXT");
+    } catch {}
   }
 
   private get(key: string): string {
@@ -68,7 +90,7 @@ export class HealthStore {
     if (typeof patch.birth === "string" && /^\d{4}-\d{2}-\d{2}$/.test(patch.birth) && patch.birth > "1900-01-01" && patch.birth <= this.today()) p.birth = patch.birth;
     if (patch.height != null) p.height = num(patch.height, 50, 250) ?? p.height;
     if (Array.isArray(patch.conditions)) p.conditions = [...new Set(patch.conditions.map((c) => String(c).trim().slice(0, 20)).filter(Boolean))].slice(0, 15);
-    if (typeof patch.allergies === "string") p.allergies = patch.allergies.trim().slice(0, 200);
+    if (typeof patch.allergies === "string") p.allergies = patch.allergies.trim().slice(0, 500);
     for (const k of ["familyCrc", "familyLung", "betel", "pregnant"] as const) if (typeof patch[k] === "boolean") p[k] = patch[k] as boolean;
     if (patch.smoking === "never" || patch.smoking === "former" || patch.smoking === "current") p.smoking = patch.smoking;
     if (patch.packYears != null) p.packYears = num(patch.packYears, 0, 200);
@@ -184,10 +206,16 @@ export class HealthStore {
     this.sql.exec("DELETE FROM meds WHERE id = ?", id);
   }
 
-  /** 找藥名（聊天說「停了 xxx」用） */
+  /** 找藥名（聊天說「停了 xxx」、藥袋和健康存摺是不是同一種藥）：比對整個名稱，或開頭的中文商品名 */
   medFind(name: string) {
     const n = name.trim().toLowerCase();
-    return this.meds().find((m) => String(m.name).toLowerCase().includes(n) || n.includes(String(m.name).toLowerCase()));
+    if (!n) return undefined;
+    const brand = (s: string) => s.match(/^[\u4e00-\u9fff]{2,}/)?.[0] ?? "";
+    const b = brand(n);
+    return this.meds().find((m) => {
+      const x = String(m.name).toLowerCase();
+      return x.includes(n) || n.includes(x) || (!!b && brand(x) === b);
+    });
   }
 
   markScreening(code: string, last: string | null) {
@@ -234,7 +262,7 @@ export class HealthStore {
     const today = this.today();
     const p = this.profile();
     const vitals = this.vitals(120);
-    const last = (k: VitalKind) => [...vitals].reverse().find((v) => v.kind === k) ?? null;
+    const last = (k: VitalKind) => [...vitals].reverse().find((v) => v.kind === k && v.context !== "clinic") ?? null;
     const bp = last("bp"), glu = last("glucose"), wt = last("weight");
     const task = this.activeTask();
     const plan = screeningPlan(p, today);
@@ -262,7 +290,183 @@ export class HealthStore {
       vitals,
       diabetic: this.diabetic(),
       hypertensive: this.hypertensive(),
+      labs: this.labs(),
+      reports: this.reports(),
+      scans: this.scans(),
     };
+  }
+
+  // ---------- 檢驗數值 ----------
+
+  /** 存一批檢驗數值（拍照確認後、健康存摺匯入）。同一天、同項目、同數值不重複存 */
+  addLabs(items: LabInput[], source: string, kind: "lab" | "report" | "vaccine" = "lab"): { added: number; skipped: number } {
+    let added = 0, skipped = 0;
+    const today = this.today();
+    for (const it of items) {
+      const date = isDate(it.date) && it.date <= today ? it.date : null;
+      const name = str(it.name, 80);
+      const value = kind === "report" ? String(it.value ?? "").trim().slice(0, 4000) : str(it.value, 60);
+      if (!date || !name || !value) {
+        skipped++;
+        continue;
+      }
+      const code = kind === "lab" ? labCode(name) : null;
+      const num = kind === "lab" ? labNumber(value) : null;
+      // 健康存摺的同一次檢驗可能在好幾個區塊出現（檢驗、成人健檢、糖尿病追蹤），名稱不同但數值一樣
+      if (code && num != null && this.sql.exec("SELECT 1 FROM labs WHERE kind = 'lab' AND code = ? AND date = ? AND num = ?", code, date, num).toArray().length) {
+        skipped++;
+        continue;
+      }
+      this.sql.exec(
+        "INSERT OR IGNORE INTO labs (date, code, name, value, num, unit, ref, flag, kind, source, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        date, code, name, value, num, str(it.unit, 20) || null, str(it.ref, 60) || null, str(it.flag, 10) || null, kind, source, Date.now(),
+      );
+      if (Number(this.sql.exec("SELECT changes() AS n").one().n)) added++;
+      else skipped++;
+    }
+    return { added, skipped };
+  }
+
+  deleteLab(id: number) {
+    this.sql.exec("DELETE FROM labs WHERE id = ?", id);
+  }
+
+  private labContext() {
+    const p = this.profile();
+    const age = p.birth ? ageOn(p.birth, this.today()) : null;
+    const hdl = this.sql.exec("SELECT num FROM labs WHERE code = 'hdl' AND num IS NOT NULL ORDER BY date DESC LIMIT 1").toArray()[0]?.num;
+    return { p, age, hdl: hdl == null ? null : Number(hdl) };
+  }
+
+  /** 檢驗項目：同一項目歸在一起（最新在前），常見項目附上依指引的判讀 */
+  labs() {
+    const { p, age, hdl } = this.labContext();
+    const groups = new Map<string, { key: string; code: string | null; name: string; points: Record<string, unknown>[] }>();
+    for (const r of this.sql.exec("SELECT id, date, code, name, value, num, unit, ref, flag FROM labs WHERE kind = 'lab' ORDER BY date DESC, id DESC").toArray()) {
+      const code = r.code ? String(r.code) : null;
+      const key = code ?? String(r.name).toLowerCase().replace(/[\s()（）]+/g, "");
+      let g = groups.get(key);
+      if (!g) groups.set(key, (g = { key, code, name: code ? LAB_NAMES[code] ?? String(r.name) : String(r.name), points: [] }));
+      if (g.points.length < 12) g.points.push({ id: r.id, date: r.date, value: r.value, num: r.num, unit: r.unit, ref: r.ref, flag: r.flag, name: r.name });
+    }
+    const order = Object.keys(LAB_NAMES);
+    return [...groups.values()]
+      .map((g) => {
+        const note = labNote(g.code, g.points[0].num == null ? null : Number(g.points[0].num), p, age, hdl);
+        return { ...g, note, warn: !!note && LAB_WARN.test(note) };
+      })
+      .sort((a, b) => (a.code && b.code ? order.indexOf(a.code) - order.indexOf(b.code) : a.code ? -1 : b.code ? 1 : String(b.points[0].date).localeCompare(String(a.points[0].date))))
+      .slice(0, 120);
+  }
+
+  /** 影像、病理、癌症篩檢報告和疫苗（健康存摺匯入的文字紀錄） */
+  reports() {
+    return this.sql.exec("SELECT id, date, name, substr(value, 1, 1500) AS value, kind FROM labs WHERE kind != 'lab' ORDER BY date DESC, id DESC LIMIT 60").toArray();
+  }
+
+  /** 某一天的檢驗，寫成給 AI 說明用的條列（判讀、上次數值都是程式算的） */
+  labFacts(date: string): string {
+    const { p, age, hdl } = this.labContext();
+    const rows = this.sql.exec("SELECT * FROM labs WHERE kind = 'lab' AND date = ? ORDER BY id", date).toArray();
+    return rows
+      .map((r) => {
+        const code = r.code ? String(r.code) : null;
+        const prev = this.sql
+          .exec(`SELECT date, value FROM labs WHERE kind = 'lab' AND date < ? AND ${code ? "code = ?" : "name = ?"} ORDER BY date DESC LIMIT 1`, date, code ?? String(r.name))
+          .toArray()[0];
+        const note = labNote(code, r.num == null ? null : Number(r.num), p, age, hdl);
+        const judge = note ? `判讀：${note}` : [r.flag ? `報告標示 ${r.flag}` : "", r.ref ? `參考值 ${r.ref}` : ""].filter(Boolean).join("、") || "報告沒有參考值";
+        return `- ${code ? LAB_NAMES[code] : r.name}：${r.value}${r.unit ? ` ${r.unit}` : ""}｜${judge}${prev ? `｜上次 ${prev.value}（${prev.date}）` : ""}`;
+      })
+      .join("\n");
+  }
+
+  // ---------- 拍照讀取（Gemini 只照抄，存檔前由本人確認） ----------
+
+  scanAdd(kind: "lab" | "med", photoId: string): number {
+    return this.sql.exec("INSERT INTO health_scans (ts, kind, photo_id, status) VALUES (?, ?, ?, 'reading') RETURNING id", Date.now(), kind, photoId).one().id as number;
+  }
+
+  scan(id: number) {
+    return this.sql.exec("SELECT * FROM health_scans WHERE id = ?", id).toArray()[0];
+  }
+
+  scanSet(id: number, status: string, data: unknown = null, error: string | null = null) {
+    this.sql.exec("UPDATE health_scans SET status = ?, data = ?, error = ?, ts = ? WHERE id = ?", status, data == null ? null : JSON.stringify(data), error, Date.now(), id);
+  }
+
+  /** 還沒處理完的（讀取中、等確認、失敗）；讀取中超過 5 分鐘當作失敗 */
+  scans() {
+    return this.sql
+      .exec("SELECT id, ts, kind, photo_id, status, data, error FROM health_scans WHERE status IN ('reading', 'review', 'failed') ORDER BY id DESC LIMIT 6")
+      .toArray()
+      .map((r) => {
+        const stale = r.status === "reading" && Date.now() - Number(r.ts) > 5 * 60_000;
+        return { ...r, status: stale ? "failed" : r.status, error: stale ? "讀取逾時，請重試" : r.error, data: r.data ? JSON.parse(String(r.data)) : null };
+      });
+  }
+
+  // ---------- 健康存摺匯入（瀏覽器先解析，只送需要的欄位） ----------
+
+  importBank(d: Record<string, unknown>) {
+    const arr = (v: unknown, n: number) => (Array.isArray(v) ? v.slice(0, n) : []) as Record<string, unknown>[];
+    const labs = this.addLabs(arr(d.labs, 5000), "nhi", "lab");
+    const reports = this.addLabs(arr(d.reports, 300), "nhi", "report");
+    const vaccines = this.addLabs(arr(d.vaccines, 200).map((v) => ({ date: v.date, name: v.name, value: "已接種" })), "nhi", "vaccine");
+    // 健檢、追蹤量的血壓和體重：標成「健檢／門診」，不算進居家血壓平均，也不發警示
+    let vitals = 0;
+    const today = this.today();
+    for (const v of arr(d.vitals, 500)) {
+      const kind = v.kind === "bp" ? "bp" : v.kind === "weight" ? "weight" : null;
+      if (!kind || !isDate(v.date) || v.date > today) continue;
+      const v1 = Number(v.v1), v2 = v.v2 == null || v.v2 === "" ? null : Number(v.v2);
+      const [r1, r2] = RANGES[kind];
+      if (!(v1 >= r1[0] && v1 <= r1[1])) continue;
+      if (kind === "bp" ? !(v2 != null && v2 >= r2[0] && v2 <= r2[1]) : v2 != null && !(v2 >= r2[0] && v2 <= r2[1])) continue;
+      const ts = localToUtc(v.date, "12:00", this.tz());
+      if (!ts || this.sql.exec("SELECT 1 FROM vitals WHERE kind = ? AND ts = ? AND source = 'nhi'", kind, ts).toArray().length) continue;
+      this.sql.exec("INSERT INTO vitals (ts, kind, v1, v2, context, source) VALUES (?, ?, ?, ?, ?, 'nhi')", ts, kind, v1, v2, kind === "bp" ? "clinic" : "");
+      vitals++;
+    }
+    // 篩檢、疫苗：只在比原本紀錄新的時候更新
+    let screens = 0;
+    const lastDone = new Map(this.sql.exec("SELECT code, last FROM screenings").toArray().map((r) => [String(r.code), String(r.last)]));
+    for (const s of arr(d.screens, 300)) {
+      const code = String(s.code ?? "");
+      if (!SCREEN_CODES.has(code) || !isDate(s.date) || s.date > today) continue;
+      if ((lastDone.get(code) ?? "") >= s.date) continue;
+      this.markScreening(code, s.date);
+      lastDone.set(code, s.date);
+      screens++;
+    }
+    // 用藥：本人勾選要加的才會送來；同一個健保代碼或同名的藥已經在清單裡就略過
+    let meds = 0;
+    for (const m of arr(d.meds, 60)) {
+      const name = str(m.name, 60);
+      const code = /^[A-Z]{1,2}\d{8,9}$/.test(String(m.code ?? "")) ? String(m.code) : null;
+      if (!name) continue;
+      if (code && this.sql.exec("SELECT 1 FROM meds WHERE status = 'active' AND code = ?", code).toArray().length) continue;
+      if (this.medFind(name)) continue;
+      const note = [isDate(m.date) ? `健康存摺：${m.date}` : "健康存摺", str(m.inst, 30), Number(m.days) > 0 ? `${Number(m.days)} 天份` : "", str(m.diag, 40) ? `就診原因 ${str(m.diag, 40)}` : ""].filter(Boolean).join("，");
+      this.sql.exec("INSERT INTO meds (ts, name, note, code, updated) VALUES (?, ?, ?, ?, ?)", Date.now(), name, note, code, Date.now());
+      meds++;
+    }
+    // 過敏、身高：補進健康檔案
+    const p = this.profile();
+    let allergies = 0;
+    const have = (p.allergies ?? "").split(/[、,，]\s*/).filter(Boolean);
+    for (const a of arr(d.allergies, 20)) {
+      const t = str(a, 80);
+      if (t && !have.some((h) => h.includes(t.split("（")[0]) || t.includes(h))) {
+        have.push(t);
+        allergies++;
+      }
+    }
+    const patch: Record<string, unknown> = {};
+    if (allergies) patch.allergies = have.join("、").slice(0, 500);
+    if (!p.height && Number(d.height) >= 100 && Number(d.height) <= 230) patch.height = Number(d.height);
+    if (Object.keys(patch).length) this.saveProfile(patch);
+    return { labs: labs.added, reports: reports.added, vaccines: vaccines.added, vitals, screens, meds, allergies, skipped: labs.skipped + reports.skipped + vaccines.skipped, height: !!patch.height };
   }
 
   seeAlert(id: number) {
@@ -356,10 +560,11 @@ export class HealthStore {
       meds: this.sql.exec("SELECT name, dose, freq, purpose, status, refill_next, refill_left, note FROM meds ORDER BY id").toArray(),
       screenings: this.sql.exec("SELECT code, last FROM screenings").toArray(),
       bp722: this.sql.exec("SELECT start, status, result FROM health_tasks ORDER BY id").toArray(),
+      labs: this.sql.exec("SELECT date, name, value, unit, ref, flag, kind, source FROM labs ORDER BY date, id").toArray(),
     };
   }
 
   clear() {
-    for (const t of ["health_kv", "vitals", "meds", "screenings", "health_tasks", "health_alerts", "health_sent"]) this.sql.exec(`DELETE FROM ${t}`);
+    for (const t of ["health_kv", "vitals", "meds", "screenings", "health_tasks", "health_alerts", "health_sent", "labs", "health_scans"]) this.sql.exec(`DELETE FROM ${t}`);
   }
 }

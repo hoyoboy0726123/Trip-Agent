@@ -11,7 +11,7 @@ import { disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
-import { isHealthTopic, redFlagText, type Flag } from "./health";
+import { findDate, isHealthTopic, labCode, normDate, redFlagText, type Flag } from "./health";
 import { HealthStore } from "./health-store";
 import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
@@ -245,6 +245,19 @@ const PUSH_HOSTS = /^https:\/\/([a-z0-9-]+\.)*(googleapis\.com|push\.apple\.com|
 
 const MEMORY_EVERY = 4; // 每 4 則新的成員訊息自動整理一次長期記憶
 const RECALL_LIMIT = 8; // 從較舊的聊天中自動找回的相關訊息數
+/** 藥袋上的「第 1 次／共 3 次」→ 還剩 2 次 */
+function refillLeft(text: string): string {
+  const m = text.match(/第\s*(\d+)\s*次.{0,6}?共\s*(\d+)\s*次/) ?? text.match(/(\d+)\s*\/\s*(\d+)\s*次/);
+  return m && Number(m[2]) >= Number(m[1]) ? String(Number(m[2]) - Number(m[1])) : "";
+}
+
+/** 健康管家拍照：Gemini 只照抄成 JSON（不判讀、不抄個資），存檔前本人確認 */
+const LAB_SCAN_PROMPT = `只把這張檢驗／健檢報告上的文字照抄成 JSON，不要解讀、不要判斷好壞：
+{"date": "報告或採檢日期（照原文）", "items": [{"name": "項目原文", "value": "結果原文", "unit": "單位", "ref": "報告上的參考值原文", "flag": "報告上的 H/L/* 標記（沒有就空字串）", "prev": "上次結果（報告上有才填）", "unreadable": false}], "vitals": "血壓、身高、體重等原文", "doctor_note": "醫師建議原文", "item_count_on_page": 這頁的檢驗項目總數}
+姓名、身分證字號、病歷號、地址不要抄。看不清楚的欄位 unreadable 填 true，不要猜。`;
+const MED_SCAN_PROMPT = `只把這個藥袋（或藥單）上的文字照抄成 JSON，不要解讀：
+{"date": "調劑或看診日期原文", "drug_name": "藥名原文（商品名＋學名）", "ingredient": "成分（有寫才填）", "strength": "含量", "quantity": "數量", "usage": "用法用量原文", "indication": "適應症或用途原文", "side_effects": "副作用原文", "warnings": "注意事項原文", "appearance": "外觀", "refill": "慢箋資訊原文（第幾次、下次可領藥日期）"}
+如果有好幾種藥，只抄最上面第一種。姓名、身分證字號、病歷號、地址不要抄。看不清楚的欄位填空字串，不要猜。`;
 const PHOTO_BYTES_LIMIT = 700_000_000; // 每個旅程的照片總量上限（免費方案整個帳號只有 5 GB）
 const AI_NAME = "旅伴 AI";
 
@@ -329,7 +342,7 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   // 健康管家（只在健康對話裡有這些工具）：報數字要記、說用藥要存、問狀況要先查，模型常常嘴上說好了卻沒呼叫
   { tool: "health_log", test: (t) => /血壓.{0,10}\d{2,3}\s*[\/／]\s*\d{2,3}|\d{2,3}\s*[\/／]\s*\d{2,3}.{0,6}血壓|血糖.{0,10}\d{2,3}|體重.{0,6}\d{2,3}/.test(t) },
   { tool: "health_meds", test: (t) => /開始(吃|服用|使用)|改吃|(停|不吃)(了|掉)?.{0,8}藥|藥.{0,6}(不吃了|停了)|慢箋|領藥/.test(t) },
-  { tool: "health_status", test: (t) => /(最近|這週|這個月|上次|目前).{0,10}(血壓|血糖|體重|健康).{0,10}(怎麼樣|如何|狀況|正常嗎|好嗎|趨勢)|該做.{0,6}(健檢|篩檢|檢查|疫苗)/.test(t) },
+  { tool: "health_status", test: (t) => /(最近|這週|這個月|上次|目前).{0,10}(血壓|血糖|體重|健康).{0,10}(怎麼樣|如何|狀況|正常嗎|好嗎|趨勢)|該做.{0,6}(健檢|篩檢|檢查|疫苗)|(檢驗|報告|膽固醇|LDL|HDL|三酸甘油|糖化|A1c|腎功能|肝功能|eGFR|尿酸).{0,12}(怎麼樣|如何|正常嗎|好嗎|多少|看一下|解釋|說明|意思)/i.test(t) },
 ];
 
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
@@ -1481,6 +1494,55 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         this.health().seeAlert(Number(msg.id));
         this.broadcastState();
         break;
+      case "health_scan": {
+        if (!this.isPersonal()) return reply(false, "只有個人助理有這個功能");
+        const photoId = String(msg.photoId ?? "");
+        if (!this.sql.exec("SELECT 1 FROM photos WHERE id = ?", photoId).toArray().length) return reply(false, "找不到照片，請重新上傳");
+        const err = await this.scanBlocked();
+        if (err) {
+          this.sql.exec("DELETE FROM photos WHERE id = ?", photoId);
+          return reply(false, err);
+        }
+        const id = this.health().scanAdd(msg.kind === "med" ? "med" : "lab", photoId);
+        this.broadcastState();
+        this.ctx.waitUntil(this.runScan(id));
+        break;
+      }
+      case "scan_retry": {
+        const s = this.health().scan(Number(msg.id));
+        if (!s) return reply(false, "找不到這筆");
+        const err = await this.scanBlocked();
+        if (err) return reply(false, err);
+        this.health().scanSet(Number(s.id), "reading");
+        this.broadcastState();
+        this.ctx.waitUntil(this.runScan(Number(s.id)));
+        break;
+      }
+      case "scan_save": {
+        const r = this.saveScan(Number(msg.id), msg);
+        if ("error" in r) return reply(false, r.error);
+        break;
+      }
+      case "scan_discard": {
+        const s = this.health().scan(Number(msg.id));
+        if (s) {
+          this.health().scanSet(Number(s.id), "discarded");
+          this.sql.exec("DELETE FROM photos WHERE id = ?", s.photo_id);
+        }
+        this.broadcastState();
+        break;
+      }
+      case "lab_delete":
+        this.health().deleteLab(Number(msg.id));
+        this.broadcastState();
+        break;
+      case "health_import": {
+        if (!this.isPersonal()) return reply(false, "只有個人助理有這個功能");
+        const r = this.health().importBank(msg.data && typeof msg.data === "object" ? msg.data : {});
+        this.send(ws, { type: "health_import_result", result: r });
+        this.broadcastState();
+        break;
+      }
       case "iddoc_add": {
         const r = this.idDocAdd({ kind: msg.kind, holder: msg.holder, expires: msg.expires, last4: msg.last4 }, user.name);
         if ("error" in r) return reply(false, String(r.error));
@@ -3910,6 +3972,14 @@ ${body}`;
     return {
       ...s,
       screenings: s.screenings.filter((x) => x.status === "due" || x.status === "none").map((x) => ({ name: x.name, status: x.status === "due" ? "該做了" : "沒有紀錄", last: x.last, rule: x.rule })),
+      labs: s.labs.slice(0, 40).map((g) => ({
+        item: g.name,
+        latest: `${g.points[0].value}${g.points[0].unit ? ` ${g.points[0].unit}` : ""}（${g.points[0].date}）`,
+        judge: g.note ?? (g.points[0].ref ? `參考值 ${g.points[0].ref}${g.points[0].flag ? `，報告標示 ${g.points[0].flag}` : ""}` : null),
+        previous: g.points.slice(1, 4).map((x) => `${x.value}（${x.date}）`),
+      })),
+      reports: s.reports.slice(0, 8).map((r) => ({ date: r.date, name: r.name, text: String(r.value).slice(0, 300) })),
+      scans: undefined,
       note: "數字與判讀都是程式依指引算的；說明時照這些判讀，不要自己改",
     };
   }
@@ -3941,6 +4011,100 @@ ${body}`;
     return { saved: p };
   }
 
+  /** 拍照讀取前的檢查：隱私模式不傳給 Google；需要自己的 Gemini 金鑰 */
+  private async scanBlocked(): Promise<string | null> {
+    if (this.setting("voice_engine", "gemini") === "private") return "隱私模式不會把照片傳給 Google，請手動輸入（或到設定把語音與文件改回 Gemini）";
+    if (!(await this.keys()).gemini) return "拍照讀取需要你自己的 Gemini 金鑰（設定 → API 金鑰）；也可以手動輸入";
+    return null;
+  }
+
+  /** Gemini 只把照片上的字照抄成 JSON（不判讀），等本人確認後才存 */
+  private async runScan(id: number) {
+    const store = this.health();
+    const s = store.scan(id);
+    if (!s) return;
+    const ph = this.sql.exec("SELECT mime, data FROM photos WHERE id = ?", s.photo_id).toArray()[0];
+    try {
+      if (!ph) throw new Error("照片不見了");
+      const r = await (await this.provider("gemini-own", 1, 30_000)).generate({
+        system: "你是把醫療文件照片照抄成 JSON 的助手：只抄寫看得到的文字，不解讀、不判斷好壞、不補充、不猜。",
+        turns: [{ role: "user", parts: [{ image: { mime: String(ph.mime), data: toBase64(ph.data as ArrayBuffer) } }, { text: s.kind === "med" ? MED_SCAN_PROMPT : LAB_SCAN_PROMPT }] }],
+        json: true,
+        timeoutMs: 120_000,
+      });
+      const j = parseArgs(r.text.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as Record<string, any>;
+      const t = (v: unknown, n = 200) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+      let data: Record<string, unknown>;
+      if (s.kind === "lab") {
+        const items = (Array.isArray(j.items) ? j.items : []).slice(0, 80).map((it: any) => ({
+          name: t(it?.name, 80), value: t(it?.value, 60), unit: t(it?.unit, 20), ref: t(it?.ref, 60), flag: t(it?.flag, 10), prev: t(it?.prev, 40), unreadable: !!it?.unreadable, known: !!labCode(t(it?.name, 80)),
+        })).filter((it: { name: string; value: string }) => it.name && (it.value || it.name));
+        if (!items.length) throw new Error("讀不到檢驗項目");
+        data = { date: normDate(t(j.date, 30)) ?? "", dateRaw: t(j.date, 30), items, count: Number(j.item_count_on_page) || null, note: t(j.doctor_note, 500), vitals: t(j.vitals, 200) };
+      } else {
+        const name = t(j.drug_name, 80);
+        if (!name) throw new Error("讀不到藥名");
+        data = {
+          date: normDate(t(j.date, 30)) ?? "", name, ingredient: t(j.ingredient, 120), strength: t(j.strength, 40), quantity: t(j.quantity, 40), usage: t(j.usage, 120), indication: t(j.indication, 120),
+          side_effects: t(j.side_effects, 300), warnings: t(j.warnings, 300), appearance: t(j.appearance, 120), refill: t(j.refill, 120), refill_next: findDate(t(j.refill, 120)) ?? "", refill_left: refillLeft(t(j.refill, 120)),
+        };
+      }
+      store.scanSet(id, "review", data);
+    } catch (e) {
+      console.error("runScan failed", String((e as Error)?.message ?? e).slice(0, 200));
+      store.scanSet(id, "failed", null, isQuotaError(e) ? "Gemini 額度暫時用完，稍後再按重試" : "讀不出來，請重拍：光線充足、拍正、整張入鏡、不要反光");
+    }
+    this.broadcastState();
+  }
+
+  /** 本人確認（可修改）後存進健康管家；檢驗存完請 Cloudflare 的模型用白話說明 */
+  private saveScan(id: number, msg: any): { error: string } | { ok: true } {
+    const store = this.health();
+    const s = store.scan(id);
+    if (!s || s.status !== "review") return { error: "這筆已經處理過了" };
+    if (s.kind === "lab") {
+      const date = String(msg.date ?? "");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date > this.today()) return { error: "請填報告日期" };
+      const items = (Array.isArray(msg.items) ? msg.items : []).slice(0, 80).map((it: any) => ({ date, name: it?.name, value: it?.value, unit: it?.unit, ref: it?.ref, flag: it?.flag }));
+      if (!items.length) return { error: "沒有勾選要存的項目" };
+      store.addLabs(items, "photo");
+      store.scanSet(id, "saved", JSON.parse(String(s.data ?? "null")));
+      // 確認完就刪照片，只留數字
+      this.sql.exec("DELETE FROM photos WHERE id = ?", s.photo_id);
+      this.broadcastState();
+      this.ctx.waitUntil(this.explainLabs(date));
+      return { ok: true };
+    }
+    const med = msg.med ?? {};
+    const same = store.medFind(String(med.name ?? ""));
+    const r = store.medSave(same ? { ...same, ...med, id: same.id } : med);
+    if ("error" in r) return r;
+    store.scanSet(id, "saved", JSON.parse(String(s.data ?? "null")));
+    this.sql.exec("DELETE FROM photos WHERE id = ?", s.photo_id);
+    this.broadcastState();
+    return { ok: true };
+  }
+
+  /** 檢驗存好後：程式整理判讀，Cloudflare 的模型（不是 Gemini）用白話說明 */
+  private async explainLabs(date: string) {
+    const facts = this.health().labFacts(date);
+    if (!facts) return;
+    let text = `🧪 **${date} 的檢驗已存進健康管家**\n${facts}`;
+    try {
+      if (await this.workersAiBlocked()) throw new WorkersAiQuotaError();
+      const r = await (await this.provider("workers-ai")).generate({
+        system: this.healthPrompt(),
+        turns: [{ role: "user", parts: [{ text: `下面是 ${date} 的檢驗結果，判讀是程式依指引算好的：\n${facts}\n\n請用白話說明（300 字內、條列）：\n1. 標示「高於目標、偏高、偏低、範圍」或報告標示 H/L 的項目，各代表什麼、可能和哪些生活習慣有關；跟上次比變好還是變差。\n2. 正常的項目合成一句帶過。\n3. 最後列 2–3 個看診時可以問醫師的問題。\n不要改寫判讀、不要診斷、不要提任何藥物或劑量調整。這次不需要呼叫工具。` }] }],
+        timeoutMs: 60_000,
+      });
+      if (r.text.trim()) text += `\n\n${stripSpeakerTag(r.text.trim())}`;
+    } catch (e) {
+      this.noteQuota(e);
+      text += "\n\n（今天的 AI 說明額度用完了，之後可以在聊天問「@健康管家 幫我看這次的檢驗」）";
+    }
+    this.postAiMessage(text, { kind: "health_labs", health: true });
+  }
+
   /** 健康對話的系統提示詞（Cloudflare 的模型） */
   private healthPrompt(): string {
     const p = this.p();
@@ -3957,7 +4121,8 @@ ${now.date}（${now.weekday}）${now.time}
 - 說開始吃、停了某個藥，或拿到慢箋、下次領藥日 → health_meds。身高、生日、慢性病、過敏、家族史、吸菸 → health_profile。
 - 問最近的血壓、血糖、體重，或該做哪些健檢、疫苗 → 先用 health_status，再用白話說明，寫出依據的數字和日期。
 - 解釋時用「可能和…有關，建議請醫師評估」；可以給生活習慣層面的建議（飲食、運動、睡眠、正確量血壓的方法）。
-- 要提醒吃藥、量血壓 → create_reminder；回診 → add_event；問以前存的檢查報告 → search_notes。
+- 問檢驗數值（膽固醇、糖化血色素、腎功能等）→ 先用 health_status 看 labs 的最新值、判讀和以前的數值；沒有判讀的項目請他對照報告的參考值或問醫師。
+- 要提醒吃藥、量血壓 → create_reminder；回診 → add_event；問以前存在知識庫的文件 → search_notes。
 - 一律繁體中文、台灣用語，精簡條列。提到症狀或異常數值時，最後加一句：「健康管家是紀錄整理與衛教參考，不能取代醫師診斷；用藥請問醫師或藥師。」`;
   }
 

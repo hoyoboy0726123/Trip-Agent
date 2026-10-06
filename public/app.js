@@ -219,6 +219,9 @@ function handle(m) {
       healthResult = m;
       if (S.panel === "health") renderPanel();
       break;
+    case "health_import_result":
+      importDone(m.result);
+      break;
     case "note_text":
       S.noteText[m.id] = m.text;
       if (S.panel === "notes") renderPanel();

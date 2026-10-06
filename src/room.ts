@@ -31,8 +31,9 @@ const PHOTO_NOTE_V = 2;
 /** 語音備忘：Gemini 一次請求最多 20MB（base64 會大 1/3），超過就先傳 Files API；Whisper 只收比較小的檔 */
 const GEMINI_INLINE_MAX = 14_000_000;
 const WHISPER_MAX = 9_000_000;
-/** 一個空間暫存的錄音最多 300MB（轉完文字就刪） */
-const MEMO_AUDIO_LIMIT = 300_000_000;
+/** 錄音檔轉完文字後留 30 天可以回放；每個空間最多 400MB，超過先刪最舊的音檔（逐字稿一直留著）。免費方案整個帳號只有 5GB */
+const MEMO_KEEP_DAYS = 30;
+const MEMO_KEEP_BYTES = 400_000_000;
 const AUDIO_MIME = /^(audio\/[\w.+-]+|video\/(mp4|webm|quicktime))$/;
 const TRANSCRIBE_PROMPT =
   "逐字轉錄這段錄音：繁體中文（台灣用語），加上標點符號。換人說話時換行，開頭標「說話者A：」「說話者B：」（只有一個人說話就不用標）。" +
@@ -711,6 +712,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     }
 
     // 語音備忘：開始一段錄音、上傳每一段（錄音每 5 分鐘一段；大的檔案切成好幾塊上傳）
+    const audio = url.pathname.match(/^\/memo\/(\d+)\/audio$/);
+    if (audio && req.method === "GET") return this.memoAudio(Number(audio[1]), Number(url.searchParams.get("seq") ?? 0), req);
     const memo = url.pathname.match(/^\/memo\/(?:start|(\d+)\/seg)$/);
     if (memo && req.method === "POST") {
       if (!this.isPersonal()) return Response.json({ ok: false, error: "語音備忘只有個人助理可以用" }, { status: 403 });
@@ -1331,7 +1334,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
           "UPDATE memo_segs SET status = 'pending', tries = 0 WHERE memo_id = ? AND status = 'failed' AND EXISTS (SELECT 1 FROM memo_audio a WHERE a.memo_id = memo_segs.memo_id AND a.seq = memo_segs.seq)",
           Number(msg.id),
         );
-        this.sql.exec("UPDATE memos SET status = 'processing', ended = 1, error = NULL, updated = ? WHERE id = ? AND status IN ('error', 'processing')", Date.now(), Number(msg.id));
+        this.sql.exec(
+          "UPDATE memos SET status = 'processing', ended = 1, error = NULL, updated = ?, done_segs = (SELECT COUNT(*) FROM memo_segs s WHERE s.memo_id = memos.id AND s.status != 'pending') WHERE id = ? AND (status IN ('error', 'processing') OR EXISTS (SELECT 1 FROM memo_segs s WHERE s.memo_id = memos.id AND s.status = 'pending'))",
+          Date.now(), Number(msg.id),
+        );
         this.setSetting("memo_retry_at", "0");
         this.broadcastState();
         this.kickMemos();
@@ -2432,7 +2438,12 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             cards: this.sql.exec("SELECT id, ts, kind, title, body FROM cards WHERE status = 'pending' ORDER BY ts DESC LIMIT 10").toArray(),
             dreamOps: this.sql.exec("SELECT id, ts, op, before, after, reason, undone FROM dream_ops ORDER BY id DESC LIMIT 20").toArray(),
             episodes: this.sql.exec("SELECT date, summary, weekly FROM episodes ORDER BY date DESC LIMIT 10").toArray(),
-            memos: this.sql.exec("SELECT id, ts, title, status, source, segs, done_segs, ended, seconds, engine, summary, actions, note_id, error FROM memos ORDER BY id DESC LIMIT 20").toArray(),
+            memos: this.sql
+              .exec(
+                "SELECT id, ts, updated, title, status, source, segs, done_segs, ended, seconds, engine, summary, actions, note_id, error, (SELECT COALESCE(SUM(LENGTH(a.data)), 0) FROM memo_audio a WHERE a.memo_id = memos.id) AS audio_bytes FROM memos ORDER BY id DESC LIMIT 20",
+              )
+              .toArray()
+              .map((m) => ({ ...m, parts: this.sql.exec("SELECT seq, seconds, status FROM memo_segs WHERE memo_id = ? ORDER BY seq", m.id).toArray() })),
             idDocs: this.idDocList(),
           }
         : {}),
@@ -3091,8 +3102,9 @@ ${transcript}
     if (data.byteLength > 10_000_000) return fail("這一塊太大", 413);
     const last = url.searchParams.get("last") === "1" && part === parts - 1;
     if (data.byteLength) {
+      this.trimMemoAudio(data.byteLength);
       const used = this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM memo_audio").one().n as number;
-      if (used + data.byteLength > MEMO_AUDIO_LIMIT) return fail("還有太多錄音在排隊轉文字，請稍後再傳", 507);
+      if (used + data.byteLength > MEMO_KEEP_BYTES) return fail("還有太多錄音在排隊轉文字，請稍後再傳", 507);
       // Durable Object 的資料庫一格最多 2MB：切成 1.5MB 一塊存（編號＝第幾塊上傳×100＋第幾小塊）
       for (let off = 0, k = 0; off < data.byteLength; off += 1_500_000, k++) {
         this.sql.exec("INSERT OR REPLACE INTO memo_audio (memo_id, seq, part, data) VALUES (?, ?, ?, ?)", id, seq, part * 100 + k, data.slice(off, off + 1_500_000).buffer);
@@ -3111,6 +3123,59 @@ ${transcript}
     this.broadcastState();
     this.kickMemos();
     return Response.json({ ok: true });
+  }
+
+  /** 錄音超過上限：從最舊的（已經整理好的）開始刪音檔，逐字稿留著；還在排隊轉文字的不刪 */
+  private trimMemoAudio(extra = 0) {
+    const used = () => this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM memo_audio").one().n as number;
+    while (used() + extra > MEMO_KEEP_BYTES) {
+      const old = this.sql.exec("SELECT id FROM memos WHERE status IN ('done', 'error') AND id IN (SELECT memo_id FROM memo_audio) ORDER BY updated LIMIT 1").toArray()[0];
+      if (!old) return;
+      this.sql.exec("DELETE FROM memo_audio WHERE memo_id = ?", old.id);
+    }
+  }
+
+  /** 回放錄音的某一段：支援 Range（iPhone 的播放器一定要），一塊一塊從資料庫串流出去，不整個讀進記憶體 */
+  private memoAudio(id: number, seq: number, req: Request): Response {
+    const m = this.sql.exec("SELECT mime FROM memos WHERE id = ?", id).toArray()[0];
+    const parts = this.sql.exec("SELECT part, LENGTH(data) AS n FROM memo_audio WHERE memo_id = ? AND seq = ? ORDER BY part", id, seq).toArray().map((r) => ({ part: Number(r.part), n: Number(r.n) }));
+    if (!m || !parts.length) return new Response("錄音檔已經刪除", { status: 404 });
+    const total = parts.reduce((a, p) => a + p.n, 0);
+    let start = 0, end = total - 1;
+    const range = /bytes=(\d*)-(\d*)/.exec(req.headers.get("range") ?? "");
+    if (range) {
+      if (range[1] === "") start = Math.max(0, total - Number(range[2] || 0));
+      else {
+        start = Number(range[1]);
+        if (range[2]) end = Math.min(Number(range[2]), total - 1);
+      }
+      if (start > end || start >= total) return new Response(null, { status: 416, headers: { "content-range": `bytes */${total}` } });
+    }
+    const sql = this.sql;
+    let i = 0, offset = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        while (i < parts.length) {
+          const p = parts[i++];
+          const from = offset;
+          offset += p.n;
+          if (offset <= start) continue;
+          if (from > end) break;
+          const data = new Uint8Array(sql.exec("SELECT data FROM memo_audio WHERE memo_id = ? AND seq = ? AND part = ?", id, seq, p.part).one().data as ArrayBuffer);
+          controller.enqueue(data.subarray(Math.max(0, start - from), Math.min(p.n, end - from + 1)));
+          return;
+        }
+        controller.close();
+      },
+    });
+    const headers: Record<string, string> = {
+      "content-type": String(m.mime || "audio/webm"),
+      "content-length": String(end - start + 1),
+      "accept-ranges": "bytes",
+      "cache-control": "private, max-age=3600",
+    };
+    if (range) headers["content-range"] = `bytes ${start}-${end}/${total}`;
+    return new Response(body, { status: range ? 206 : 200, headers });
   }
 
   private memoBusy = false;
@@ -3168,7 +3233,6 @@ ${transcript}
       try {
         const text = engine === "gemini" ? await this.transcribeGemini(audio, mime, seconds) : await this.transcribeWhisper(audio);
         this.sql.exec("UPDATE memo_segs SET status = 'done', text = ?, engine = ? WHERE memo_id = ? AND seq = ?", text, engine, memoId, seq);
-        this.sql.exec("DELETE FROM memo_audio WHERE memo_id = ? AND seq = ?", memoId, seq);
         this.sql.exec("UPDATE memos SET done_segs = done_segs + 1, error = NULL, updated = ? WHERE id = ?", Date.now(), memoId);
         this.broadcastState();
         return "done";
@@ -3294,14 +3358,21 @@ ${body}`;
     // 語音備忘頁的待辦另外列（可以一鍵加進清單），那邊的摘要只放重點和決定；知識庫那筆三樣都放
     const brief = [summary, decisions.length ? `**決定**\n${decisions.map((d) => `- ${d}`).join("\n")}` : ""].filter(Boolean).join("\n\n");
     const full = [brief, actions.length ? `**待辦**\n${actionLines}` : ""].filter(Boolean).join("\n\n");
-    const saved = this.noteSave({ title: `🎙️ ${title}`, summary: full, content: transcript.slice(0, 300_000), tags: [...new Set([...tags, "錄音"])] }, String(m.author), false) as { saved_id?: number };
+    const note = { title: `🎙️ ${title}`, summary: full, content: transcript.slice(0, 300_000), tags: [...new Set([...tags, "錄音"])] };
+    const again = !!m.note_id && this.sql.exec("SELECT 1 FROM notes WHERE id = ?", m.note_id).toArray().length > 0;
+    let noteId = Number(m.note_id) || 0;
+    if (again) {
+      // 重轉失敗的段落：更新原本那筆知識庫，不要多一筆
+      this.sql.exec("UPDATE notes SET ts = ?, title = ?, summary = ?, content = ?, tags = ? WHERE id = ?", Date.now(), note.title, note.summary, note.content, JSON.stringify(note.tags), noteId);
+      this.ctx.waitUntil(this.syncEmbeddings());
+    } else noteId = (this.noteSave(note, String(m.author), false) as { saved_id?: number }).saved_id ?? 0;
     this.sql.exec(
       "UPDATE memos SET status = 'done', title = ?, summary = ?, actions = ?, transcript = ?, seconds = ?, engine = ?, note_id = ?, error = NULL, updated = ? WHERE id = ?",
-      title, brief, JSON.stringify(actions), transcript, seconds, engine, saved.saved_id ?? null, Date.now(), id,
+      title, brief, JSON.stringify(actions), transcript, seconds, engine, noteId || null, Date.now(), id,
     );
-    for (const t of ["memo_audio", "memo_segs"]) this.sql.exec(`DELETE FROM ${t} WHERE memo_id = ?`, id);
+    this.trimMemoAudio();
     this.postAiMessage(
-      `🎙️ **錄音整理好了｜${title}**${seconds ? `（${fmtDuration(seconds)}）` : ""}\n\n${summary}${actions.length ? `\n\n**待辦建議**\n${actionLines}` : ""}\n\n逐字稿和重點已存進[知識庫](#note-${saved.saved_id})；到「工具箱 → 語音備忘」可以把待辦一鍵加進清單。`,
+      `🎙️ **錄音${again ? "重新" : ""}整理好了｜${title}**${seconds ? `（${fmtDuration(seconds)}）` : ""}\n\n${summary}${actions.length ? `\n\n**待辦建議**\n${actionLines}` : ""}\n\n逐字稿和重點已存進[知識庫](#note-${noteId})；到「工具箱 → 語音備忘」可以把待辦一鍵加進清單、回放錄音（保留 ${MEMO_KEEP_DAYS} 天）。`,
       { kind: "memo" },
     );
     this.broadcastState();
@@ -3635,8 +3706,8 @@ ${transcript || "（沒什麼對話）"}`;
     if (this.setting("maint_date") === today) return;
     this.setSetting("maint_date", today);
     this.sql.exec("UPDATE memories SET status = 'expired', updated = ? WHERE COALESCE(status, 'active') = 'active' AND expires IS NOT NULL AND expires < ?", Date.now(), today);
-    // 轉文字失敗、留著等重試的錄音：7 天後刪掉音檔
-    this.sql.exec("DELETE FROM memo_audio WHERE memo_id IN (SELECT id FROM memos WHERE status = 'error' AND updated < ?)", Date.now() - 7 * 86400_000);
+    // 錄音檔留 30 天可以回放，之後刪掉音檔（逐字稿一直留著）
+    this.sql.exec("DELETE FROM memo_audio WHERE memo_id IN (SELECT id FROM memos WHERE status IN ('done', 'error') AND updated < ?)", Date.now() - MEMO_KEEP_DAYS * 86400_000);
   }
 
   /** 匯出：聊天文字、記憶、清單、提醒、帳本、保管箱的清單（照片太大不放） */

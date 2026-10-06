@@ -2358,6 +2358,22 @@ async function memoUploadFile(file) {
   recNote();
 }
 
+// 回放錄音：整個頁面共用一個播放器，畫面重畫時搬到那筆錄音底下（同一輪搬回去就不會停）
+const PLAYER = Object.assign(document.createElement("audio"), { controls: true, preload: "none", className: "memo-audio" });
+const PLAY = { id: null, seq: 0, parts: [] };
+function memoPlay(m, seq) {
+  Object.assign(PLAY, { id: m.id, seq, parts: (m.parts || []).filter((p) => p.status !== "failed").map((p) => p.seq) });
+  PLAYER.src = `/api/memo/${m.id}/audio?seq=${seq}&room=${ROOM}`;
+  PLAYER.play().catch(() => {});
+  if (S.panel === "memo") renderPanel();
+}
+// 一段播完接下一段
+PLAYER.addEventListener("ended", () => {
+  const next = PLAY.parts[PLAY.parts.indexOf(PLAY.seq) + 1];
+  const m = (S.state?.memos || []).find((x) => x.id === PLAY.id);
+  if (next != null && m) memoPlay(m, next);
+});
+
 addEventListener("beforeunload", (e) => {
   if (REC.on || REC.queue.length) {
     e.preventDefault();
@@ -2382,6 +2398,24 @@ function renderMemoPanel(st, b) {
       ${m.status === "done" ? `<div class="small msg-text">${md(m.summary || "")}</div>` : ""}
       ${acts.length ? `<div class="memo-acts">${acts.map((a, i) => `<div class="memo-act small"><span>${a.added ? "✅" : "▫️"} ${escapeHtml(a.item)}${a.who ? `<span class="muted">（${escapeHtml(a.who)}）</span>` : ""}${a.due ? `<span class="muted">｜${escapeHtml(a.due)}</span>` : ""}</span>${a.added ? "" : `<button type="button" class="btn small" data-memo-todo="${m.id}" data-idx="${i}">加到待辦</button>`}</div>`).join("")}
         ${acts.filter((a) => !a.added).length > 1 ? `<button type="button" class="btn small primary-sm" data-memo-todo="${m.id}">全部加到待辦</button>` : ""}</div>` : ""}
+      ${(() => {
+        if (m.status !== "done" && m.status !== "error") return "";
+        const parts = (m.parts || []).filter((p) => p.status !== "failed");
+        if (!m.audio_bytes) return m.status === "done" && parts.length ? `<div class="small muted" style="margin-top:6px">錄音檔已超過保留期限刪除，逐字稿還在。</div>` : "";
+        let at = 0;
+        const starts = new Map((m.parts || []).map((p) => [p.seq, (at += Number(p.seconds) || 0) - (Number(p.seconds) || 0)]));
+        const failed = (m.parts || []).filter((p) => p.status === "failed").length;
+        return `<div class="memo-play">
+          <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
+            ${parts.length > 1
+              ? parts.map((p) => `<button type="button" class="btn small${PLAY.id === m.id && PLAY.seq === p.seq ? " primary-sm" : ""}" data-play="${m.id}" data-seq="${p.seq}">▶ ${fmtDur(starts.get(p.seq) || 0)}</button>`).join("")
+              : `<button type="button" class="btn small" data-play="${m.id}" data-seq="${parts[0]?.seq ?? 0}">▶ 播放錄音</button>`}
+            <span class="small muted">保留到 ${dayText(Number(m.updated || m.ts) + 30 * 86400e3)}</span>
+          </div>
+          <div id="memo-player-${m.id}"></div>
+          ${failed && m.status === "done" ? `<button type="button" class="btn small" data-memo-retry="${m.id}" style="margin-top:6px">重轉失敗的 ${failed} 段</button>` : ""}
+        </div>`;
+      })()}
       ${text != null ? `<div class="transcript small">${escapeHtml(text)}</div>` : ""}
       <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:6px">
         ${m.status === "done" ? `<button type="button" class="btn small" data-memo-text="${m.id}">${text != null ? "收起逐字稿" : "看逐字稿"}</button>` : ""}
@@ -2435,6 +2469,13 @@ function renderMemoPanel(st, b) {
     }),
   );
   b.querySelectorAll("[data-memo-retry]").forEach((x) => x.addEventListener("click", () => action({ action: "memo_retry", id: Number(x.dataset.memoRetry) })));
+  b.querySelectorAll("[data-play]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const m = memos.find((y) => y.id === Number(x.dataset.play));
+      if (m) memoPlay(m, Number(x.dataset.seq));
+    }),
+  );
+  $(`#memo-player-${PLAY.id}`, b)?.append(PLAYER);
   b.querySelectorAll("[data-memo-del]").forEach((x) =>
     x.addEventListener("click", () => confirm("刪除這段錄音？（已經存進知識庫的逐字稿會保留）") && action({ action: "memo_delete", id: Number(x.dataset.memoDel) })),
   );

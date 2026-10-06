@@ -501,8 +501,11 @@ details.guide li + li { margin-top: 4px; }
 .memo-act { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .memo-act > span { min-width: 0; overflow-wrap: anywhere; }
 .transcript { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; margin-top: 8px; padding: 10px; border-radius: 10px; background: var(--bg); line-height: 1.7; }
+.memo-play { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.memo-audio { width: 100%; margin-top: 8px; }
 .id-doc { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .id-doc.warn { border-left: 4px solid #f59e0b; }
 .id-doc.bad { border-left: 4px solid #dc2626; }
 .bad-text { color: #dc2626; }
 .link-row { display: flex; justify-content: space-between; gap: 8px; width: 100%; border: 0; background: transparent; padding: 4px 0; text-align: left; color: inherit; font: inherit; }
+.memo-act .btn { flex: none; white-space: nowrap; }

@@ -319,6 +319,9 @@ export default {
       }
 
       // 語音備忘：開始錄音、上傳每一段（錄音每 5 分鐘一段，大檔切成好幾塊）
+      // 回放錄音（<audio> 帶不了標頭：網址上的 ?room= 指定空間；Range 標頭照轉）
+      const memoAudio = path.match(/^\/api\/memo\/(\d+)\/audio$/);
+      if (memoAudio && req.method === "GET") return room.fetch(new Request(`https://room/memo/${memoAudio[1]}/audio${url.search}`, { headers }));
       const memo = path.match(/^\/api\/memo\/(start|\d+\/seg)$/);
       if (memo && req.method === "POST") {
         return room.fetch(new Request(`https://room/memo/${memo[1]}${url.search}`, { method: "POST", headers, body: req.body }));

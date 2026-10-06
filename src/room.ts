@@ -411,6 +411,15 @@ function expenseBrief(r: Record<string, SqlStorageValue>) {
   return { id: r.id as number, date: r.date as string, description: r.description as string, amount: r.amount as number, currency: r.currency as string, payer: r.payer as string };
 }
 
+/** 挑記憶用的文字：這則訊息加上它回覆的那則（「那第一天呢？」要靠被回覆的內容才知道在問什麼） */
+function memoryText(m: { text: string; meta: string | null }): string {
+  let quoted = "";
+  try {
+    quoted = m.meta ? String(JSON.parse(m.meta).reply?.text ?? "") : "";
+  } catch {}
+  return `${m.text} ${quoted.slice(0, 300)}`.trim();
+}
+
 /** 模型偶爾學對話紀錄的格式，回答開頭多一個「［爸爸］」，存檔前拿掉 */
 function stripSpeakerTag(text: string): string {
   return text.replace(/^\s*［[^］\n]{1,16}］\s*/, "");
@@ -2716,7 +2725,28 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     return this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') = 'active' ORDER BY ts").toArray();
   }
 
-  /** 個人助理的記憶多了以後，只挑跟這次問題相關的：雙字詞比對＋最近記的＋待辦與預訂 */
+  /** 記憶多了以後（個人助理、旅遊群組都一樣），只挑跟這次問題相關的：雙字詞比對＋語意＋最近記的＋待辦與預訂 */
+  /** 整理記憶時給 AI 看的舊記憶：不多就全部；多了只給跟新對話有關的 50 條＋最近記的 20 條（它才抓得到重複和過時的） */
+  private memoriesFor(transcript: string): { list: Record<string, SqlStorageValue>[]; total: number } {
+    const all = this.memories();
+    if (all.length <= 70) return { list: all, total: all.length };
+    const t = bigrams(transcript);
+    const keep = new Set(
+      all
+        .map((m) => {
+          const g = bigrams(String(m.content));
+          let hit = 0;
+          for (const x of g) if (t.has(x)) hit++;
+          return { id: m.id, s: g.size ? hit / g.size : 0 };
+        })
+        .sort((a, b) => b.s - a.s)
+        .slice(0, 50)
+        .map((x) => x.id),
+    );
+    for (const m of all.slice(-20)) keep.add(m.id);
+    return { list: all.filter((m) => keep.has(m.id)), total: all.length };
+  }
+
   private relevantMemories(text: string): { list: Record<string, SqlStorageValue>[]; total: number } {
     const all = this.memories();
     if (all.length <= 40) return { list: all, total: all.length };
@@ -3362,7 +3392,7 @@ ${transcript}
   private embedBusy = false;
   /** 新增、改過的才重算，刪掉的順便清掉；一次最多 max 筆（Workers AI 額度用完就等下次） */
   private async syncEmbeddings(max = 60) {
-    if (!this.isPersonal() || this.embedBusy) return;
+    if (this.embedBusy) return;
     this.embedBusy = true;
     try {
       const have = new Map(this.sql.exec("SELECT kind, ref, hash FROM embeddings WHERE kind != 'chunk'").toArray().map((r) => [`${r.kind}:${r.ref}`, String(r.hash)]));
@@ -3403,6 +3433,8 @@ ${transcript}
   private async prepareMemoryQuery(text: string) {
     this.memQuery = null;
     if (!text.trim() || this.memories().length <= 40) return;
+    // 還沒算向量的記憶在背景補（第一次超過 40 條、或剛整理完一批）
+    this.ctx.waitUntil(this.syncEmbeddings(500));
     const sims = await this.similarity(text, ["memory"]);
     if (sims) this.memQuery = { text, sims };
   }
@@ -4552,7 +4584,7 @@ ${transcript || "（沒什麼對話）"}`;
     const recall = trigger && windowStartTs ? this.recallOlder(trigger, windowStartTs) : "";
     const now = zoned(Date.now(), p.timezone);
     const a = p.accommodation;
-    const picked = this.relevantMemories(trigger?.text ?? "");
+    const picked = this.relevantMemories(trigger ? memoryText(trigger) : "");
     const mems =
       picked.list.map((m) => `- #${m.id}［${m.category}］${m.content}${m.expires ? `（到 ${m.expires} 為止）` : ""}`).join("\n") || "（目前沒有）";
     const core = this.setting("core_profile");
@@ -4613,7 +4645,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
         return `- ${date.slice(5).replace("-", "/")}（${wd}）${d.title || "（未安排）"}${d.detail ? `｜${d.detail}` : ""}${d.status ? `｜${d.status}` : ""}`;
       })
       .join("\n");
-    const mems = this.memories().map((m) => `- #${m.id}［${m.category}］${m.content}（${m.author}）`).join("\n") || "（目前沒有）";
+    const picked = this.relevantMemories(trigger ? memoryText(trigger) : "");
+    const mems = picked.list.map((m) => `- #${m.id}［${m.category}］${m.content}（${m.author}）`).join("\n") || "（目前沒有）";
     const locs = this.memberLocation()
       .map((l) => `- ${l.name}：${l.area ? `${l.area}附近` : "地名查詢中"}（${l.lat.toFixed(5)},${l.lon.toFixed(5)}，${Math.round((Date.now() - l.ts) / 60000)} 分鐘前）`)
       .join("\n");
@@ -4654,7 +4687,7 @@ ${guide}
 # 最新行程（以這裡為準）
 ${itin}
 
-# 長期記憶（成員偏好、決定、預訂…，#編號可用 forget 刪除）
+# 長期記憶（成員偏好、決定、預訂…，#編號可用 forget 刪除）${picked.list.length < picked.total ? `\n（共 ${picked.total} 條，這裡只列出跟這次對話最相關的；找不到就用 search_history）` : ""}
 ${mems}
 ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}${locs ? `\n# 成員最近位置\n${locs}\n` : ""}${translations ? `\n# 最近在翻譯頁翻過的句子（成員問「剛剛跟店員說了什麼」時參考）\n${translations}\n` : ""}${cards ? `\n# 最近的確認卡片（等待確認的還沒寫入；要修改就重新呼叫同一個工具，replaces 填編號）\n${cards}\n` : ""}
 # 回答規則
@@ -4788,7 +4821,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     if (trigger.lat != null) await this.ensureArea(trigger.author);
     // 一般對話看不到健康對話（不會傳給 Gemini）；健康對話可以看一般對話
     const history = this.recentMessages(HISTORY_WINDOW).filter((m) => health || !healthMessage(m));
-    if (this.isPersonal() && !health) await this.prepareMemoryQuery(trigger.text);
+    if (!health) await this.prepareMemoryQuery(memoryText(trigger));
     const system = health ? this.healthPrompt() : this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
     const images: AttachedImage[] = [];
     const toolsUsed: string[] = [];
@@ -5017,7 +5050,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 
     // 系統自己發的訊息（歡迎、提醒、早報、預算、日記）不算對話：歡迎訊息裡的範例會被當成使用者說的事
     const transcript = fresh.filter((m) => !systemMade(m)).slice(-80).map((m) => `${m.role === "assistant" ? AI_NAME : m.author}：${m.text.slice(0, 500)}`).join("\n");
-    const existing = this.memories().map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n") || "（無）";
+    const shown = this.memoriesFor(transcript);
+    const existing = shown.list.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n") || "（無）";
     const personal = this.isPersonal();
     // 記憶暫停中：這段期間的對話不整理（游標照樣往前，之後也不會補記）
     if (personal && this.setting("memory_paused") === "1") {
@@ -5045,7 +5079,7 @@ ${this.setting("summary") || "（無）"}
 現在的「關於我」：
 ${this.setting("core_profile") || "（無）"}
 
-現有記憶：
+現有記憶${shown.list.length < shown.total ? `（共 ${shown.total} 條，這裡只列出跟新對話有關的 ${shown.list.length} 條；remove_ids 只能從這些裡面挑）` : ""}：
 ${existing}
 
 新對話：
@@ -5062,7 +5096,7 @@ ${transcript}
 舊摘要：
 ${this.setting("summary") || "（無）"}
 
-現有記憶：
+現有記憶${shown.list.length < shown.total ? `（共 ${shown.total} 條，這裡只列出跟新對話有關的 ${shown.list.length} 條；remove_ids 只能從這些裡面挑）` : ""}：
 ${existing}
 
 新對話：
@@ -5094,8 +5128,13 @@ ${transcript}
         for (const rid of (json.remove_ids ?? []).slice(0, 20)) {
           if (Number.isInteger(Number(rid))) this.sql.exec("DELETE FROM memories WHERE id = ?", Number(rid));
         }
+        // 跟現有的某條講同一件事就不再記（模型常把記過的換句話說再記一次，記憶才會一直變多）
+        const known = this.memories().map((x) => String(x.content));
         for (const m of (json.memories ?? []).slice(0, 20)) {
-          if (m?.content) this.addMemory(String(m.content), String(m.category || "資訊"), "AI 自動整理");
+          const content = String(m?.content ?? "").trim();
+          if (!content || known.some((x) => sameFact(x, content))) continue;
+          this.addMemory(content, String(m.category || "資訊"), "AI 自動整理");
+          known.push(content);
         }
       }
       this.setSetting("memory_cursor", String(fresh[fresh.length - 1].ts));

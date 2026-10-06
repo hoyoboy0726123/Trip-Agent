@@ -537,6 +537,9 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     // 日記挑照片用：AI 看過每張照片的說明
     this.sql.exec("CREATE TABLE IF NOT EXISTS photo_notes (photo_id TEXT PRIMARY KEY, kind TEXT, score INTEGER, note TEXT, ts INTEGER, v INTEGER)");
     if (!this.sql.exec("PRAGMA table_info(photo_notes)").toArray().some((c) => c.name === "v")) this.sql.exec("ALTER TABLE photo_notes ADD COLUMN v INTEGER");
+    // 換國家繼續玩：上一趟收成「過去的旅程」，日記標上屬於哪一趟（NULL＝現在這趟）
+    this.sql.exec("CREATE TABLE IF NOT EXISTS trips (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, title TEXT, country TEXT, city TEXT, flag TEXT, start_date TEXT, end_date TEXT, travelers TEXT, summary TEXT)");
+    if (!this.sql.exec("PRAGMA table_info(diaries)").toArray().some((c) => c.name === "trip_id")) this.sql.exec("ALTER TABLE diaries ADD COLUMN trip_id INTEGER");
     // 第四階段：語音備忘（錄音分段上傳，轉完文字就刪音檔）、語意搜尋的向量、證件到期
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS memos (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, status TEXT, mime TEXT, source TEXT, segs INTEGER DEFAULT 0, done_segs INTEGER DEFAULT 0, ended INTEGER DEFAULT 0, seconds INTEGER DEFAULT 0, engine TEXT, transcript TEXT, summary TEXT, actions TEXT, note_id INTEGER, error TEXT, updated INTEGER);
@@ -729,6 +732,102 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     for (const r of this.itinerary()) {
       if (!days.has(r.date as string) && !r.title && !r.detail) this.sql.exec("DELETE FROM itinerary WHERE date = ?", r.date);
     }
+  }
+
+  // ---------------- 換一個國家繼續玩 ----------------
+
+  /**
+   * 上一趟收成「過去的旅程」：日記（和日記用到的照片）留著，長期記憶由 AI 分類；
+   * 聊天、其他照片、票券、記帳、行程、清單、提醒、常用語清掉，再照新的目的地重新查資料（回到確認頁）
+   */
+  private async nextTrip(x: any): Promise<string | null> {
+    if (this.isPersonal()) return "個人助理沒有這個功能";
+    const p = this.p();
+    if (!String(x.country ?? "").trim()) return "請填寫要去的國家";
+    // 先檢查新的資料，有錯就什麼都不動
+    const next: TripProfile = structuredClone(p);
+    const a = x.accommodation ?? {};
+    const err = this.applyProfilePatch(next, {
+      country: x.country, city: String(x.city ?? ""), startDate: x.startDate, endDate: x.endDate, flights: String(x.flights ?? ""), travelers: x.travelers,
+      accommodation: { name: String(a.name ?? ""), address: String(a.address ?? ""), lat: a.lat ?? null, lon: a.lon ?? null, note: "" },
+    });
+    if (err) return err;
+    const old = {
+      title: p.title, country: p.country, city: p.city, flag: flagEmoji(p.countryCode), start: p.startDate, end: p.endDate,
+      travelers: p.travelers.map((t) => t.name).join("、"),
+    };
+    // 1. 長期記憶：上一趟才有效的改成回憶（家人的口味、過敏、習慣照常用）
+    await this.archiveTripMemories(old, `${next.country}${next.city ? `（${next.city}）` : ""}`);
+    // 2. 上一趟收起來：日記標上屬於哪一趟
+    const tripId = Number(
+      this.sql
+        .exec(
+          "INSERT INTO trips (ts, title, country, city, flag, start_date, end_date, travelers, summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+          Date.now(), old.title, old.country, old.city, old.flag, old.start, old.end, old.travelers, this.setting("summary"),
+        )
+        .one().id,
+    );
+    this.sql.exec("UPDATE diaries SET trip_id = ? WHERE trip_id IS NULL", tripId);
+    // 3. 照片只留日記用到的（免費帳號整個只有 5GB）
+    const keep = new Set<string>();
+    for (const d of this.sql.exec("SELECT photo_ids FROM diaries").toArray()) {
+      for (const id of JSON.parse(String(d.photo_ids || "[]")) as string[]) keep.add(id);
+    }
+    for (const r of this.sql.exec("SELECT id FROM photos").toArray()) if (!keep.has(String(r.id))) this.sql.exec("DELETE FROM photos WHERE id = ?", r.id);
+    for (const r of this.sql.exec("SELECT photo_id FROM photo_notes").toArray()) if (!keep.has(String(r.photo_id))) this.sql.exec("DELETE FROM photo_notes WHERE photo_id = ?", r.photo_id);
+    // 4. 其他都是上一趟的：清掉
+    for (const t of ["messages", "pins", "drafts", "expenses", "itinerary", "checklist", "reminders", "phrases", "translations", "documents", "doc_folders", "locations", "cache", "embeddings"]) {
+      this.sql.exec(`DELETE FROM ${t}`);
+    }
+    this.setSetting("summary", "");
+    this.setSetting("memory_cursor", String(Date.now()));
+    this.setSetting("diary_sent", "");
+    this.setSetting("next_from", old.title);
+    // 5. 新的目的地：照新的查一次當地資料，查完回到確認頁
+    next.title = String(x.title ?? "").trim().slice(0, 40);
+    next.guide = { ...EMPTY_GUIDE };
+    next.taxi = null;
+    next.emergency = "";
+    next.initNotes = [];
+    next.status = "initializing";
+    this.saveProfile(next);
+    this.syncItineraryDays(next);
+    this.setSetting("init_progress", JSON.stringify({ step: 0, label: "準備中", total: INIT_STEPS.length }));
+    await this.ctx.storage.setAlarm(Date.now() + 200);
+    this.ctx.waitUntil(this.registry().updateRoom(this.roomId(), { title: next.title || old.title, country: next.country, flag: "🌏", city: next.city, startDate: next.startDate, endDate: next.endDate, status: "initializing" }));
+    this.helloAll();
+    return null;
+  }
+
+  /** 換國家時：只跟上一趟有關的記憶（訂位、待辦、當地行程、去過的店）改成「【旅程名稱】…」的回憶 */
+  private async archiveTripMemories(old: { title: string; country: string; city: string; start: string; end: string }, nextWhere: string) {
+    const mems = this.memories();
+    const label = `【${old.title}】`;
+    let past: Set<number> | null = null;
+    if (mems.length) {
+      const prompt = `這個家庭旅遊群組的旅程「${old.title}」（${old.start}～${old.end}，${old.country}${old.city}）結束了，接下來要去${nextWhere}。
+下面是群組的長期記憶。請挑出「只跟上一趟旅程有關、到下一趟就不成立」的記憶 id，例如：訂位、門票、航班、住宿、待辦、當地的行程安排、想去或去過的當地景點和店家、當地交通、當地天氣。
+家人的口味、過敏、健康狀況、習慣、個性、年齡、喜歡的活動、旅行偏好（例如不想走太多路、要有午睡時間）要留著，不要挑。
+只輸出 JSON：{"past_ids":[數字]}
+
+${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
+      try {
+        const raw = await this.generateText("你負責整理家庭旅遊群組的長期記憶，只輸出 JSON。", prompt, true, 1);
+        const j = parseArgs(raw.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as { past_ids?: unknown[] };
+        if (Array.isArray(j.past_ids)) past = new Set(j.past_ids.map(Number).filter(Number.isInteger));
+      } catch (e) {
+        console.error("archiveTripMemories failed", String((e as Error)?.message ?? e).slice(0, 200));
+      }
+    }
+    // AI 不能用：訂位、待辦、決定一律當成上一趟的事
+    if (!past) past = new Set(mems.filter((m) => ["預訂", "待辦", "決定"].includes(String(m.category))).map((m) => Number(m.id)));
+    for (const m of mems) {
+      if (!past.has(Number(m.id)) || String(m.content).startsWith("【")) continue;
+      this.sql.exec("UPDATE memories SET content = ?, category = '回憶', updated = ? WHERE id = ?", `${label}${m.content}`.slice(0, 500), Date.now(), m.id);
+    }
+    // 上一趟的對話摘要也記成一條回憶：AI 才知道這家人去過哪裡、發生過什麼
+    const summary = this.setting("summary");
+    if (summary) this.insertMemory(`${label}回顧（${old.start}～${old.end}）：${summary.replace(/\s+/g, " ").slice(0, 400)}`, "回憶", "AI 自動整理", "auto", null);
   }
 
   // ---------------- AI 初始化 ----------------
@@ -1073,7 +1172,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   private async handleAction(ws: WebSocket, user: Attachment, msg: any) {
     const reply = (ok: boolean, error?: string) => this.send(ws, { type: "action_result", ok, error, action: msg.action });
     const p = this.p();
-    const adminOnly = ["activate", "update_profile", "rerun_init", "update_keys", "update_passwords", "delete_trip", "settings", "reset", "brief_now", "diary_now", "diary_rewrite", "share_on", "share_off"];
+    const adminOnly = ["activate", "update_profile", "rerun_init", "next_trip", "update_keys", "update_passwords", "delete_trip", "settings", "reset", "brief_now", "diary_now", "diary_rewrite", "share_on", "share_off"];
     if (adminOnly.includes(msg.action) && !user.admin) return reply(false, "只有管理員可以使用");
     // 還沒啟用的旅程只能做確認與設定
     if (p.status !== "active" && !["activate", "update_profile", "rerun_init", "update_keys", "delete_trip"].includes(msg.action)) return reply(false, "旅程還在準備中");
@@ -1092,14 +1191,22 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
           title: p.title, country: p.country, flag: flagEmoji(p.countryCode), city: p.city, startDate: p.startDate, endDate: p.endDate, status: p.status,
         }));
         if (first) {
+          // 換國家繼續玩：讓大家知道上一趟的事 AI 都還記得
+          const from = this.setting("next_from");
+          if (from) this.setSetting("next_from", "");
           this.postAiMessage(
-            `🎉 **${p.title}** 準備好了！\n\n我是${AI_NAME}，可以幫大家查景點美食和照片、找附近、估計程車、記帳分帳、翻譯${p.language}、設提醒…有問題直接在這裡問我就好。\n\n` +
+            `🎉 **${p.title}** 準備好了！\n\n${from ? `上一趟「${from}」的回憶我都記得（大家的口味、過敏、習慣），這次不用重新介紹 😊\n\n` : ""}我是${AI_NAME}，可以幫大家查景點美食和照片、找附近、估計程車、記帳分帳、翻譯${p.language}、設提醒…有問題直接在這裡問我就好。\n\n` +
               `👉 先按下方「工具箱」→ 使用說明，看看每個功能怎麼用\n👉 ${p.country}的入境、插座、交通、退稅整理在 「工具箱」→ 旅遊指南\n👉 管理員可以到 下方「設定」→ 邀請家人，把網址傳給大家`,
             { kind: "welcome" },
           );
           await this.ctx.storage.setAlarm(Date.now() + 60_000);
         }
         this.helloAll();
+        break;
+      }
+      case "next_trip": {
+        const err = await this.nextTrip(msg.trip ?? {});
+        if (err) return reply(false, err);
         break;
       }
       case "rerun_init": {
@@ -2682,11 +2789,17 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     const token = this.setting("share_token");
     const sharePath = `/share/${this.roomId()}/${token}`;
     const photoBase = mode === "share" ? `${sharePath}/photo/` : "/api/photo/";
-    const plan = new Map(this.itinerary().map((d) => [String(d.date), String(d.title ?? "")]));
-    const start = Date.parse(p.startDate + "T00:00:00Z");
+    // 過去的旅程（?trip=）只給登入的家人看；分享連結只看現在這趟
+    const pastId = mode === "member" ? Number(url.searchParams.get("trip")) || 0 : 0;
+    const past = pastId ? this.sql.exec("SELECT * FROM trips WHERE id = ?", pastId).toArray()[0] : undefined;
+    const trip = past
+      ? { title: String(past.title), startDate: String(past.start_date), endDate: String(past.end_date), travelers: String(past.travelers ?? "") }
+      : { title: p.title, startDate: p.startDate, endDate: p.endDate, travelers: p.travelers.map((t) => t.name).join("、") };
+    const plan = new Map(past ? [] : this.itinerary().map((d) => [String(d.date), String(d.title ?? "")]));
+    const start = Date.parse(trip.startDate + "T00:00:00Z");
     const personal = this.isPersonal();
     const days = this.sql
-      .exec(`SELECT * FROM diaries ORDER BY date${personal ? " DESC" : ""}`)
+      .exec(`SELECT * FROM diaries WHERE ${past ? "trip_id = ?" : "trip_id IS NULL"} ORDER BY date${personal ? " DESC" : ""}`, ...(past ? [pastId] : []))
       .toArray()
       .map((d) => {
         const date = String(d.date);
@@ -2707,16 +2820,16 @@ ${transcript || "（今天群組沒什麼對話）"}`;
         };
       });
     const html = renderDiaryPage({
-      tripTitle: personal ? `${p.travelers[0]?.name || "我"}的日記` : p.title,
+      tripTitle: personal ? `${p.travelers[0]?.name || "我"}的日記` : trip.title,
       dates: personal
         ? days.length ? `${days[days.length - 1].date.replaceAll("-", "/")} – ${days[0].date.replaceAll("-", "/")}` : ""
-        : `${p.startDate.replaceAll("-", "/")} – ${p.endDate.slice(5).replace("-", "/")}`,
-      travelers: personal ? "" : p.travelers.map((t) => t.name).join("、"),
+        : `${trip.startDate.replaceAll("-", "/")} – ${trip.endDate.slice(5).replace("-", "/")}`,
+      travelers: personal ? "" : trip.travelers,
       ...(personal ? { kicker: "LIFE DIARY ・ 生活日記", footer: "由個人助理根據你的對話、照片和行事曆整理", unit: "篇", suffix: "", noShare: true } : {}),
       accent: "#1d4ed8",
       days,
       mode,
-      shareUrl: token ? origin + sharePath : null,
+      shareUrl: token && !past ? origin + sharePath : null,
       origin,
       autoPrint: url.searchParams.get("print") === "1",
       homeUrl: `/t/${this.roomId()}`,
@@ -2807,7 +2920,8 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       reminders: this.reminderList(),
       documents: this.documentFind().map((d) => ({ id: d.id, title: d.title, note: d.note, author: d.author, ts: d.ts, photo: `/api/photo/${d.photo_id}`, folder: d.folder_id ?? null })),
       docFolders: this.sql.exec("SELECT id, name, parent_id AS parent FROM doc_folders ORDER BY id").toArray(),
-      diaries: this.sql.exec("SELECT date, ts, title, text, photo_ids, edited_by, edited_at, span FROM diaries ORDER BY date DESC").toArray(),
+      diaries: this.sql.exec("SELECT date, ts, title, text, photo_ids, edited_by, edited_at, span FROM diaries WHERE trip_id IS NULL ORDER BY date DESC").toArray(),
+      pastTrips: this.sql.exec("SELECT t.id, t.title, t.country, t.city, t.flag, t.start_date, t.end_date, (SELECT COUNT(*) FROM diaries d WHERE d.trip_id = t.id) AS days FROM trips t ORDER BY t.id DESC").toArray(),
       // 置頂訊息附完整內容：訊息再舊、畫面上沒載入也看得到
       pins: this.sql
         .exec<MessageRow & { pin_ts: number; pin_by: string }>("SELECT m.*, p.ts AS pin_ts, p.by AS pin_by FROM pins p JOIN messages m ON m.id = p.message_id ORDER BY p.ts DESC")
@@ -4774,7 +4888,7 @@ ${guide}
 # 最新行程（以這裡為準）
 ${itin}
 
-# 長期記憶（成員偏好、決定、預訂…，#編號可用 forget 刪除）${picked.list.length < picked.total ? `\n（共 ${picked.total} 條，這裡只列出跟這次對話最相關的；找不到就用 search_history）` : ""}
+# 長期記憶（成員偏好、決定、預訂…；開頭標【旅程名稱】的是以前旅程的回憶，可以拿來聊、了解家人，但不是這次的訂位或待辦；#編號可用 forget 刪除）${picked.list.length < picked.total ? `\n（共 ${picked.total} 條，這裡只列出跟這次對話最相關的；找不到就用 search_history）` : ""}
 ${mems}
 ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}${locs ? `\n# 成員最近位置\n${locs}\n` : ""}${translations ? `\n# 最近在翻譯頁翻過的句子（成員問「剛剛跟店員說了什麼」時參考）\n${translations}\n` : ""}${cards ? `\n# 最近的確認卡片（等待確認的還沒寫入；要修改就重新呼叫同一個工具，replaces 填編號）\n${cards}\n` : ""}
 # 回答規則

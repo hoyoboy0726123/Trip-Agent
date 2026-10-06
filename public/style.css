@@ -634,3 +634,10 @@ input[type="date"]::-webkit-date-and-time-value, input[type="time"]::-webkit-dat
 .pic-cell { position: relative; padding: 0; border: 0; border-radius: 4px; overflow: hidden; aspect-ratio: 1; background: var(--line); cursor: zoom-in; }
 .pic-cell img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .pic-tag { position: absolute; top: 3px; right: 3px; padding: 0 3px; border-radius: 6px; background: rgba(255, 255, 255, .85); font-size: 12px; }
+
+/* 換一個國家繼續玩 */
+.next-trip-card { display: grid; gap: 6px; margin-top: 12px; }
+.nt-list { margin: 6px 0 0; padding-left: 20px; display: grid; gap: 4px; }
+.nt-warn { border-left: 4px solid #dc2626; }
+.nt-ok { gap: 8px; align-items: center; margin: 12px 4px; }
+.nt-btn { width: 100%; margin-top: 8px; }

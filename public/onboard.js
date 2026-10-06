@@ -152,6 +152,7 @@ const W = Object.assign(
 
 /** 密碼與金鑰不存進瀏覽器，重新整理後要重填 */
 function saveWizard() {
+  if (W.mode === "next") return;
   const { roomPassword, adminPassword, tavilyKey, geminiKey, tavilyOk, geminiOk, ...rest } = W;
   try {
     sessionStorage.setItem("ta-wizard", JSON.stringify(rest));
@@ -273,14 +274,14 @@ function stepBody(i) {
         <p class="small muted">🔐 金鑰會加密保存在這個旅程裡，其他旅伴看不到，之後可以在 ⚙️ 設定更換。</p>`;
     case 7: {
       const t = W.travelers.filter((x) => x.name);
-      return `<p>確認一下，按「建立旅程」後 AI 會花 1–2 分鐘查好當地資料，查完你可以再修改。</p>
+      return `<p>${W.mode === "next" ? "確認一下，按「開始新的旅程」後，上一趟會收進「過去的旅程」，AI 會花 1–2 分鐘查好新的當地資料，查完你可以再修改。" : "確認一下，按「建立旅程」後 AI 會花 1–2 分鐘查好當地資料，查完你可以再修改。"}</p>
         <label class="field">旅程名稱<input id="w-title" maxlength="40" value="${escapeHtml(W.title || `${W.city || W.country}旅行 ${year}`)}" /></label>
         <div class="card summary small">
           <div>🌏 ${escapeHtml(W.country)}${W.city ? `・${escapeHtml(W.city)}` : ""}</div>
           <div>📅 ${escapeHtml(W.startDate)} → ${escapeHtml(W.endDate)}</div>
           <div>🏨 ${escapeHtml(W.accName || W.accAddress || "之後再填")}${W.accLat != null ? "（已定位）" : ""}</div>
           <div>👨‍👩‍👧‍👦 ${t.map((x, i) => `${escapeHtml(x.name)}${x.kind === "小孩" ? "（小孩）" : ""}${i === W.me ? "（我）" : ""}`).join("、")}</div>
-          <div>🔍 Tavily ✅　🤖 Gemini ${W.geminiKey ? "✅" : "未填（用網站提供的額度）"}</div>
+          ${W.mode === "next" ? "" : `<div>🔍 Tavily ✅　🤖 Gemini ${W.geminiKey ? "✅" : "未填（用網站提供的額度）"}</div>`}
         </div>
         <p class="error" id="w-error" hidden></p>`;
     }
@@ -289,23 +290,31 @@ function stepBody(i) {
 }
 
 function renderWizard() {
-  document.title = "建立旅程｜旅伴 AI";
-  const i = W.step;
+  // 換國家繼續玩：邀請碼、密碼、金鑰都沿用，只跑目的地、日期、住宿、旅伴、確認
+  const next = W.mode === "next";
+  const seq = next ? [1, 2, 3, 4, 7] : STEPS.map((_, k) => k);
+  const pos = Math.min(W.step, seq.length - 1);
+  const i = seq[pos];
+  document.title = next ? "下一趟旅程｜旅伴 AI" : "建立旅程｜旅伴 AI";
   const root = showScreen(`
     <div class="wiz-head">
-      <button class="icon" id="w-home" title="回首頁">←</button>
-      <div class="wiz-progress">${STEPS.map((s, k) => `<span class="${k < i ? "done" : k === i ? "now" : ""}"></span>`).join("")}</div>
-      <span class="small muted">${i + 1}/${STEPS.length}</span>
+      <button class="icon" id="w-home" title="${next ? "取消" : "回首頁"}">${next ? "✕" : "←"}</button>
+      <div class="wiz-progress">${seq.map((s, k) => `<span class="${k < pos ? "done" : k === pos ? "now" : ""}"></span>`).join("")}</div>
+      <span class="small muted">${pos + 1}/${seq.length}</span>
     </div>
-    <h2 class="wiz-title">${STEPS[i].icon} ${STEPS[i].title}</h2>
+    <h2 class="wiz-title">${STEPS[i].icon} ${next && pos === 0 ? "下一趟要去哪裡？" : STEPS[i].title}</h2>
     <form id="w-form" class="wiz-body" novalidate>${stepBody(i)}
       <p class="error" id="w-step-error" hidden></p>
       <div class="wiz-nav">
-        ${i > 0 ? `<button type="button" class="btn big-btn" id="w-back">上一步</button>` : ""}
-        <button class="primary" id="w-next">${i === STEPS.length - 1 ? "🚀 建立旅程" : "下一步"}</button>
+        ${pos > 0 ? `<button type="button" class="btn big-btn" id="w-back">上一步</button>` : ""}
+        <button class="primary" id="w-next">${pos === seq.length - 1 ? (next ? "🧳 開始新的旅程" : "🚀 建立旅程") : "下一步"}</button>
       </div>
     </form>`);
   $("#w-home", root).addEventListener("click", () => {
+    if (next) {
+      if (confirm("取消換國家？目前的旅程不會有任何改變。")) location.reload();
+      return;
+    }
     saveWizard();
     renderLanding();
   });
@@ -379,7 +388,7 @@ function renderWizard() {
       collectStep(i);
       const problem = await validateStep(i);
       if (problem) throw new Error(problem);
-      if (i === STEPS.length - 1) return await createTrip();
+      if (pos === seq.length - 1) return next ? await startNextTrip(btn) : await createTrip();
       W.step++;
       saveWizard();
       renderWizard();
@@ -446,6 +455,33 @@ async function validateStep(i) {
     }
   }
   return null;
+}
+
+/** 換國家繼續玩：送出新的目的地；伺服器整理好記憶、收好上一趟後，畫面會自動進入「AI 查資料中」 */
+async function startNextTrip(btn) {
+  const where = `${W.country}${W.city ? `・${W.city}` : ""}`;
+  if (!confirm(`確定換到「${where}」？\n\n上一趟的照片、票券、帳目和聊天紀錄會刪除，無法復原；日記和長期記憶會留著。`)) return;
+  btn.textContent = "整理記憶、收好上一趟中…（約 30 秒）";
+  const r = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ ok: false, error: "等太久了，請重新整理頁面看看是否已經換好" }), 180_000);
+    S.onNextTrip = (m) => {
+      clearTimeout(timer);
+      resolve(m);
+    };
+    action({
+      action: "next_trip",
+      trip: {
+        title: W.title, country: W.country, city: W.city, startDate: W.startDate, endDate: W.endDate, flights: W.flights, travelers: W.travelers,
+        accommodation: { name: W.accName, address: W.accAddress, lat: W.accLat, lon: W.accLon },
+      },
+    });
+  });
+  S.onNextTrip = null;
+  if (!r.ok) {
+    btn.textContent = "🧳 開始新的旅程";
+    throw new Error(r.error || "沒有換成功，請再試一次");
+  }
+  W.mode = "";
 }
 
 async function createTrip() {

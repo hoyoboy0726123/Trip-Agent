@@ -287,6 +287,10 @@ function handle(m) {
       break;
     case "action_result": {
       if (m.action === "translate" || m.action === "add_phrase") trActionDone(m);
+      if (m.action === "next_trip") {
+        S.onNextTrip?.(m);
+        break;
+      }
       // 卡片按了但失敗（例如別人已經處理過）：把按鈕恢復，畫面會跟著伺服器的狀態更新
       if (!m.ok && (m.action === "draft_confirm" || m.action === "draft_cancel")) document.querySelectorAll(".draft-actions button:disabled").forEach((x) => (x.disabled = false));
       const formErr = $("#trip-error");
@@ -1386,6 +1390,7 @@ function renderPanelInner() {
     if (S.panel === "iddocs") return renderIdDocsPanel(st, b);
   }
   if (S.panel === "photos") return renderPhotosPanel(b);
+  if (S.panel === "nexttrip") return renderNextTripPanel(st, b);
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
     case "itinerary": {
@@ -1496,10 +1501,20 @@ function renderPanelInner() {
     case "tripedit": {
       els.panelTitle.textContent = "🌏 旅程設定";
       b.innerHTML = `${tripForm(S.trip)}
-        <div class="row" style="gap:8px"><button class="btn" id="te-rerun" style="flex:1">🔄 請 AI 重新查詢</button><button class="btn primary-sm" id="te-save" style="flex:1">儲存</button></div>`;
+        <div class="row" style="gap:8px"><button class="btn" id="te-rerun" style="flex:1">🔄 請 AI 重新查詢</button><button class="btn primary-sm" id="te-save" style="flex:1">儲存</button></div>
+        <div class="card next-trip-card"><b>🧳 換一個國家繼續玩</b>
+          <div class="small muted">同一群家人去下一個國家：AI 記得大家的口味和習慣，介面整個換成新的國家。</div>
+          <button type="button" class="btn" id="te-next">開始設定下一趟</button></div>`;
       const read = bindTripForm(b, S.trip);
       $("#te-save", b).addEventListener("click", () => action({ action: "update_profile", profile: read() }));
+      $("#te-next", b).addEventListener("click", () => {
+        PH.data = null;
+        openPanel("nexttrip");
+      });
       $("#te-rerun", b).addEventListener("click", () => {
+        // 換了國家：照片、帳目、聊天會跟上一趟混在一起，建議用「換一個國家繼續玩」
+        const country = $("#trip-form", b).country.value.trim();
+        if (country && country !== S.trip.country && !confirm(`國家改成「${country}」了。\n\n如果是要去下一個國家玩，建議按下面的「換一個國家繼續玩」，上一趟的照片、帳目才不會混在一起。\n\n只是改正打錯的國家，按「確定」繼續重新查詢。`)) return;
         if (confirm("用表單上的國家、城市、日期，讓 AI 重新查一次當地資料？\n\n時區、貨幣、語言、緊急電話、旅遊指南、計程車費率、AI 產生的常用語和清單會換成新查的結果（自己加的不會動）。查完要再確認一次，期間大家暫時不能聊天。")) {
           action({ action: "rerun_init", profile: read() });
           els.panel.close();
@@ -3296,6 +3311,7 @@ function renderDiaryPanel(st, b) {
       <div class="small muted">${share ? "分享連結已開啟：拿到連結的人不用登入就能看日記和照片。" : S.me.admin ? "分享連結還沒開啟，按「分享給親友」會先問你要不要開啟。" : "分享連結要由管理員開啟。"}</div>
       ${S.me.admin && share ? `<button type="button" class="btn small" id="diary-share-off">關閉分享連結（舊連結會失效）</button>` : ""}
     </div>
+    ${(st.pastTrips || []).length ? `<div class="card"><h3>過去的旅程</h3><div class="list">${st.pastTrips.map((x) => `<a class="item small link-row" href="/api/album?room=${ROOM}&trip=${x.id}" target="_blank" rel="noopener"><span>${escapeHtml(x.flag || "🌏")} <b>${escapeHtml(x.title)}</b></span><span class="muted">${escapeHtml(String(x.start_date).slice(5).replace("-", "/"))}–${escapeHtml(String(x.end_date).slice(5).replace("-", "/"))}・${x.days} 篇</span></a>`).join("")}</div></div>` : ""}
     ${ds.length
       ? ds.map((d) => {
           const photos = JSON.parse(d.photo_ids || "[]");
@@ -3782,3 +3798,49 @@ if (ROOM) checkSession();
 else if (location.pathname === "/capture") routeCapture();
 else if (location.pathname === "/new") renderWizard();
 else renderLanding();
+
+// ================= 換一個國家繼續玩（管理員） =================
+
+function renderNextTripPanel(st, b) {
+  els.panelTitle.textContent = "🧳 換一個國家繼續玩";
+  if (!PH.data && !PH.loading) loadPhotos();
+  const t = S.trip || {};
+  const ph = PH.data;
+  const inDiary = new Set((st.diaries || []).flatMap((d) => JSON.parse(d.photo_ids || "[]")));
+  const photos = ph ? ph.days.flatMap((d) => d.photos).filter((x) => !inDiary.has(x.id) && !x.ticket).length : null;
+  const tickets = (st.documents || []).length;
+  const expenses = st.expenses?.count || 0;
+  b.innerHTML = `
+    <div class="card"><h3>「${escapeHtml(t.title || "")}」之後，換到下一個國家</h3>
+      <div class="small">會重新跑一次一開始的設定：目的地 → 日期 → 住宿 → 旅伴，AI 再查一次當地資料，你在確認頁按「確認」才算換好。</div></div>
+    <div class="card"><h3>會留下來</h3><ul class="small nt-list">
+      <li>🧠 長期記憶：家人的口味、過敏、習慣照常記得；只跟這一趟有關的（訂位、待辦、當地行程）會變成「${escapeHtml(t.title || "")}」的回憶</li>
+      <li>📔 旅遊日記 ${(st.diaries || []).length} 篇和日記裡的照片，收在「旅遊日記 → 過去的旅程」</li>
+      <li>👨‍👩‍👧‍👦 旅伴、登入密碼、API 金鑰</li></ul></div>
+    <div class="card nt-warn"><h3>會刪除，無法復原</h3><ul class="small nt-list">
+      <li>📷 照片 ${photos == null ? "（讀取中…）" : `${photos} 張`}（日記用到的不算）</li>
+      <li>🎫 票券 ${tickets} 張</li>
+      <li>💰 帳目 ${expenses} 筆</li>
+      <li>💬 聊天紀錄、行程、清單、提醒、常用語、翻譯紀錄</li></ul>
+      <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:8px">
+        <button type="button" class="btn small primary-sm" id="nt-photos">📷 先去存照片</button>
+        ${expenses ? `<a class="btn small" href="/api/expenses.csv?room=${ROOM}" download>⬇️ 下載帳目</a>` : ""}
+        ${tickets ? `<button type="button" class="btn small" id="nt-tickets">🎫 看票券</button>` : ""}
+      </div></div>
+    <label class="row small nt-ok"><input type="checkbox" id="nt-ok" /> 需要的照片、票券和帳目我都存好了</label>
+    <button type="button" class="btn primary-sm nt-btn" id="nt-go" disabled>下一步：設定新的旅程</button>
+    <button type="button" class="btn nt-btn" id="nt-cancel">先不要</button>`;
+  $("#nt-photos", b).addEventListener("click", () => openPanel("photos"));
+  $("#nt-tickets", b)?.addEventListener("click", () => openPanel("tickets"));
+  $("#nt-ok", b).addEventListener("change", (e) => ($("#nt-go", b).disabled = !e.target.checked));
+  $("#nt-cancel", b).addEventListener("click", () => openPanel("tripedit"));
+  $("#nt-go", b).addEventListener("click", () => {
+    const list = (t.travelers || []).map((x) => ({ ...x }));
+    Object.assign(W, {
+      mode: "next", step: 0, invite: "", country: "", city: "", startDate: "", endDate: "", accName: "", accAddress: "", accLat: null, accLon: null, accLabel: "", flights: "", title: "",
+      travelers: list.length ? list : [{ name: S.me.name, kind: "大人" }], me: Math.max(0, list.findIndex((x) => x.name === S.me.name)),
+    });
+    els.panel.close();
+    renderWizard();
+  });
+}

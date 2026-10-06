@@ -1385,6 +1385,7 @@ function renderPanelInner() {
     if (S.panel === "health") return renderHealthPanel(st, b);
     if (S.panel === "iddocs") return renderIdDocsPanel(st, b);
   }
+  if (S.panel === "photos") return renderPhotosPanel(b);
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
     case "itinerary": {
@@ -1429,7 +1430,8 @@ function renderPanelInner() {
       const currencies = [...new Set([t.currency, "TWD", "USD"].filter(Boolean))];
       b.innerHTML = `
         <div class="card"><div class="small muted">總花費（${ex.count} 筆）</div>
-          <div class="big">${money(ex.total)}</div><div class="muted">約 NT$${ex.total_twd.toLocaleString()}</div></div>
+          <div class="big">${money(ex.total)}</div><div class="muted">約 NT$${ex.total_twd.toLocaleString()}</div>
+          ${ex.count ? `<a class="btn small" href="/api/expenses.csv?room=${ROOM}" download style="margin-top:8px">⬇️ 下載帳目（CSV）</a>` : ""}</div>
         <div class="card"><h3>每人</h3>
           ${ex.balance.map((p) => `<div class="item small"><span>${escapeHtml(p.name)}</span><span>付 ${money(p.paid)}｜應付 ${money(p.share)}｜<b style="color:${p.net >= 0 ? "#17a398" : "var(--danger)"}">${p.net >= 0 ? "+" : ""}${money(p.net)}</b></span></div>`).join("") || `<div class="small muted">還沒有帳目</div>`}
           ${ex.transfers.length ? `<h3 style="margin-top:10px">結算建議</h3>${ex.transfers.map((x) => `<div class="small">👉 ${escapeHtml(x.from)} 給 ${escapeHtml(x.to)} <b>${money(x.amount)}</b></div>`).join("")}` : ""}
@@ -1658,6 +1660,7 @@ function renderLedgerPanel(st, b) {
       ${l.budget ? `${meter(l.total, l.budget)}<div class="small ${left < 0 ? "error" : "muted"}">${left >= 0 ? `預算 ${nt(l.budget)}，還剩 ${nt(left)}` : `已超出預算 ${nt(-left)}`}</div>` : ""}
       <form class="row inline-form" id="lg-budget" style="gap:6px;margin-top:10px"><input name="amount" type="number" inputmode="numeric" min="0" step="100" placeholder="每月預算（NT$）" value="${l.budget || ""}" style="flex:1" /><button class="btn small">${l.budget ? "修改預算" : "設定預算"}</button></form>
       <div class="small muted">花到八成、超過預算時，會在聊天和手機通知你。</div>
+      ${l.count ? `<a class="btn small" href="/api/expenses.csv?room=${ROOM}" download style="margin-top:8px">⬇️ 下載全部帳目（CSV）</a>` : ""}
     </div>
     ${cats.length ? `<div class="card"><h3>分類</h3>${cats.map(([c, v]) => `<div class="cat-row"><span>${escapeHtml(c)}</span>${meter(v, l.total, true)}<b>${nt(v)}</b></div>`).join("")}</div>` : ""}
     <div class="card"><h3>明細</h3>
@@ -2270,6 +2273,7 @@ function toolCards() {
       ["reminders", "bell", "提醒", "時間到通知你"],
       ["diary", "notebook", "日記", "每週（或每天）自動寫"],
       ["iddocs", "idcard", "證件到期", "護照、駕照到期前提醒"],
+      ["photos", "camera", "相片", "傳過的照片，存到手機"],
       ["memories", "bookmark", "記憶", "AI 記得你的事，可以刪改"],
     ];
   }
@@ -2280,6 +2284,7 @@ function toolCards() {
     ["checklist", "list", "共用清單", "行李、購物、待辦"],
     ["reminders", "bell", "提醒", "時間到在群組通知"],
     ["diary", "book", "旅遊日記", "每晚自動寫、匯出相簿"],
+    ["photos", "camera", "相片", "每天的照片，存到手機"],
   ];
 }
 

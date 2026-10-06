@@ -311,8 +311,8 @@ export default {
         return room.fetch(new Request("https://room/ws", { headers }));
       }
 
-      // 個人助理：手機推播訂閱、匯出資料
-      const direct: Record<string, string> = { "/api/push/key": "/push/key", "/api/push/subscribe": "/push/subscribe", "/api/push/unsubscribe": "/push/unsubscribe", "/api/export": "/export" };
+      // 個人助理：手機推播訂閱、匯出資料；相片清單、帳目下載
+      const direct: Record<string, string> = { "/api/push/key": "/push/key", "/api/push/subscribe": "/push/subscribe", "/api/push/unsubscribe": "/push/unsubscribe", "/api/export": "/export", "/api/photos": "/photos", "/api/expenses.csv": "/expenses.csv" };
       if (direct[path]) {
         headers.set("x-origin", url.origin);
         return room.fetch(new Request(`https://room${direct[path]}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));

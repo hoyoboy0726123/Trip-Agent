@@ -572,3 +572,11 @@ details.guide li + li { margin-top: 4px; }
 .tag.warn { background: #fff1f0; color: #c0271a; }
 .tag.ok { background: #e8f5ec; color: #1f7a45; }
 .h-disclaimer { margin-top: 12px; }
+
+/* 輸入 @ 的選單、健康管家的回答 */
+.mention-box { position: absolute; left: 12px; bottom: calc(100% - 2px); z-index: 25; display: grid; min-width: 220px; max-width: calc(100% - 24px); background: var(--card); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, .12); overflow: hidden; }
+.mention-box button { display: grid; gap: 2px; text-align: left; padding: 10px 14px; border: 0; background: transparent; font: inherit; color: inherit; cursor: pointer; }
+.mention-box button:hover, .mention-box button:focus-visible { background: var(--red-soft); }
+.ai-card.health { border-color: #b7e0c4; }
+.ai-card.health .ai-avatar { background: #e3f3e9; color: #1f7a45; }
+.ai-card.health .ai-name { color: #1f7a45; }

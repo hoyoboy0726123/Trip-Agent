@@ -4526,7 +4526,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 
     for (const pid of order) {
       const provider = await this.provider(pid, 1, FOREGROUND_MAX_WAIT, onWait);
-      this.broadcast({ type: "ai_start", id, provider: provider.id, label: PROVIDER_LABEL[provider.id], model: provider.model });
+      this.broadcast({ type: "ai_start", id, provider: provider.id, label: PROVIDER_LABEL[provider.id], model: provider.model, ...(health ? { health: true } : {}) });
       let finalText = "";
       const nudged = new Set<string>();
       const forced = new Set<string>();

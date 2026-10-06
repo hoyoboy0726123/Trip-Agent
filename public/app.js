@@ -333,6 +333,9 @@ function renderPresence(online) {
   els.avatars.innerHTML = online.slice(0, 3).map((n) => `<span style="background:${colorFor(n)}">${escapeHtml([...n][0])}</span>`).join("");
 }
 
+/** 健康管家的回答、提醒、警示 */
+const healthMeta = (meta) => !!meta?.health || String(meta?.kind ?? "").startsWith("health");
+
 function messageNode(msg) {
   const isAI = msg.role === "assistant";
   const isMe = !isAI && msg.author === S.me?.name;
@@ -368,8 +371,9 @@ function messageNode(msg) {
   }
   if (isAI) {
     const provider = providerName(msg.meta);
-    node.innerHTML = `<div class="ai-card">
-      <div class="ai-head"><span class="ai-avatar">${svg("luggage")}</span><span class="ai-name">${escapeHtml(msg.author)}</span>
+    const hm = healthMeta(msg.meta);
+    node.innerHTML = `<div class="ai-card${hm ? " health" : ""}">
+      <div class="ai-head"><span class="ai-avatar">${svg(hm ? "heart" : "luggage")}</span><span class="ai-name">${hm ? "🩺 健康管家" : escapeHtml(msg.author)}</span>
         <span class="ai-tools">${(msg.meta?.tools ?? []).map(toolBadge).join("")}</span>
         <span class="ai-time">${timeText(msg.ts)}${provider ? ` · ${escapeHtml(provider)}` : ""}</span></div>
       <div class="ai-body rich">${body}</div>
@@ -777,6 +781,11 @@ function aiStart(m) {
     arrived(node, stick);
   }
   live.node.querySelector(".ai-time").textContent = `${m.label || "AI"} 思考中…`;
+  if (m.health) {
+    live.node.querySelector(".ai-card")?.classList.add("health");
+    live.node.querySelector(".ai-name").textContent = "🩺 健康管家";
+    live.node.querySelector(".ai-avatar").innerHTML = svg("heart");
+  }
 }
 
 function aiTool(m) {
@@ -830,7 +839,77 @@ function autoGrow() {
   els.input.style.height = Math.min(els.input.scrollHeight, 140) + "px";
 }
 
+// ---------- 輸入 @：叫出健康管家（個人助理） ----------
+const MENTIONS = () => (isPersonal() ? [{ key: "健康管家", label: "🩺 健康管家", desc: "血壓、血糖、用藥、健康問題" }] : []);
+let mentionBox = null;
+
+function mentionQuery() {
+  const pos = els.input.selectionStart ?? els.input.value.length;
+  return els.input.value.slice(0, pos).match(/(^|\s)@([^\s@]*)$/);
+}
+
+function hideMention() {
+  if (mentionBox) mentionBox.hidden = true;
+}
+
+function updateMention() {
+  const m = mentionQuery();
+  const hits = m ? MENTIONS().filter((x) => x.key.startsWith(m[2]) || x.label.includes(m[2])) : [];
+  if (!hits.length) return hideMention();
+  if (!mentionBox) {
+    mentionBox = document.createElement("div");
+    mentionBox.className = "mention-box";
+    els.sendForm.parentElement.append(mentionBox);
+  }
+  mentionBox.innerHTML = hits.map((x, i) => `<button type="button" data-mention="${i}"><b>${x.label}</b><span class="small muted">${x.desc}</span></button>`).join("");
+  mentionBox.hidden = false;
+  // pointerdown：在輸入框失去焦點之前選好
+  mentionBox.querySelectorAll("[data-mention]").forEach((b) =>
+    b.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      pickMention(hits[Number(b.dataset.mention)]);
+    }),
+  );
+}
+
+function pickMention(x) {
+  const m = mentionQuery();
+  const pos = els.input.selectionStart ?? els.input.value.length;
+  const start = m ? pos - m[2].length - 1 : pos;
+  const insert = `@${x.key} `;
+  els.input.value = els.input.value.slice(0, start) + insert + els.input.value.slice(pos);
+  const caret = start + insert.length;
+  els.input.focus();
+  els.input.setSelectionRange(caret, caret);
+  hideMention();
+  autoGrow();
+}
+
+/** 「＋」選單的「問健康管家」：在輸入框開頭放 @健康管家 */
+function askHealth() {
+  if (!/@健康管家/.test(els.input.value)) els.input.value = `@健康管家 ${els.input.value}`;
+  els.input.focus();
+  els.input.setSelectionRange(els.input.value.length, els.input.value.length);
+  autoGrow();
+}
+
+els.input.addEventListener("input", updateMention);
+els.input.addEventListener("blur", () => setTimeout(hideMention, 150));
+
 els.input.addEventListener("keydown", (e) => {
+  if (mentionBox && !mentionBox.hidden) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      return hideMention();
+    }
+    if ((e.key === "Enter" || e.key === "Tab") && !e.isComposing) {
+      const first = MENTIONS().find((x) => x.key.startsWith(mentionQuery()?.[2] ?? ""));
+      if (first) {
+        e.preventDefault();
+        return pickMention(first);
+      }
+    }
+  }
   // 電腦上 Enter 送出、Shift+Enter 換行；手機用送出鍵
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && matchMedia("(pointer: fine)").matches) {
     e.preventDefault();
@@ -948,6 +1027,7 @@ function moreActions() {
   const cur = t.currency || "";
   if (isPersonal()) {
     return [
+      ["heart", "問健康管家", askHealth],
       ["camera", "拍照問", () => els.photoInput.click()],
       ["file", "上傳文件", () => DOC_INPUT.click()],
       ["receipt", "收據記帳", receiptFlow],

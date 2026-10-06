@@ -748,14 +748,24 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     });
     // 初始化期間管理員可能按了「重新查詢」以外的修改，以最新狀態為準
     if (this.profile()?.status !== "initializing") return;
+    const extra = this.setting("init_note");
+    if (extra) {
+      profile.initNotes.unshift(extra);
+      this.setSetting("init_note", "");
+    }
     profile.status = "review";
     this.saveProfile(profile);
     if (phrases.length) {
       this.sql.exec("DELETE FROM phrases WHERE author = '預設'");
       for (const x of phrases) this.sql.exec("INSERT INTO phrases (category, zh, local, reading, author, ts) VALUES (?, ?, ?, ?, '預設', ?)", x.category, x.zh, x.local, x.reading, Date.now());
     }
+    // 重新查詢會整批換掉 AI 產生的清單：同名的項目保留打勾
+    const ticked = new Map(this.sql.exec("SELECT item, done_by FROM checklist WHERE author = 'AI 初始化' AND done = 1").toArray().map((r) => [String(r.item), r.done_by]));
     this.sql.exec("DELETE FROM checklist WHERE author = 'AI 初始化'");
-    for (const c of checklist) this.sql.exec("INSERT INTO checklist (list, item, for_whom, author, ts) VALUES (?, ?, '', 'AI 初始化', ?)", c.list, c.item, Date.now());
+    for (const c of checklist) {
+      const by = ticked.get(c.item);
+      this.sql.exec("INSERT INTO checklist (list, item, for_whom, author, done, done_by, ts) VALUES (?, ?, '', 'AI 初始化', ?, ?, ?)", c.list, c.item, by === undefined ? 0 : 1, by ?? null, Date.now());
+    }
     this.setSetting("init_progress", JSON.stringify({ step: INIT_STEPS.length, label: "完成", total: INIT_STEPS.length }));
     this.ctx.waitUntil(this.registry().updateRoom(this.roomId(), { title: profile.title, country: profile.country, flag: flagEmoji(profile.countryCode), status: "review" }));
     this.helloAll();
@@ -1090,6 +1100,22 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         break;
       }
       case "rerun_init": {
+        // 先套用表單上還沒按「儲存」的修改（換了國家、城市、日期、住宿），AI 才會照新的查
+        if (msg.profile && typeof msg.profile === "object") {
+          const before = { country: p.country, city: p.city, title: p.title, acc: `${p.accommodation.name}|${p.accommodation.address}` };
+          const err = this.applyProfilePatch(p, msg.profile);
+          if (err) return reply(false, err);
+          this.syncItineraryDays(p);
+          if (p.country !== before.country || p.city !== before.city) {
+            // 名稱是自動取的（「首爾旅行 2026」）就跟著換；自己取的名稱不動
+            const year = p.startDate.slice(0, 4);
+            if (before.title === `${before.city || before.country}旅行 ${year}`) p.title = "";
+            // 換了國家、住宿卻沒換：舊住宿的位置不能用，查完在確認頁提醒
+            if (p.country !== before.country && `${p.accommodation.name}|${p.accommodation.address}` === before.acc) {
+              this.setSetting("init_note", `國家從「${before.country}」換成「${p.country}」，但住宿還是「${p.accommodation.name || p.accommodation.address || "未填"}」，請更新住宿並按「📍 重新定位」；每天的行程也記得改`);
+            }
+          }
+        }
         p.status = "initializing";
         this.saveProfile(p);
         this.setSetting("init_progress", JSON.stringify({ step: 0, label: "準備中", total: INIT_STEPS.length }));

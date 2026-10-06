@@ -612,6 +612,7 @@ function bindTripForm(root, t) {
   form.accAddress.addEventListener("input", () => {
     form.accLat.value = "";
     form.accLon.value = "";
+    if (/^最近車站/.test(form.accNote.value)) form.accNote.value = "";
     $("#acc-state", form).textContent = "⚠️ 地址改了，請重新定位";
   });
   return () => {
@@ -650,7 +651,7 @@ function renderReview() {
     </div>`);
   const read = bindTripForm(root, t);
   $("#rv-rerun", root).addEventListener("click", () => {
-    if (confirm("重新讓 AI 查一次當地資料？你剛才的修改會被覆蓋。")) action({ action: "rerun_init" });
+    if (confirm("用你剛才填的國家、城市、日期，讓 AI 重新查一次當地資料？時區、貨幣、指南、常用語會換成新查的結果。")) action({ action: "rerun_init", profile: read() });
   });
   $("#rv-ok", root).addEventListener("click", (e) => {
     e.target.disabled = true;

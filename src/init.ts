@@ -54,7 +54,7 @@ export async function researchTrip(input: TripProfile, deps: InitDeps): Promise<
     const j = json(await deps.ask(
       "你是旅遊資料助理，只輸出 JSON。",
       `台灣旅客要去 ${where} 旅行。請提供當地基本資料，只輸出 JSON：
-{"countryCode":"ISO 3166-1 兩碼，例如 KR","countryIso3":"三碼，例如 KOR","country":"國家的繁體中文名稱","timezone":"主要城市的 IANA 時區，例如 Asia/Seoul","currency":"ISO 4217 貨幣代碼","currencySymbol":"貨幣符號","language":"旅客最常需要的當地語言（繁體中文名稱，例如 韓文）","langCode":"BCP 47，例如 ko-KR","readingName":"這個語言給台灣人照著念的發音提示叫什麼，例如 日文=平假名、韓文=羅馬拼音、泰文=羅馬拼音；英文等拼音文字不需要就給空字串","emergency":"緊急電話與觀光諮詢熱線，一句話，例如：警察 112、救護車／消防 119；觀光諮詢 1330（有中文）"}`,
+{"countryCode":"ISO 3166-1 兩碼，例如 KR","countryIso3":"三碼，例如 KOR","country":"國家的繁體中文名稱","timezone":"主要城市的 IANA 時區，例如 Asia/Seoul","currency":"ISO 4217 貨幣代碼","currencySymbol":"貨幣符號","language":"旅客最常需要的當地語言（繁體中文名稱，例如 韓文）","langCode":"BCP 47，例如 ko-KR","readingName":"這個語言給台灣人照著念的發音提示叫什麼，例如 日文=平假名、韓文=羅馬拼音、泰文=羅馬拼音；英文等拼音文字不需要就給空字串","emergency":"這個國家的警察、救護車、消防電話，一句話，格式：警察 ○○○、救護車 ○○○、消防 ○○○（號碼相同就合併寫）"}`,
     ));
     if (/^[A-Z]{2}$/i.test(str(j.countryCode))) p.countryCode = str(j.countryCode).toUpperCase();
     if (/^[A-Z]{3}$/i.test(str(j.countryIso3))) p.countryIso3 = str(j.countryIso3).toUpperCase();
@@ -82,6 +82,7 @@ export async function researchTrip(input: TripProfile, deps: InitDeps): Promise<
     const queries = [
       `台灣護照 ${p.country} 入境 簽證 入境登記 ${year}`,
       `${p.country} 觀光客 退稅 規定 門檻 ${year}`,
+      `${p.country} 旅客 觀光諮詢熱線 中文 服務 電話`,
       `${p.city || p.country} taxi fare flag fall per km ${year}`,
       `${p.city || p.country} 交通卡 地鐵 叫車 App 旅客 ${year}`,
     ];
@@ -92,12 +93,15 @@ export async function researchTrip(input: TripProfile, deps: InitDeps): Promise<
       "你是嚴謹的旅遊資料助理，只根據提供的搜尋結果與可靠常識回答，不確定就寫「請出發前再確認」，只輸出 JSON。",
       `台灣家庭（${travelersText(p.travelers)}）要在 ${p.startDate} 到 ${p.endDate} 去 ${where}。
 請整理成給手機閱讀的旅遊指南，每一項 2–4 句、條列可以用「・」，繁體中文台灣用語：
-{"entry":"台灣護照入境規定：免簽天數或簽證、入境登記／電子旅行許可、效期要求","money":"貨幣、現金與刷卡習慣、換匯建議、小費習慣","power":"電壓與插座型式，要不要帶轉接頭","transport":"市區交通卡、地鐵、常用叫車 App","taxRefund":"觀光客退稅規定與門檻，沒有退稅就說明","connectivity":"網卡、eSIM、Wi-Fi 建議","etiquette":"需要注意的禮儀或禁忌（有小孩的話也提醒）","weather":"${month} 月的天氣與穿著建議",
+{"entry":"台灣護照入境規定：免簽天數或簽證、入境登記／電子旅行許可、效期要求","money":"貨幣、現金與刷卡習慣、換匯建議、小費習慣","power":"電壓與插座型式，要不要帶轉接頭","transport":"市區交通卡、地鐵、常用叫車 App","taxRefund":"觀光客退稅規定與門檻，沒有退稅就說明","connectivity":"網卡、eSIM、Wi-Fi 建議","etiquette":"需要注意的禮儀或禁忌（有小孩的話也提醒）","weather":"${month} 月的天氣與穿著建議","hotline":"搜尋結果裡寫到的觀光客諮詢熱線：號碼＋有沒有中文服務；搜尋結果沒寫到就給空字串，不要憑記憶寫",
 "taxi":{"base":起跳價（當地貨幣，數字）,"baseKm":起跳里程公里（數字）,"perKm":之後每公里約多少（數字）,"nightMultiplier":深夜加成倍數（沒有就 1）,"nightFrom":深夜開始小時（0-23）,"nightTo":深夜結束小時,"note":"一句話補充，例如叫車 App 名稱或機場固定費率"}}
 查不到計程車費率就把 taxi 設成 null。
 搜尋結果：
 ${found.map((r, i) => `[${i + 1}] ${r.title}（${r.url}）\n${r.content}`).join("\n\n").slice(0, 9000) || "（沒有搜尋結果，請依可靠常識回答並提醒出發前確認）"}`,
     ));
+    // 觀光熱線只用搜尋結果裡有的（AI 憑記憶常把別國的號碼寫進來）
+    const hotline = str(j.hotline, 100).replace(/^[・•\-\s]+/, "").replace(/\s+/g, " ");
+    if (hotline && /\d{3,}/.test(hotline) && !p.emergency.includes("觀光")) p.emergency = `${p.emergency}${p.emergency ? "；" : ""}觀光諮詢 ${hotline}`.slice(0, 300);
     p.guide = {
       entry: str(j.entry), money: str(j.money), power: str(j.power), transport: str(j.transport), taxRefund: str(j.taxRefund),
       connectivity: str(j.connectivity), etiquette: str(j.etiquette), weather: str(j.weather), sources,

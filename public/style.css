@@ -88,7 +88,7 @@ a.btn { display: inline-block; text-align: center; text-decoration: none; color:
 .field input, .field textarea, .field select, .key-card input, .trav-row input, .trav-row select {
   width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); font-size: 16px; color: var(--ink);
 }
-.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .wiz-head { display: flex; align-items: center; gap: 10px; color: #fff; }
 .wiz-head .icon { color: #fff; }
 .wiz-head .muted { color: rgba(255,255,255,.85); }
@@ -617,3 +617,8 @@ details.guide li + li { margin-top: 4px; }
 .attach-add { width: 52px; height: 52px; border-radius: 10px; border: 1.5px dashed var(--line); background: transparent; color: var(--muted); font-size: 22px; cursor: pointer; }
 .rich .photo-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; max-width: 300px; margin: 2px 0 6px; }
 .rich .photo-grid img.photo { width: 100%; height: 130px; max-height: none; margin: 0; object-fit: cover; border-radius: 8px; }
+
+/* iOS 的日期、時間欄位有內建的最小寬度，兩欄並排時會撐出邊框：允許縮小、跟其他欄位一樣靠左 */
+.field { min-width: 0; }
+input[type="date"], input[type="time"] { min-width: 0; max-width: 100%; -webkit-appearance: none; appearance: none; min-height: 2.75em; }
+input[type="date"]::-webkit-date-and-time-value, input[type="time"]::-webkit-date-and-time-value { text-align: left; }

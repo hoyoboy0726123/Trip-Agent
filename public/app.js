@@ -1498,8 +1498,8 @@ function renderPanelInner() {
       const read = bindTripForm(b, S.trip);
       $("#te-save", b).addEventListener("click", () => action({ action: "update_profile", profile: read() }));
       $("#te-rerun", b).addEventListener("click", () => {
-        if (confirm("讓 AI 重新查一次當地資料（時區、貨幣、指南、常用語）？查完要再確認一次，期間大家暫時不能聊天。")) {
-          action({ action: "rerun_init" });
+        if (confirm("用表單上的國家、城市、日期，讓 AI 重新查一次當地資料？\n\n時區、貨幣、語言、緊急電話、旅遊指南、計程車費率、AI 產生的常用語和清單會換成新查的結果（自己加的不會動）。查完要再確認一次，期間大家暫時不能聊天。")) {
+          action({ action: "rerun_init", profile: read() });
           els.panel.close();
         }
       });

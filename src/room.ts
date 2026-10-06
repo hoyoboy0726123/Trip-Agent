@@ -11,6 +11,7 @@ import { disasterAlerts, DRAFT_TOOLS, homeOf, reverseArea, type EventInput, runT
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
+import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
 
@@ -428,6 +429,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     // 個人助理知識庫：貼連結（文章、FB／IG 影片）或筆記，AI 整理成標題＋重點＋標籤
     this.sql.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, summary TEXT, content TEXT, url TEXT, tags TEXT, thumb TEXT)");
     if (!this.sql.exec("PRAGMA table_info(notes)").toArray().some((c) => c.name === "inbox")) this.sql.exec("ALTER TABLE notes ADD COLUMN inbox INTEGER DEFAULT 0");
+    // 上傳的文件：知識庫那筆連到原檔
+    if (!this.sql.exec("PRAGMA table_info(notes)").toArray().some((c) => c.name === "file_id")) this.sql.exec("ALTER TABLE notes ADD COLUMN file_id INTEGER");
     // 第三階段：行事曆、做夢的確認卡、每天的回顧、做夢紀錄（可復原）
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, date TEXT, start TEXT, end_time TEXT, location TEXT, note TEXT, remind_min INTEGER, reminded INTEGER DEFAULT 0);
@@ -447,6 +450,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       CREATE TABLE IF NOT EXISTS memo_segs (memo_id INTEGER, seq INTEGER, bytes INTEGER, seconds REAL, status TEXT DEFAULT 'pending', text TEXT, engine TEXT, tries INTEGER DEFAULT 0, PRIMARY KEY (memo_id, seq));
       CREATE TABLE IF NOT EXISTS memo_audio (memo_id INTEGER, seq INTEGER, part INTEGER, data BLOB, PRIMARY KEY (memo_id, seq, part));
       CREATE TABLE IF NOT EXISTS embeddings (kind TEXT, ref INTEGER, hash TEXT, vec BLOB, PRIMARY KEY (kind, ref));
+      CREATE TABLE IF NOT EXISTS files (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, name TEXT, mime TEXT, bytes INTEGER, status TEXT, note_id INTEGER, method TEXT, pages INTEGER, chars INTEGER, error TEXT, updated INTEGER);
+      CREATE TABLE IF NOT EXISTS file_data (file_id INTEGER, part INTEGER, data BLOB, PRIMARY KEY (file_id, part));
+      CREATE TABLE IF NOT EXISTS note_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, note_id INTEGER, seq INTEGER, text TEXT, embedded INTEGER DEFAULT 0);
+      CREATE INDEX IF NOT EXISTS note_chunks_note ON note_chunks(note_id);
       CREATE TABLE IF NOT EXISTS id_docs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, holder TEXT, last4 TEXT, expires TEXT, author TEXT, notified INTEGER DEFAULT 100000);
     `);
     // 家人修改日記：記下最後是誰改的；個人日記的週記 span＝7（一篇涵蓋幾天）
@@ -728,6 +735,14 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     }
 
     // 語音備忘：開始一段錄音、上傳每一段（錄音每 5 分鐘一段；大的檔案切成好幾塊上傳）
+    // 知識庫上傳文件：開始、分塊上傳、下載原檔
+    const file = url.pathname.match(/^\/file\/(?:start|(\d+)(\/part)?)$/);
+    if (file) {
+      if (!this.isPersonal()) return Response.json({ ok: false, error: "上傳文件只有個人助理可以用" }, { status: 403 });
+      if (req.method === "POST" && !file[1]) return this.fileStart(req, user.name);
+      if (req.method === "POST" && file[2]) return this.filePart(Number(file[1]), url, req);
+      if (req.method === "GET" && file[1] && !file[2]) return this.fileDownload(Number(file[1]));
+    }
     const audio = url.pathname.match(/^\/memo\/(\d+)\/audio$/);
     if (audio && req.method === "GET") return this.memoAudio(Number(audio[1]), Number(url.searchParams.get("seq") ?? 0), req);
     const memo = url.pathname.match(/^\/memo\/(?:start|(\d+)\/seg)$/);
@@ -1100,8 +1115,28 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         this.sql.exec("UPDATE notes SET inbox = 0 WHERE id = ?", Number(msg.id));
         this.broadcastState();
         break;
-      case "note_delete":
-        this.sql.exec("DELETE FROM notes WHERE id = ?", Number(msg.id));
+      case "note_delete": {
+        // 連同切好的段落、上傳的原檔一起刪
+        const id = Number(msg.id);
+        this.dropNoteChunks(id);
+        for (const f of this.sql.exec("SELECT id FROM files WHERE note_id = ?", id).toArray()) this.deleteFile(Number(f.id));
+        this.sql.exec("DELETE FROM notes WHERE id = ?", id);
+        this.broadcastState();
+        break;
+      }
+      case "note_text": {
+        const row = this.sql.exec("SELECT content FROM notes WHERE id = ?", Number(msg.id)).toArray()[0];
+        if (!row) return reply(false, "找不到這筆");
+        this.send(ws, { type: "note_text", id: Number(msg.id), text: String(row.content ?? "") });
+        break;
+      }
+      case "file_retry":
+        this.sql.exec("UPDATE files SET status = 'processing', error = NULL, updated = ? WHERE id = ? AND status = 'error' AND EXISTS (SELECT 1 FROM file_data d WHERE d.file_id = files.id)", Date.now(), Number(msg.id));
+        this.broadcastState();
+        this.kickFiles();
+        break;
+      case "file_delete":
+        this.deleteFile(Number(msg.id));
         this.broadcastState();
         break;
       case "core_save":
@@ -1986,7 +2021,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   private async scheduleNext() {
     if (!this.profile()) return;
     const remind = this.sql.exec("SELECT MIN(due) AS due FROM reminders WHERE sent = 0").one().due as number | null;
-    const next = Math.min(remind ?? Infinity, this.isPersonal() ? Math.min(this.nextEventReminder() ?? Infinity, this.nextMemoWork() ?? Infinity) : Infinity);
+    const next = Math.min(remind ?? Infinity, this.isPersonal() ? Math.min(this.nextEventReminder() ?? Infinity, this.nextMemoWork() ?? Infinity, this.nextFileWork() ?? Infinity) : Infinity);
     const at = Math.max(Date.now() + 5_000, Math.min(next, Date.now() + 5 * 60_000));
     await this.ctx.storage.setAlarm(at);
   }
@@ -2008,6 +2043,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         await this.deliverEventReminders();
         await this.maybeDream(now);
         await this.processMemos();
+        await this.processFiles();
         await this.checkIdExpiry(now.date);
         await this.maybePersonalDiary(now);
         await this.syncEmbeddings();
@@ -2455,7 +2491,8 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             core: this.setting("core_profile"),
             memoryArchive: this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') NOT IN ('active', 'hypothesis') ORDER BY COALESCE(updated, ts) DESC LIMIT 60").toArray(),
             brief: this.latestBrief(),
-            notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb, inbox FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
+            notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb, inbox, file_id, LENGTH(COALESCE(content, '')) AS clen FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
+            files: this.sql.exec("SELECT id, ts, name, bytes, status, error, note_id FROM files WHERE status != 'done' ORDER BY id DESC LIMIT 20").toArray(),
             events: this.eventList(shiftDays(this.today(), -7), shiftDays(this.today(), 90)),
             cards: this.sql.exec("SELECT id, ts, kind, title, body FROM cards WHERE status = 'pending' ORDER BY ts DESC LIMIT 10").toArray(),
             dreamOps: this.sql.exec("SELECT id, ts, op, before, after, reason, undone FROM dream_ops ORDER BY id DESC LIMIT 20").toArray(),
@@ -2998,7 +3035,7 @@ ${transcript}
     if (!k) return { found: rows.length, notes: rows.filter((r) => r.kind === "note").slice(0, 8).map(fmt) };
     const words = k.split(/\s+/).filter(Boolean);
     const q = bigrams(k);
-    const sims = this.isPersonal() ? await this.similarity(k) : null;
+    const sims = this.isPersonal() ? await this.similarity(k, ["note", "doc", "chunk"]) : null;
     const scored = rows
       .map((r) => {
         const text = `${r.title} ${r.summary} ${r.content ?? ""} ${r.tags}`.toLowerCase();
@@ -3011,7 +3048,10 @@ ${transcript}
       .filter((x) => x.score >= 0.5)
       .sort((a, b) => b.score - a.score)
       .slice(0, 8);
-    return scored.length ? { found: scored.length, notes: scored.map((x) => fmt(x.r)) } : { found: 0, note: "知識庫裡找不到相關的內容" };
+    // 文件、錄音逐字稿裡最相關的原文段落：問細節要靠這個（摘要不會寫到每個條款）
+    const passages = this.isPersonal() ? this.searchPassages(words, sims) : [];
+    if (!scored.length && !passages.length) return { found: 0, note: "知識庫裡找不到相關的內容" };
+    return { found: scored.length, notes: scored.map((x) => fmt(x.r)), ...(passages.length ? { passages } : {}) };
   }
 
   // ================= 語意搜尋：知識庫、保管箱、記憶的向量（Workers AI bge-m3，存在這個空間自己的資料庫） =================
@@ -3053,7 +3093,7 @@ ${transcript}
     if (!this.isPersonal() || this.embedBusy) return;
     this.embedBusy = true;
     try {
-      const have = new Map(this.sql.exec("SELECT kind, ref, hash FROM embeddings").toArray().map((r) => [`${r.kind}:${r.ref}`, String(r.hash)]));
+      const have = new Map(this.sql.exec("SELECT kind, ref, hash FROM embeddings WHERE kind != 'chunk'").toArray().map((r) => [`${r.kind}:${r.ref}`, String(r.hash)]));
       const src = this.embedSources().map((x) => ({ ...x, hash: textHash(x.text) }));
       const live = new Set(src.map((x) => x.key));
       for (const k of have.keys()) {
@@ -3076,12 +3116,13 @@ ${transcript}
   }
 
   /** 問句跟每一筆的語意相似度（0–1）；Workers AI 不能用時回 null，搜尋就只看關鍵字 */
-  private async similarity(text: string): Promise<Map<string, number> | null> {
-    if (!this.sql.exec("SELECT 1 FROM embeddings LIMIT 1").toArray().length) return null;
+  private async similarity(text: string, kinds: string[]): Promise<Map<string, number> | null> {
+    const list = kinds.map(() => "?").join(", ");
+    if (!this.sql.exec(`SELECT 1 FROM embeddings WHERE kind IN (${list}) LIMIT 1`, ...kinds).toArray().length) return null;
     const q = (await this.embedTexts([text.slice(0, 500)]))?.[0];
     if (!q) return null;
     const out = new Map<string, number>();
-    for (const r of this.sql.exec("SELECT kind, ref, vec FROM embeddings").toArray()) out.set(`${r.kind}:${r.ref}`, cosine(q, new Float32Array(r.vec as ArrayBuffer)));
+    for (const r of this.sql.exec(`SELECT kind, ref, vec FROM embeddings WHERE kind IN (${list})`, ...kinds).toArray()) out.set(`${r.kind}:${r.ref}`, cosine(q, new Float32Array(r.vec as ArrayBuffer)));
     return out;
   }
 
@@ -3090,7 +3131,7 @@ ${transcript}
   private async prepareMemoryQuery(text: string) {
     this.memQuery = null;
     if (!text.trim() || this.memories().length <= 40) return;
-    const sims = await this.similarity(text);
+    const sims = await this.similarity(text, ["memory"]);
     if (sims) this.memQuery = { text, sims };
   }
 
@@ -3145,6 +3186,269 @@ ${transcript}
     this.broadcastState();
     this.kickMemos();
     return Response.json({ ok: true });
+  }
+
+  // ================= 知識庫上傳文件：Cloudflare 轉文字（免費）→ AI 整理重點 → 切段做語意搜尋 =================
+
+  private async fileStart(req: Request, author: string): Promise<Response> {
+    const fail = (error: string, status = 400) => Response.json({ ok: false, error }, { status });
+    const b = (await req.json().catch(() => ({}))) as { name?: string; size?: number };
+    const name = String(b.name ?? "").trim().replace(/[\\/\u0000-\u001f]/g, "_").slice(0, 120);
+    const ext = extOf(name);
+    if (!DOC_MIME[ext] && !TEXT_EXT.has(ext)) {
+      return fail(ext === "doc" || ext === "ppt" ? "舊版的 .doc／.ppt 讀不了，請先另存成 .docx／.pptx 或 PDF" : "這種檔案還不能讀：支援 PDF、Word、PPT、Excel、CSV、MD、TXT");
+    }
+    const size = Number(b.size) || 0;
+    if (size <= 0 || size > FILE_MAX_BYTES) return fail("檔案太大，單檔上限 20MB", 413);
+    const used = this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM file_data").one().n as number;
+    if (used + size > FILE_KEEP_BYTES) return fail("文件空間滿了（每人 300MB），請先刪掉一些不需要的文件", 507);
+    const id = this.sql
+      .exec("INSERT INTO files (ts, author, name, mime, bytes, status, updated) VALUES (?, ?, ?, ?, ?, 'uploading', ?) RETURNING id", Date.now(), author, name, DOC_MIME[ext] ?? "text/plain; charset=utf-8", size, Date.now())
+      .one().id as number;
+    this.broadcastState();
+    return Response.json({ ok: true, id });
+  }
+
+  private async filePart(id: number, url: URL, req: Request): Promise<Response> {
+    const fail = (error: string, status = 400) => Response.json({ ok: false, error }, { status });
+    const f = this.sql.exec("SELECT status FROM files WHERE id = ?", id).toArray()[0];
+    if (!f) return fail("找不到這個檔案", 404);
+    if (f.status !== "uploading") return fail("這個檔案已經傳完了", 409);
+    const part = Number(url.searchParams.get("part") ?? 0), parts = Number(url.searchParams.get("parts") ?? 1);
+    if (!Number.isInteger(part) || !Number.isInteger(parts) || parts < 1 || parts > 10 || part < 0 || part >= parts) return fail("上傳參數不正確");
+    const data = new Uint8Array(await req.arrayBuffer());
+    if (!data.byteLength || data.byteLength > 10_000_000) return fail("這一塊太大或是空的", 413);
+    // 資料庫一格最多 2MB：切成 1.5MB 一塊存（編號＝第幾塊上傳×100＋第幾小塊）
+    for (let off = 0, k = 0; off < data.byteLength; off += 1_500_000, k++) {
+      this.sql.exec("INSERT OR REPLACE INTO file_data (file_id, part, data) VALUES (?, ?, ?)", id, part * 100 + k, data.slice(off, off + 1_500_000).buffer);
+    }
+    const got = this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM file_data WHERE file_id = ?", id).one().n as number;
+    if (got > FILE_MAX_BYTES + 1_000_000) {
+      this.deleteFile(id);
+      this.broadcastState();
+      return fail("檔案太大，單檔上限 20MB", 413);
+    }
+    if (part === parts - 1) {
+      this.sql.exec("UPDATE files SET status = 'processing', bytes = ?, updated = ? WHERE id = ?", got, Date.now(), id);
+      this.broadcastState();
+      this.kickFiles();
+    }
+    return Response.json({ ok: true });
+  }
+
+  /** 下載原檔：一塊一塊串流出去 */
+  private fileDownload(id: number): Response {
+    const f = this.sql.exec("SELECT name, mime FROM files WHERE id = ?", id).toArray()[0];
+    const parts = this.sql.exec("SELECT part, LENGTH(data) AS n FROM file_data WHERE file_id = ? ORDER BY part", id).toArray().map((r) => Number(r.part));
+    if (!f || !parts.length) return new Response("檔案已經刪除", { status: 404 });
+    const total = this.sql.exec("SELECT SUM(LENGTH(data)) AS n FROM file_data WHERE file_id = ?", id).one().n as number;
+    const sql = this.sql;
+    let i = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (i >= parts.length) return controller.close();
+        controller.enqueue(new Uint8Array(sql.exec("SELECT data FROM file_data WHERE file_id = ? AND part = ?", id, parts[i++]).one().data as ArrayBuffer));
+      },
+    });
+    return new Response(body, {
+      headers: {
+        "content-type": String(f.mime || "application/octet-stream"),
+        "content-length": String(total),
+        "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(String(f.name))}`,
+        "cache-control": "private, max-age=3600",
+      },
+    });
+  }
+
+  private deleteFile(id: number) {
+    this.sql.exec("DELETE FROM file_data WHERE file_id = ?", id);
+    this.sql.exec("DELETE FROM files WHERE id = ?", id);
+  }
+
+  private fileBusy = false;
+  private kickFiles() {
+    this.ctx.waitUntil(this.processFiles());
+  }
+
+  private nextFileWork(): number | null {
+    return this.sql.exec("SELECT 1 FROM files WHERE status = 'processing' LIMIT 1").toArray().length ? Date.now() + 15_000 : null;
+  }
+
+  private async processFiles() {
+    if (this.fileBusy || !this.isPersonal()) return;
+    this.fileBusy = true;
+    try {
+      // 上傳到一半就斷掉（沒傳完）超過一天的：刪掉
+      for (const f of this.sql.exec("SELECT id FROM files WHERE status = 'uploading' AND updated < ?", Date.now() - 86400_000).toArray()) this.deleteFile(Number(f.id));
+      for (let i = 0; i < 5; i++) {
+        const f = this.sql.exec("SELECT * FROM files WHERE status = 'processing' ORDER BY id LIMIT 1").toArray()[0];
+        if (!f) break;
+        await this.readFile(f);
+      }
+      await this.embedChunks();
+    } catch (e) {
+      console.error("processFiles failed", e);
+    } finally {
+      this.fileBusy = false;
+    }
+  }
+
+  /** 讀一個上傳的檔案：轉文字 → 整理標題、重點、標籤 → 存進知識庫（全文＋原檔）→ 切段算向量 */
+  private async readFile(f: Record<string, SqlStorageValue>) {
+    const id = Number(f.id);
+    const name = String(f.name);
+    const ext = extOf(name);
+    try {
+      const bytes = concatBytes(this.sql.exec("SELECT data FROM file_data WHERE file_id = ? ORDER BY part", id).toArray().map((r) => new Uint8Array(r.data as ArrayBuffer)));
+      let text = "", pages = 0, method = "cloudflare";
+      if (TEXT_EXT.has(ext)) {
+        text = new TextDecoder().decode(bytes);
+        method = "text";
+      } else {
+        let md = "";
+        try {
+          const r = (await this.env.AI.toMarkdown([{ name, blob: new Blob([bytes], { type: DOC_MIME[ext] }) }])) as { format: string; data?: string; error?: string }[];
+          if (r[0]?.format === "error") throw new Error(r[0].error || "轉換失敗");
+          md = String(r[0]?.data ?? "");
+        } catch (e) {
+          // PPT 官方沒列在支援清單：轉不出來就自己解
+          if (ext !== "pptx") throw new Error(`這個檔案讀不出來（${String((e as Error)?.message ?? e).slice(0, 80)}）`);
+        }
+        if (md) ({ text, pages } = cleanMarkdown(md, ext));
+        if (ext === "pptx" && !text.trim()) {
+          text = await pptxText(bytes);
+          pages = (text.match(/【第 \d+ 張投影片】/g) || []).length;
+          method = "pptx";
+        }
+      }
+      // 掃描版 PDF（整頁是圖）或 Cloudflare 漏掉內文：改請 Gemini 看 PDF
+      if (ext === "pdf" && looksScanned(text, pages)) {
+        const scanned = await this.readPdfWithGemini(bytes);
+        if (scanned) {
+          text = scanned;
+          method = "gemini";
+        } else if (!text.replace(/【第 \d+ 頁】/g, "").trim()) {
+          throw new Error(
+            this.setting("voice_engine", "gemini") === "private"
+              ? "這份 PDF 是掃描檔（只有圖片），隱私模式不能請 Gemini 讀，請改成一般模式或傳文字版"
+              : "這份 PDF 是掃描檔（只有圖片），要有 Gemini 金鑰才能讀；額度用完的話晚點按重試",
+          );
+        }
+      }
+      if (!text.trim()) throw new Error("檔案裡沒有文字");
+      const owner = this.p().travelers[0]?.name || "使用者";
+      const priv = this.setting("voice_engine", "gemini") === "private";
+      const cap = priv ? 20_000 : 60_000;
+      const prompt = `下面是${owner}上傳的文件「${name}」的內容${pages ? `（${pages} ${ext === "pptx" ? "張投影片" : "頁"}）` : ""}。請整理成 JSON：
+{"title": "20 字內的標題，說清楚是什麼文件", "summary": "重點摘要，Markdown 條列 3–8 點，寫具體的數字、日期、金額、人名、條款", "tags": ["2–5 個標籤"]}
+只根據內容，不要編造。
+
+內容：
+${text.length > cap ? `${text.slice(0, cap)}\n…（後面省略）` : text}`;
+      let j: Record<string, any> = {};
+      try {
+        const system = "你是幫忙整理文件的助理，只根據內容，只輸出 JSON。";
+        const raw = priv
+          ? (await (await this.provider("workers-ai")).generate({ system, turns: [{ role: "user", parts: [{ text: prompt }] }], json: true, maxTokens: 2048 })).text
+          : await this.generateText(system, prompt, true, 1, 2048);
+        j = parseArgs(raw.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as Record<string, any>;
+      } catch (e) {
+        console.error("file summary failed", e);
+      }
+      const title = (String(j.title ?? "").trim() || name.replace(/\.[^.]+$/, "")).slice(0, 60);
+      const summary = String(j.summary ?? "").trim().slice(0, 3000) || "（AI 暫時不能整理重點，全文已經存好，可以直接問內容）";
+      const tags = (Array.isArray(j.tags) ? j.tags : []).map((t: unknown) => String(t).trim().slice(0, 20)).filter(Boolean).slice(0, 5);
+      const noteId = (this.noteSave({ title: `📄 ${title}`, summary, content: text.slice(0, 400_000), tags: [...new Set([...tags, "文件"])] }, String(f.author), false) as { saved_id?: number }).saved_id ?? 0;
+      this.sql.exec("UPDATE notes SET file_id = ? WHERE id = ?", id, noteId);
+      this.indexNoteChunks(noteId, text);
+      this.sql.exec("UPDATE files SET status = 'done', note_id = ?, method = ?, pages = ?, chars = ?, error = NULL, updated = ? WHERE id = ?", noteId, method, pages, text.length, Date.now(), id);
+      this.postAiMessage(
+        `📄 **文件整理好了｜${title}**\n\n${summary}\n\n全文和原檔已存進[知識庫](#note-${noteId})，可以直接問我裡面的內容。`,
+        { kind: "file" },
+      );
+      this.broadcastState();
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e).slice(0, 200);
+      console.error(`readFile ${name} failed`, msg);
+      this.sql.exec("UPDATE files SET status = 'error', error = ?, updated = ? WHERE id = ?", msg, Date.now(), id);
+      this.broadcastState();
+    }
+  }
+
+  /** 掃描版 PDF：請 Gemini 看整份 PDF 轉成文字（隱私模式、沒有金鑰、額度用完都回 null） */
+  private async readPdfWithGemini(bytes: Uint8Array): Promise<string | null> {
+    if (this.setting("voice_engine", "gemini") === "private") return null;
+    const key = (await this.keys()).gemini;
+    if (!key) return null;
+    try {
+      const media = bytes.byteLength <= GEMINI_INLINE_MAX
+        ? { mime: "application/pdf", data: toBase64(bytes.buffer as ArrayBuffer) }
+        : { mime: "application/pdf", uri: await uploadGeminiFile(key, bytes, "application/pdf") };
+      const r = await (await this.provider("gemini-own", 1, 30_000)).generate({
+        system: "你是把文件轉成文字的助手，只輸出文件內容。",
+        turns: [{ role: "user", parts: [{ media }, { text: "把這份 PDF 的內容完整轉成 Markdown：保留標題、條列和表格，每一頁開頭單獨一行寫【第 N 頁】。照片或圖表用一句話描述。不要摘要、不要加任何說明。" }] }],
+        timeoutMs: 300_000,
+      });
+      return r.text.replace(/^\s*```(?:markdown)?|```\s*$/g, "").replace(/^\s*【第 (\d+) 頁】\s*$/gm, "\n【第 $1 頁】\n").trim() || null;
+    } catch (e) {
+      console.error("readPdfWithGemini failed", String((e as Error)?.message ?? e).slice(0, 200));
+      return null;
+    }
+  }
+
+  /** 長文切段存起來（文件、錄音逐字稿），語意搜尋才找得到細節 */
+  private indexNoteChunks(noteId: number, text: string) {
+    this.dropNoteChunks(noteId);
+    chunkText(text).slice(0, 3000).forEach((t, i) => this.sql.exec("INSERT INTO note_chunks (note_id, seq, text) VALUES (?, ?, ?)", noteId, i, t));
+    this.ctx.waitUntil(this.embedChunks());
+  }
+
+  private dropNoteChunks(noteId: number) {
+    this.sql.exec("DELETE FROM embeddings WHERE kind = 'chunk' AND ref IN (SELECT id FROM note_chunks WHERE note_id = ?)", noteId);
+    this.sql.exec("DELETE FROM note_chunks WHERE note_id = ?", noteId);
+  }
+
+  private chunkBusy = false;
+  /** 還沒算向量的段落：一次 20 段，額度用完就等下次 */
+  private async embedChunks(max = 600) {
+    if (this.chunkBusy) return;
+    this.chunkBusy = true;
+    try {
+      for (let done = 0; done < max; ) {
+        const rows = this.sql.exec("SELECT id, text FROM note_chunks WHERE embedded = 0 ORDER BY id LIMIT 20").toArray();
+        if (!rows.length) break;
+        const vecs = await this.embedTexts(rows.map((r) => String(r.text).slice(0, 1500)));
+        if (!vecs) break;
+        rows.forEach((r, k) => {
+          this.sql.exec("INSERT OR REPLACE INTO embeddings (kind, ref, hash, vec) VALUES ('chunk', ?, '', ?)", r.id, vecs[k].buffer);
+          this.sql.exec("UPDATE note_chunks SET embedded = 1 WHERE id = ?", r.id);
+        });
+        done += rows.length;
+      }
+    } catch (e) {
+      console.error("embedChunks failed", e);
+    } finally {
+      this.chunkBusy = false;
+    }
+  }
+
+  /** 找原文段落：語意相近，或包含關鍵字 */
+  private searchPassages(words: string[], sims: Map<string, number> | null) {
+    const score = new Map<number, number>();
+    for (const [key, sim] of sims ?? []) {
+      if (!key.startsWith("chunk:")) continue;
+      const b = semanticBoost(sim);
+      if (b > 0) score.set(Number(key.slice(6)), b);
+    }
+    for (const w of words.filter((x) => x.length >= 2).slice(0, 4)) {
+      for (const r of this.sql.exec("SELECT id FROM note_chunks WHERE text LIKE ? LIMIT 30", `%${w}%`).toArray()) score.set(Number(r.id), (score.get(Number(r.id)) ?? 0) + 1);
+    }
+    return [...score]
+      .filter(([, s]) => s >= 0.5)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .flatMap(([id]) => this.sql.exec("SELECT c.note_id, c.text, n.title FROM note_chunks c JOIN notes n ON n.id = c.note_id WHERE c.id = ?", id).toArray())
+      .map((r) => ({ ref: `#note-${r.note_id}`, from: String(r.title), page: String(r.text).match(/^【第 (\d+) (?:頁|張投影片)】/)?.[1] ?? null, text: String(r.text).slice(0, 900) }));
   }
 
   /** 錄音超過上限：從最舊的（已經整理好的）開始刪音檔，逐字稿留著；還在排隊轉文字的不刪 */
@@ -3388,6 +3692,7 @@ ${body}`;
       this.sql.exec("UPDATE notes SET ts = ?, title = ?, summary = ?, content = ?, tags = ? WHERE id = ?", Date.now(), note.title, note.summary, note.content, JSON.stringify(note.tags), noteId);
       this.ctx.waitUntil(this.syncEmbeddings());
     } else noteId = (this.noteSave(note, String(m.author), false) as { saved_id?: number }).saved_id ?? 0;
+    if (noteId) this.indexNoteChunks(noteId, transcript);
     this.sql.exec(
       "UPDATE memos SET status = 'done', title = ?, summary = ?, actions = ?, transcript = ?, seconds = ?, engine = ?, note_id = ?, error = NULL, updated = ? WHERE id = ?",
       title, brief, JSON.stringify(actions), transcript, seconds, engine, noteId || null, Date.now(), id,
@@ -3752,6 +4057,7 @@ ${transcript || "（沒什麼對話）"}`;
       episodes: rows("SELECT date, summary, weekly FROM episodes ORDER BY date"),
       memos: rows("SELECT ts, title, seconds, summary, actions, transcript FROM memos WHERE status = 'done' ORDER BY ts"),
       id_docs: rows("SELECT kind, holder, last4, expires FROM id_docs ORDER BY expires"),
+      files: rows("SELECT ts, name, bytes, status, pages, chars FROM files ORDER BY ts"),
     };
   }
 
@@ -3797,7 +4103,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 問以前存過的文章、影片、資料、保管箱裡的照片文件 → search_notes；回答用到的內容在句尾加上來源連結，例如 [1](#note-12)（網址用結果裡的 ref）。
 - 行事曆：約會、會議、看診、上課、出遊、繳費截止這類「某天的事」→ add_event（產生確認卡片，按確認才寫入；說了提前提醒就填 remind_minutes）；問這週、某天有什麼事、有沒有空 → list_events；改時間、取消 → update_event／delete_event。只是「幾點提醒我做某件事」用 create_reminder。日期一律換成實際日期再填。
 - 證件到期（護照、身分證、駕照、健保卡…）→ id_expiry（action add）：只記種類、持有人、到期日和號碼末四碼，絕對不要記完整號碼；問哪些證件快到期 → id_expiry（action list）。
-- 錄音（語音備忘）整理好的會議記錄、逐字稿都存在知識庫：問開會、上課說了什麼 → search_notes。
+- 錄音（語音備忘）整理好的會議記錄、逐字稿，以及上傳的文件（PDF、Word、PPT、Excel…）都存在知識庫：問開會說了什麼、文件裡寫什麼 → search_notes。結果裡的 passages 是原文段落，回答細節要根據 passages，並附上來源連結；段落開頭有【第 N 頁】就說在第幾頁。
 - remember 只用來記之後還會用到的事。只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址都不要填。
 - 身分證字號、信用卡號、密碼這類敏感資料不要用 remember 記，也提醒${owner}不要在聊天裡傳。`;
   }

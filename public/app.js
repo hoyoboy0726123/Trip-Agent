@@ -49,6 +49,7 @@ const ICONS = {
 };
 ICONS.mic = '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8"/>';
 ICONS.notebook = '<rect width="16" height="20" x="4" y="2" rx="2"/><path d="M2 6h4M2 10h4M2 14h4M2 18h4M15 2v20"/>';
+ICONS.file = '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/>';
 ICONS.idcard = '<rect width="20" height="14" x="2" y="5" rx="2"/><circle cx="8" cy="12" r="2"/><path d="M14 10h4M14 14h4"/>';
 const svg = (name, cls = "") => `<svg viewBox="0 0 24 24" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>${ICONS[name] ?? ""}</svg>`;
 
@@ -212,6 +213,10 @@ function handle(m) {
     case "settings":
       S.settings = m.settings;
       if (["settings", "keys", "diary", "memo"].includes(S.panel)) renderPanel();
+      break;
+    case "note_text":
+      S.noteText[m.id] = m.text;
+      if (S.panel === "notes") renderPanel();
       break;
     case "memo_transcript":
       S.memoText[m.id] = m.text;
@@ -929,6 +934,7 @@ function moreActions() {
   if (isPersonal()) {
     return [
       ["camera", "拍照問", () => els.photoInput.click()],
+      ["file", "上傳文件", () => DOC_INPUT.click()],
       ["receipt", "收據記帳", receiptFlow],
       ["pin", "附上位置", () => attachLocation(false)],
       ["sun", "今天", () => ask("今天天氣如何？我有哪些提醒和待辦？")],
@@ -1779,12 +1785,19 @@ function renderNotesPanel(st, b) {
         <div class="row between" style="align-items:flex-start"><b class="note-title">${escapeHtml(n.title)}</b><span class="small muted" style="white-space:nowrap">${dayText(n.ts)}</span></div>
         ${tagsOf(n).length ? `<div class="note-tags">${tagsOf(n).map((t) => `<button type="button" class="tag" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</button>`).join("")}</div>` : ""}
         <div class="small msg-text note-body">${md(n.summary || "")}</div>
-        <div class="row" style="gap:6px;flex-wrap:wrap">${n.inbox ? `<button type="button" class="btn small primary-sm" data-file="${n.id}">✅ 收好</button>` : ""}${n.url ? `<a class="btn small" href="${escapeHtml(n.url)}" target="_blank" rel="noopener">開原始連結</a>` : ""}<button type="button" class="btn small" data-edit-note="${n.id}">改</button><button type="button" class="btn small" data-ask="${n.id}">問 AI</button><button type="button" class="btn danger small" data-del-note="${n.id}">刪除</button></div>
+        ${S.noteText[n.id] != null ? `<div class="note-full small msg-text">${md(S.noteText[n.id])}</div>` : ""}
+        <div class="row" style="gap:6px;flex-wrap:wrap">${n.inbox ? `<button type="button" class="btn small primary-sm" data-file="${n.id}">✅ 收好</button>` : ""}${n.clen > 300 ? `<button type="button" class="btn small" data-full="${n.id}">${S.noteText[n.id] != null ? "收起全文" : "看全文"}</button>` : ""}${n.file_id ? `<a class="btn small" href="/api/file/${n.file_id}?room=${ROOM}" target="_blank" rel="noopener">原檔</a>` : ""}${n.url ? `<a class="btn small" href="${escapeHtml(n.url)}" target="_blank" rel="noopener">開原始連結</a>` : ""}<button type="button" class="btn small" data-edit-note="${n.id}">改</button><button type="button" class="btn small" data-ask="${n.id}">問 AI</button><button type="button" class="btn danger small" data-del-note="${n.id}">刪除</button></div>
       </div>`;
   b.innerHTML = `
     ${backToHub()}
     <div class="seg-tabs"><button type="button" class="on">📚 筆記與連結</button><button type="button" data-go-docs>🗂 照片文件</button></div>
-    <p class="small muted">在聊天貼 Facebook／Instagram Reels 或網頁連結，AI 會看完幫你整理重點存進來（影片也看得到）。之後在聊天問「之前存的那個…」也找得到，回答會附上來源。</p>
+    <p class="small muted">在聊天貼 Facebook／Instagram Reels 或網頁連結，AI 會看完幫你整理重點存進來（影片也看得到）。也可以上傳文件，之後在聊天問「之前存的那個…」「合約裡怎麼寫…」都找得到，回答會附上來源。</p>
+    <div class="card file-up">
+      <button type="button" class="btn big-btn" id="doc-up">${svg("file")}上傳文件</button>
+      <div class="small muted">PDF、Word、PPT、Excel、CSV、MD、TXT，單檔 20MB 內。AI 讀完會整理重點，全文也存著。</div>
+      ${(st.files || []).map((f) => `<div class="file-row small"><span>📄 ${escapeHtml(f.name)}</span><span class="${f.status === "error" ? "bad-text" : "muted"}">${f.status === "uploading" ? "上傳中…" : f.status === "processing" ? "AI 讀取整理中…" : `⚠️ ${escapeHtml(f.error || "失敗")}`}</span>
+        ${f.status === "error" ? `<span class="row" style="gap:6px"><button type="button" class="btn small" data-file-retry="${f.id}">重試</button><button type="button" class="btn small danger" data-file-del="${f.id}">刪除</button></span>` : ""}</div>`).join("")}
+    </div>
     <details class="card" id="note-add-box" ${S.noteAddOpen ? "open" : ""}><summary><b>＋ 新增筆記</b></summary>
       <form class="form" id="note-add" style="margin-top:8px">
         <input name="title" placeholder="標題" required />
@@ -1809,6 +1822,18 @@ function renderNotesPanel(st, b) {
   });
   b.querySelectorAll("[data-tag]").forEach((x) => x.addEventListener("click", () => { S.noteQuery = x.dataset.tag; renderPanel(); }));
   $("[data-go-docs]", b).addEventListener("click", () => openPanel("tickets"));
+  $("#doc-up", b).addEventListener("click", () => DOC_INPUT.click());
+  b.querySelectorAll("[data-file-retry]").forEach((x) => x.addEventListener("click", () => action({ action: "file_retry", id: Number(x.dataset.fileRetry) })));
+  b.querySelectorAll("[data-file-del]").forEach((x) => x.addEventListener("click", () => action({ action: "file_delete", id: Number(x.dataset.fileDel) })));
+  b.querySelectorAll("[data-full]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const id = Number(x.dataset.full);
+      if (S.noteText[id] != null) {
+        delete S.noteText[id];
+        renderPanel();
+      } else action({ action: "note_text", id });
+    }),
+  );
   $("#note-add-box", b).addEventListener("toggle", (e) => (S.noteAddOpen = e.target.open));
   $("#note-add", b).addEventListener("submit", (e) => {
     e.preventDefault();
@@ -1872,7 +1897,7 @@ function renderPersonalSettings(st, b) {
       <button class="btn small" id="brief-now" style="margin-top:8px">現在發一次</button>
     </div>
     <div class="card"><h3>🎙️ 語音與日記</h3>
-      <label class="row between small"><span>語音轉文字</span><select id="set-voice"><option value="gemini" ${s.voiceEngine !== "private" ? "selected" : ""}>Gemini 優先</option><option value="private" ${s.voiceEngine === "private" ? "selected" : ""}>隱私模式（只用 Cloudflare）</option></select></label>
+      <label class="row between small"><span>錄音、文件用的 AI</span><select id="set-voice"><option value="gemini" ${s.voiceEngine !== "private" ? "selected" : ""}>Gemini 優先</option><option value="private" ${s.voiceEngine === "private" ? "selected" : ""}>隱私模式（只用 Cloudflare）</option></select></label>
       <div class="small muted" style="margin:2px 0 8px">${VOICE_HINT(s)}</div>
       <label class="row between small"><span>自動寫日記</span><select id="set-diary">${DIARY_MODES.map(([v, t]) => `<option value="${v}" ${(s.diaryMode || "weekly") === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
     </div>
@@ -2101,7 +2126,7 @@ function toolCards() {
   if (isPersonal()) {
     return [
       ["calendar", "calendar", "行事曆", "行程、提醒、訂閱到手機日曆"],
-      ["notes", "book", "知識庫", "連結、筆記、照片文件"],
+      ["notes", "book", "知識庫", "連結、筆記、文件、照片"],
       ["memo", "mic", "語音備忘", "錄音、會議記錄自動整理"],
       ["checklist", "list", "清單", "待辦、購物"],
       ["reminders", "bell", "提醒", "時間到通知你"],
@@ -2175,9 +2200,9 @@ function renderToolPanel(st, b) {
 
 const VOICE_HINT = (s) =>
   s.voiceEngine === "private"
-    ? "錄音和摘要都不經過 Google；每天能轉的時數比較少（整個網站共用），摘要也比較簡單。"
+    ? "錄音、文件都不經過 Google；每天能轉的時數比較少（整個網站共用），摘要也比較簡單，掃描版 PDF 讀不了。"
     : s.gemini
-      ? "用你的 Gemini 金鑰轉文字（中文比較準），額度用完自動改用 Cloudflare Whisper。免費版 Gemini 的內容可能被 Google 拿去改進產品，在意的話選隱私模式。"
+      ? "錄音用你的 Gemini 金鑰轉文字（中文比較準），額度用完自動改用 Cloudflare Whisper；文件的重點也由 Gemini 整理。免費版 Gemini 的內容可能被 Google 拿去改進產品，在意的話選隱私模式。"
       : "還沒填 Gemini 金鑰，會用 Cloudflare Whisper 轉文字。";
 const DIARY_MODES = [["weekly", "每週一篇（週一早上）"], ["daily", "每天一篇（隔天早上）"], ["off", "不要自動寫"]];
 const SEG_MS = 5 * 60_000;
@@ -2497,6 +2522,52 @@ function renderMemoPanel(st, b) {
   b.querySelectorAll("[data-memo-del]").forEach((x) =>
     x.addEventListener("click", () => confirm("刪除這段錄音？（已經存進知識庫的逐字稿會保留）") && action({ action: "memo_delete", id: Number(x.dataset.memoDel) })),
   );
+}
+
+// ---------- 📄 知識庫上傳文件 ----------
+
+const DOC_ACCEPT = ".pdf,.docx,.pptx,.xlsx,.xls,.csv,.md,.markdown,.txt,.odt,.ods,.html,.htm";
+const DOC_INPUT = Object.assign(document.createElement("input"), { type: "file", multiple: true, accept: DOC_ACCEPT });
+S.noteText = {};
+DOC_INPUT.addEventListener("change", async () => {
+  const files = [...DOC_INPUT.files];
+  DOC_INPUT.value = "";
+  for (const f of files) await uploadDoc(f);
+});
+
+async function uploadDoc(file) {
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  let blob = file;
+  // 純文字、CSV 可能是舊的 Big5 編碼：先轉成 UTF-8 再上傳
+  if (["md", "markdown", "txt", "csv"].includes(ext)) {
+    const buf = await file.arrayBuffer();
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    } catch {
+      text = new TextDecoder("big5").decode(buf);
+    }
+    blob = new Blob([text.replace(/^\uFEFF/, "")], { type: ext === "csv" ? "text/csv" : "text/plain" });
+  }
+  if (blob.size > 20_000_000) return alert(`「${file.name}」太大，單檔上限 20MB`);
+  const r = await api("/api/file/start", { name: file.name, size: blob.size });
+  if (!r.ok) return alert(r.error || "上傳失敗");
+  const parts = Math.max(1, Math.ceil(blob.size / UPLOAD_PART));
+  for (let k = 0; k < parts; k++) {
+    for (let tries = 0; ; tries++) {
+      try {
+        const res = await fetch(`/api/file/${r.id}/part?part=${k}&parts=${parts}`, { method: "POST", headers: { "content-type": "application/octet-stream" }, body: blob.slice(k * UPLOAD_PART, (k + 1) * UPLOAD_PART) });
+        if (res.ok || res.status === 409) break;
+        if (res.status < 500 || tries >= 3) {
+          const e = await res.json().catch(() => ({}));
+          return alert(e.error || "上傳失敗");
+        }
+      } catch {
+        if (tries >= 3) return alert("網路不穩，上傳失敗，請再試一次");
+      }
+      await new Promise((ok) => setTimeout(ok, 2000 * (tries + 1)));
+    }
+  }
 }
 
 // ---------- 🪪 證件到期 ----------

@@ -1104,7 +1104,8 @@ export const TOOLS: Tool[] = [
     decl: {
       name: "search_notes",
       description:
-        "從知識庫找以前存過的文章、影片、筆記，以及保管箱裡的照片文件（例如「之前存的那個 3D 開源專案叫什麼」）。" +
+        "從知識庫找以前存過的文章、影片、筆記、上傳的文件（PDF、Word、PPT、Excel…）、錄音逐字稿，以及保管箱裡的照片文件（例如「之前存的那個 3D 開源專案叫什麼」「租屋合約的違約金怎麼算」）。" +
+        "結果裡的 passages 是文件和逐字稿中最相關的原文段落，問細節要根據 passages 回答；段落開頭有【第 N 頁】就說在第幾頁。" +
         "回答用到這些內容時，句尾加上來源連結，例如 [1](#note-12)、[2](#doc-3)（網址用結果裡的 ref）。",
       parameters: { type: "object", properties: { keyword: { type: "string", description: "關鍵字，留空＝最近存的" } } },
     },

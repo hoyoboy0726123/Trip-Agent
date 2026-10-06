@@ -319,6 +319,12 @@ export default {
       }
 
       // 語音備忘：開始錄音、上傳每一段（錄音每 5 分鐘一段，大檔切成好幾塊）
+      // 知識庫上傳文件：開始、分塊上傳、下載原檔（下載連結帶 ?room=）
+      const file = path.match(/^\/api\/file\/(start|\d+\/part|\d+)$/);
+      if (file && (req.method === "POST" || req.method === "GET")) {
+        return room.fetch(new Request(`https://room/file/${file[1]}${url.search}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));
+      }
+
       // 回放錄音（<audio> 帶不了標頭：網址上的 ?room= 指定空間；Range 標頭照轉）
       const memoAudio = path.match(/^\/api\/memo\/(\d+)\/audio$/);
       if (memoAudio && req.method === "GET") return room.fetch(new Request(`https://room/memo/${memoAudio[1]}/audio${url.search}`, { headers }));

@@ -36,7 +36,7 @@ const MEMO_KEEP_DAYS = 30;
 const MEMO_KEEP_BYTES = 400_000_000;
 const AUDIO_MIME = /^(audio\/[\w.+-]+|video\/(mp4|webm|quicktime))$/;
 const TRANSCRIBE_PROMPT =
-  "逐字轉錄這段錄音：繁體中文（台灣用語），加上標點符號。換人說話時換行，開頭標「說話者A：」「說話者B：」（只有一個人說話就不用標）。" +
+  "逐字轉錄這段錄音：繁體中文（台灣用語），標點用全形（，。？！）。每次換人說話都要另起一行，行首寫「說話者A：」「說話者B：」，同一行只能有一個說話者（只有一個人說話就不用標）。" +
   "聽不清楚的地方寫（聽不清楚），不要猜、不要摘要、不要加任何說明。完全沒有人說話就只輸出「（沒有聲音）」。";
 /** 證件到期前幾天提醒；護照出國通常要 6 個月以上效期 */
 const ID_STEPS = [90, 30, 7, 0];
@@ -143,6 +143,22 @@ function geminiMime(mime: string): string {
   if (/wav/.test(mime)) return "audio/wav";
   if (mime === "video/quicktime") return "video/mov";
   return mime;
+}
+
+/**
+ * 逐字稿排版：模型常常把「說話者A：…說話者B：…」擠在同一行，一律在每個說話者前換行；
+ * 中文旁邊的半形逗號、問號、驚嘆號換成全形
+ */
+export function formatTranscript(text: string): string {
+  return text
+    .replace(/\s*說話者\s*([A-Za-z0-9甲乙丙丁一二三四五六])\s*[:：]\s*/g, (_, k: string) => `\n說話者${k.toUpperCase()}：`)
+    .replace(/([\u3400-\u9fff])\s*,\s*/g, "$1，")
+    .replace(/,\s*([\u3400-\u9fff])/g, "，$1")
+    .replace(/([\u3400-\u9fff])\s*\?/g, "$1？")
+    .replace(/([\u3400-\u9fff])\s*!/g, "$1！")
+    .replace(/】\s*\n+/g, "】\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 /** 秒數 → 1:02:03／12:34 */
@@ -1323,9 +1339,15 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         break;
       }
       case "memo_transcript": {
-        const row = this.sql.exec("SELECT transcript FROM memos WHERE id = ?", Number(msg.id)).toArray()[0];
+        const row = this.sql.exec("SELECT transcript, note_id FROM memos WHERE id = ?", Number(msg.id)).toArray()[0];
         if (!row) return reply(false, "找不到這段錄音");
-        this.send(ws, { type: "memo_transcript", id: Number(msg.id), text: String(row.transcript ?? "") });
+        // 排版規則更新前存的逐字稿：打開時重排一次，知識庫那筆也一起更新
+        const text = formatTranscript(String(row.transcript ?? ""));
+        if (text !== row.transcript) {
+          this.sql.exec("UPDATE memos SET transcript = ? WHERE id = ?", text, Number(msg.id));
+          if (row.note_id) this.sql.exec("UPDATE notes SET content = ? WHERE id = ?", text.slice(0, 300_000), row.note_id);
+        }
+        this.send(ws, { type: "memo_transcript", id: Number(msg.id), text });
         break;
       }
       case "memo_retry":
@@ -3231,7 +3253,7 @@ ${transcript}
     let limited = 0;
     for (const engine of audio.byteLength ? engines : []) {
       try {
-        const text = engine === "gemini" ? await this.transcribeGemini(audio, mime, seconds) : await this.transcribeWhisper(audio);
+        const text = formatTranscript(engine === "gemini" ? await this.transcribeGemini(audio, mime, seconds) : await this.transcribeWhisper(audio));
         this.sql.exec("UPDATE memo_segs SET status = 'done', text = ?, engine = ? WHERE memo_id = ? AND seq = ?", text, engine, memoId, seq);
         this.sql.exec("UPDATE memos SET done_segs = done_segs + 1, error = NULL, updated = ? WHERE id = ?", Date.now(), memoId);
         this.broadcastState();

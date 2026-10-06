@@ -2381,6 +2381,24 @@ addEventListener("beforeunload", (e) => {
   }
 });
 
+// 逐字稿：一句一行，說話者用不同顏色的小圓標；【5:00】這類分段時間做成分隔線
+function transcriptHtml(text) {
+  const who = {};
+  return String(text)
+    .split(/\n+/)
+    .map((line) => {
+      const t = line.trim();
+      if (!t) return "";
+      const time = t.match(/^【([\d:]+)】$/);
+      if (time) return `<div class="tr-time">${escapeHtml(time[1])}</div>`;
+      const m = t.match(/^說話者(\S)：\s*(.*)$/);
+      if (!m) return `<p>${escapeHtml(t)}</p>`;
+      who[m[1]] ??= Object.keys(who).length % 4;
+      return `<p class="tr-turn"><b class="spk spk-${who[m[1]]}">${escapeHtml(m[1])}</b><span>${escapeHtml(m[2])}</span></p>`;
+    })
+    .join("");
+}
+
 function renderMemoPanel(st, b) {
   els.panelTitle.textContent = "🎙️ 語音備忘";
   const s = S.settings || {};
@@ -2416,7 +2434,7 @@ function renderMemoPanel(st, b) {
           ${failed && m.status === "done" ? `<button type="button" class="btn small" data-memo-retry="${m.id}" style="margin-top:6px">重轉失敗的 ${failed} 段</button>` : ""}
         </div>`;
       })()}
-      ${text != null ? `<div class="transcript small">${escapeHtml(text)}</div>` : ""}
+      ${text != null ? `<div class="transcript small">${transcriptHtml(text)}</div>` : ""}
       <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:6px">
         ${m.status === "done" ? `<button type="button" class="btn small" data-memo-text="${m.id}">${text != null ? "收起逐字稿" : "看逐字稿"}</button>` : ""}
         ${m.note_id ? `<a class="btn small" href="#note-${m.note_id}">在知識庫</a>` : ""}

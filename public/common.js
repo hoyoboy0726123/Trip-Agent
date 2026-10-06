@@ -6,7 +6,7 @@ const ROOM = (location.pathname.match(/^\/t\/([a-z0-9]{6,20})\/?$/) || [])[1] ||
 
 const S = {
   room: ROOM, me: null, aiName: "旅伴 AI", settings: {}, state: null, trip: null, tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
-  status: null, ws: null, retry: 0, oldest: null, pending: { photo: null, photoUrl: null, location: null },
+  status: null, ws: null, retry: 0, oldest: null, pending: { photos: [], location: null },
   live: new Map(), panel: null, lastDay: null, offline: false,
 };
 

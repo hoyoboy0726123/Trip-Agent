@@ -10,6 +10,9 @@ export interface DiaryDay {
   plan: string; // 當天行程
   text: string;
   photos: DiaryPhoto[];
+  /** 個人日記：章節標籤（週記／日記）與日期文字，取代 DAY N */
+  label?: string;
+  when?: string;
 }
 
 export interface DiaryPhoto {
@@ -33,6 +36,12 @@ export interface DiaryPageInput {
   autoPrint: boolean;
   /** 「回聊天」找不到上一頁時要去的網址 */
   homeUrl?: string;
+  /** 個人日記：封面小標、頁尾、統計單位（篇）、頁面標題後綴、不顯示分享 */
+  kicker?: string;
+  footer?: string;
+  unit?: string;
+  suffix?: string;
+  noShare?: boolean;
 }
 
 const esc = (s: unknown) =>
@@ -98,16 +107,16 @@ export function renderDiaryPage(p: DiaryPageInput): string {
   const cover = [...days].reverse().find((d) => d.photos.length)?.photos[0]?.src ?? "";
   const firstText = paragraphs(days[0]?.text ?? "")[0] ?? "";
   const ogImage = p.mode === "share" && cover ? p.origin + cover : "";
-  const pageTitle = `${p.tripTitle}｜旅遊日記`;
+  const pageTitle = p.suffix === "" ? p.tripTitle : `${p.tripTitle}｜${p.suffix ?? "旅遊日記"}`;
 
   const toc = days.length > 1
-    ? `<nav class="toc">${days.map((d) => `<a href="#${d.date}"><b>Day ${d.dayNo}</b>${esc(d.title)}</a>`).join("")}</nav>`
+    ? `<nav class="toc">${days.map((d) => `<a href="#${d.date}"><b>${d.label ? esc(d.when ?? dateText(d.date)) : `Day ${d.dayNo}`}</b>${esc(d.title)}</a>`).join("")}</nav>`
     : "";
   const chapters = days.length
     ? days
         .map(
           (d) => `<article class="day" id="${d.date}">
-  <div class="day-head"><span class="day-no">DAY ${d.dayNo}</span><span>${dateText(d.date)}</span></div>
+  <div class="day-head"><span class="day-no">${d.label ? esc(d.label) : `DAY ${d.dayNo}`}</span><span>${esc(d.when ?? dateText(d.date))}</span></div>
   <h2>${esc(d.title)}</h2>
   ${d.plan ? `<p class="plan">📍 ${esc(d.plan)}</p>` : ""}
   <div class="text">${dayBody(d)}</div>
@@ -204,20 +213,20 @@ footer{text-align:center;color:var(--muted);font-size:13px;padding:28px 0 8px}
 <header class="cover${cover ? "" : " plain"}">
   ${cover ? `<img class="cover-img" src="${esc(cover)}" alt="">` : ""}
   <div class="cover-in">
-    <div class="kicker">TRAVEL DIARY ・ 旅遊日記</div>
+    <div class="kicker">${esc(p.kicker ?? "TRAVEL DIARY ・ 旅遊日記")}</div>
     <h1>${esc(p.tripTitle)}</h1>
     <p class="meta">${esc(p.dates)}${p.travelers ? `　${esc(p.travelers)}` : ""}</p>
-    <span class="stats">已記錄 ${days.length} 天・${photoCount} 張照片</span>
+    <span class="stats">已記錄 ${days.length} ${esc(p.unit ?? "天")}・${photoCount} 張照片</span>
   </div>
 </header>
 ${toc}
 <main>${chapters}</main>
-<footer>由旅伴 AI 根據群組對話與照片整理</footer>
+<footer>${esc(p.footer ?? "由旅伴 AI 根據群組對話與照片整理")}</footer>
 </div>
 <div class="bar">
   ${p.mode === "member" ? `<button type="button" onclick="goBack()">← 回聊天</button>` : ""}
   <button type="button" onclick="pdf()">下載 PDF</button>
-  <button type="button" class="main" onclick="share()">分享</button>
+  ${p.noShare ? "" : `<button type="button" class="main" onclick="share()">分享</button>`}
 </div>
 <div class="lb" id="lb" onclick="this.classList.remove('on')"><img alt=""></div>
 <div class="toast" id="toast"></div>

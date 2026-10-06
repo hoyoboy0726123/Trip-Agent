@@ -14,6 +14,9 @@ export interface RoomApi {
   /** 個人助理知識庫 */
   noteSave(n: { title: string; summary: string; content?: string; url?: string; tags?: string[]; thumb?: string }, author: string): unknown;
   noteSearch(keyword: string): unknown;
+  /** 證件到期（只記種類、持有人、到期日、末四碼） */
+  idDocAdd(d: { kind?: unknown; holder?: unknown; expires?: unknown; last4?: unknown }, author: string): unknown;
+  idDocList(): unknown;
   /** 行事曆 */
   eventList(from: string, to: string): unknown[];
   eventGet(id: number): (EventInput & { id: number }) | null;
@@ -1110,6 +1113,30 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    label: "🪪 證件到期",
+    decl: {
+      name: "id_expiry",
+      description:
+        "記錄證件（護照、身分證、駕照、健保卡、居留證…）的到期日，到期前會在聊天和手機通知提醒（護照提前 6 個月，其他提前 3 個月）。" +
+        "只記種類、持有人、到期日和號碼末四碼，絕對不要記完整證件號碼。action=list 列出已記錄的證件和剩幾天。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["add", "list"] },
+          kind: { type: "string", description: "證件種類，例如 護照、身分證、駕照" },
+          holder: { type: "string", description: "持有人（照對話裡的稱呼，例如 我、小美）" },
+          expires: { type: "string", description: "到期日 YYYY-MM-DD；只知道年月就填 YYYY-MM" },
+          last4: { type: "string", description: "號碼末四碼（可留空，不要填完整號碼）" },
+        },
+        required: ["action"],
+      },
+    },
+    async run(args, { room, author }) {
+      if (args.action !== "add") return room.idDocList();
+      return room.idDocAdd({ kind: args.kind, holder: args.holder, expires: args.expires, last4: args.last4 }, author);
+    },
+  },
+  {
     label: "🧠 記住",
     decl: {
       name: "remember",
@@ -1728,7 +1755,7 @@ const TRAVEL_ONLY = new Set([
 ]);
 
 /** 只有個人助理才有的工具 */
-const PERSONAL_ONLY = new Set(["save_note", "search_notes", "add_event", "list_events", "update_event", "delete_event"]);
+const PERSONAL_ONLY = new Set(["save_note", "search_notes", "add_event", "list_events", "update_event", "delete_event", "id_expiry"]);
 
 /** 這個空間可以用的工具（有些只在特定國家提供，個人助理不給旅遊專用的） */
 export function toolDecls(p: TripProfile): ToolDecl[] {

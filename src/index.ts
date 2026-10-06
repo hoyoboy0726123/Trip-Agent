@@ -229,6 +229,15 @@ export default {
       return roomStub(env, ics[1]).fetch(new Request(`https://room/ics/${ics[2]}.ics`));
     }
 
+    // ---------- 個人助理的分享收件網址（iPhone 捷徑）：不用登入，收不收由網址裡的密語決定 ----------
+    const inbox = path.match(/^\/in\/([a-z0-9]+)\/([\w-]+)$/);
+    if (inbox && req.method === "POST") {
+      if (!ROOM_ID.test(inbox[1])) return new Response("Not found", { status: 404 });
+      return roomStub(env, inbox[1]).fetch(
+        new Request(`https://room/inbox/${inbox[2]}`, { method: "POST", headers: { "content-type": req.headers.get("content-type") ?? "" }, body: req.body }),
+      );
+    }
+
     // ---------- 旅遊日記分享連結：不用登入，看不看得到由那個旅程的分享碼決定（管理員可隨時關閉） ----------
     const share = path.match(/^\/share\/([a-z0-9]+)\/([\w-]+(?:\/photo\/[\w-]+)?)$/);
     if (share && req.method === "GET") {
@@ -307,6 +316,12 @@ export default {
       if (direct[path]) {
         headers.set("x-origin", url.origin);
         return room.fetch(new Request(`https://room${direct[path]}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));
+      }
+
+      // 語音備忘：開始錄音、上傳每一段（錄音每 5 分鐘一段，大檔切成好幾塊）
+      const memo = path.match(/^\/api\/memo\/(start|\d+\/seg)$/);
+      if (memo && req.method === "POST") {
+        return room.fetch(new Request(`https://room/memo/${memo[1]}${url.search}`, { method: "POST", headers, body: req.body }));
       }
 
       if (path === "/api/photo" && req.method === "POST") {

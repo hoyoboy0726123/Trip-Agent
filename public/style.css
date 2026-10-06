@@ -489,3 +489,20 @@ details.guide li + li { margin-top: 4px; }
 .showcase-zh { font-size: 16px; color: #888; }
 .showcase-actions { display: flex; gap: 10px; margin-top: auto; }
 .showcase-actions .btn { flex: 1; padding: 14px; font-size: 17px; background: #f2f2f2; color: #000; }
+
+/* 第四階段：語音備忘、證件到期、今天頁的提醒列 */
+.rec-card { display: grid; gap: 8px; }
+.rec-card .primary, .rec-card .big-btn { width: 100%; }
+.rec-card label.btn { display: block; text-align: center; cursor: pointer; }
+.rec-live { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 6px 0; }
+.rec-dot { width: 14px; height: 14px; border-radius: 50%; background: #dc2626; animation: pulse 1.2s infinite; }
+.rec-time { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.memo-acts { display: grid; gap: 4px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.memo-act { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.memo-act > span { min-width: 0; overflow-wrap: anywhere; }
+.transcript { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow-y: auto; margin-top: 8px; padding: 10px; border-radius: 10px; background: var(--bg); line-height: 1.7; }
+.id-doc { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.id-doc.warn { border-left: 4px solid #f59e0b; }
+.id-doc.bad { border-left: 4px solid #dc2626; }
+.bad-text { color: #dc2626; }
+.link-row { display: flex; justify-content: space-between; gap: 8px; width: 100%; border: 0; background: transparent; padding: 4px 0; text-align: left; color: inherit; font: inherit; }

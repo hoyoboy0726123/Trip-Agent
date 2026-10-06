@@ -47,6 +47,9 @@ const ICONS = {
   copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
   pushpin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
 };
+ICONS.mic = '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v4M8 21h8"/>';
+ICONS.notebook = '<rect width="16" height="20" x="4" y="2" rx="2"/><path d="M2 6h4M2 10h4M2 14h4M2 18h4M15 2v20"/>';
+ICONS.idcard = '<rect width="20" height="14" x="2" y="5" rx="2"/><circle cx="8" cy="12" r="2"/><path d="M14 10h4M14 14h4"/>';
 const svg = (name, cls = "") => `<svg viewBox="0 0 24 24" aria-hidden="true"${cls ? ` class="${cls}"` : ""}>${ICONS[name] ?? ""}</svg>`;
 
 // ================= 進入旅程 =================
@@ -176,6 +179,11 @@ function handle(m) {
       S.lastDay = null;
       S.live.clear();
       m.messages.forEach((msg) => appendMessage(msg));
+      const shared = new URLSearchParams(location.search).get("share");
+      if (shared && isPersonal()) {
+        history.replaceState(null, "", location.pathname);
+        S.ws.send(JSON.stringify({ type: "send", text: `存到知識庫：${shared.slice(0, 4000)}` }));
+      }
       S.oldest = m.messages[0]?.ts ?? null;
       els.loadMore.hidden = m.messages.length < 60;
       restoreReadPosition();
@@ -203,7 +211,11 @@ function handle(m) {
       break;
     case "settings":
       S.settings = m.settings;
-      if (S.panel === "settings" || S.panel === "keys" || S.panel === "diary") renderPanel();
+      if (["settings", "keys", "diary", "memo"].includes(S.panel)) renderPanel();
+      break;
+    case "memo_transcript":
+      S.memoText[m.id] = m.text;
+      if (S.panel === "memo") renderPanel();
       break;
     case "state":
       setState(m.state);
@@ -273,6 +285,7 @@ function handle(m) {
           }
         }
       }
+      if (m.action === "diary_now" && S.panel === "diary") renderPanel();
       if (!m.ok && m.error) alert(m.error);
       else if (m.ok && m.action === "reset") alert("已清除 ✅");
       else if (m.ok && m.action === "update_profile") alert("已儲存 ✅");
@@ -1237,6 +1250,8 @@ function renderPanelInner() {
     if (S.panel === "memories") return renderPersonalMemories(st, b);
     if (S.panel === "notes") return renderNotesPanel(st, b);
     if (S.panel === "calendar") return renderCalendarPanel(st, b);
+    if (S.panel === "memo") return renderMemoPanel(st, b);
+    if (S.panel === "iddocs") return renderIdDocsPanel(st, b);
   }
   if (["hub", "guide", "travel", "map", "checklist", "tickets", "reminders", "diary", "diary-edit"].includes(S.panel)) return renderToolPanel(st, b);
   switch (S.panel) {
@@ -1438,6 +1453,15 @@ function renderTodayPanel(st, b) {
           : `<div class="small muted">接下來沒有行程。在聊天說「下週三下午 3 點看牙醫」就會加進來。</div>`;
       })()}
     </div>
+    ${(() => {
+      const ids = (st.idDocs || []).filter((d) => d.days <= 60);
+      const busy = (st.memos || []).filter((x) => x.status === "recording" || x.status === "processing");
+      if (!ids.length && !busy.length) return "";
+      return `<div class="card today-card">
+        ${ids.map((d) => `<button type="button" class="item small link-row" data-go="iddocs">🪪 ${escapeHtml(d.holder)}的${escapeHtml(d.kind)}${d.days < 0 ? `<b class="bad-text">已過期</b>` : `<b>${d.days} 天後到期</b>`}</button>`).join("")}
+        ${busy.map((x) => `<button type="button" class="item small link-row" data-go="memo">🎙️ ${escapeHtml(memoStatus(x))}</button>`).join("")}
+      </div>`;
+    })()}
     <div class="card today-card">
       <div class="row between"><h3>☀️ 早報</h3>${brief ? "" : `<button class="btn small" id="td-brief">現在產生</button>`}</div>
       ${brief
@@ -1847,6 +1871,27 @@ function renderPersonalSettings(st, b) {
       <label class="row between small" style="margin-top:6px"><span>幾點發</span><select id="brief-hour">${[5, 6, 7, 8, 9, 10, 11].map((h) => `<option value="${h}" ${Number(s.briefHour ?? 7) === h ? "selected" : ""}>${h}:00</option>`).join("")}</select></label>
       <button class="btn small" id="brief-now" style="margin-top:8px">現在發一次</button>
     </div>
+    <div class="card"><h3>🎙️ 語音與日記</h3>
+      <label class="row between small"><span>語音轉文字</span><select id="set-voice"><option value="gemini" ${s.voiceEngine !== "private" ? "selected" : ""}>Gemini 優先</option><option value="private" ${s.voiceEngine === "private" ? "selected" : ""}>隱私模式（只用 Cloudflare）</option></select></label>
+      <div class="small muted" style="margin:2px 0 8px">${VOICE_HINT(s)}</div>
+      <label class="row between small"><span>自動寫日記</span><select id="set-diary">${DIARY_MODES.map(([v, t]) => `<option value="${v}" ${(s.diaryMode || "weekly") === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+    </div>
+    <div class="card"><h3>📥 從其他 App 存進知識庫</h3>
+      <div class="small"><b>Android</b>：先把這個網站「加到主畫面」，之後在 Facebook、Chrome… 按「分享」→ 選「旅伴 AI」，就會存進知識庫。</div>
+      <div class="small" style="margin-top:8px"><b>iPhone</b>：用「捷徑」App 做一個分享捷徑（每支手機設定一次）。</div>
+      ${s.inbox ? `
+        <div class="row" style="gap:6px;margin-top:8px"><input readonly id="inbox-url" value="${escapeHtml(location.origin + s.inbox)}" style="flex:1;min-width:0" /><button type="button" class="btn small" id="inbox-copy">複製</button></div>
+        <details class="small" style="margin-top:6px"><summary>iPhone 捷徑設定步驟</summary><ol class="steps">
+          <li>打開「捷徑」App，按右上角「＋」新增捷徑，名稱取「存到助理」。</li>
+          <li>點上方名稱旁的箭頭 →「詳細資訊」，打開「在分享表單中顯示」。</li>
+          <li>加入動作「取得 URL 的內容」：網址貼上面複製的收件網址，「方法」選 POST，「要求本文」選 JSON，新增一個文字欄位：鍵輸入 text、值選「捷徑輸入」。</li>
+          <li>再加入動作「顯示通知」，內容選「URL 的內容」。</li>
+          <li>完成。之後在 Safari、Facebook… 按「分享」→「存到助理」，就會存進知識庫。</li>
+        </ol></details>
+        <div class="small muted" style="margin-top:6px">這個網址等於你的知識庫收件匣，不要給別人；外流了就按「換一個網址」，舊的立刻失效。</div>
+        <div class="row" style="gap:6px;margin-top:6px"><button type="button" class="btn small" id="inbox-reset">換一個網址</button><button type="button" class="btn small" id="inbox-off">停用</button></div>`
+      : `<button type="button" class="btn" id="inbox-on" style="margin-top:8px">產生 iPhone 捷徑用的收件網址</button>`}
+    </div>
     <div class="card"><div class="stack"><button class="btn" data-go="memories">🧠 記憶（關於我、暫停記憶）</button><button class="btn" data-go="keys">🔑 API 金鑰</button><a class="btn" href="/api/export?room=${ROOM}" download>⬇️ 匯出我的資料</a></div></div>
     <div class="card"><h3>🔒 更改密碼</h3>
       <form class="form" id="pw-form">
@@ -1861,7 +1906,7 @@ function renderPersonalSettings(st, b) {
         <div class="checks">
           <label><input type="checkbox" name="chat" /> 聊天紀錄（含照片、位置）</label>
           <label><input type="checkbox" name="memory" /> 長期記憶與摘要</label>
-          <label><input type="checkbox" name="tools" /> 清單、提醒、保管箱</label>
+          <label><input type="checkbox" name="tools" /> 清單、提醒、保管箱、日記、語音備忘、證件</label>
         </div>
         <button class="btn danger">清除勾選的資料</button>
       </form>
@@ -1890,6 +1935,12 @@ function renderPersonalSettings(st, b) {
     setTimeout(refreshPush, 800);
   });
   $("#push-test", b).addEventListener("click", () => action({ action: "push_test" }));
+  $("#set-voice", b).addEventListener("change", (e) => action({ action: "settings", voiceEngine: e.target.value }));
+  $("#set-diary", b).addEventListener("change", (e) => action({ action: "settings", diaryMode: e.target.value }));
+  $("#inbox-on", b)?.addEventListener("click", () => action({ action: "inbox_on" }));
+  $("#inbox-reset", b)?.addEventListener("click", () => confirm("換新網址後，舊的捷徑會失效，要把新網址貼進捷徑。確定？") && action({ action: "inbox_reset" }));
+  $("#inbox-off", b)?.addEventListener("click", () => confirm("停用後 iPhone 捷徑就不能存東西進來。確定？") && action({ action: "inbox_off" }));
+  $("#inbox-copy", b)?.addEventListener("click", (e) => copyText(location.origin + s.inbox, e.target));
   $("#brief-auto", b).addEventListener("change", (e) => action({ action: "settings", autoBrief: e.target.checked }));
   $("#brief-hour", b).addEventListener("change", (e) => action({ action: "settings", briefHour: Number(e.target.value) }));
   $("#brief-now", b).addEventListener("click", (e) => {
@@ -1905,7 +1956,7 @@ function renderPersonalSettings(st, b) {
   $("#reset-form", b).addEventListener("submit", (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const names = { chat: "聊天紀錄", memory: "長期記憶與摘要", tools: "清單、提醒、保管箱" };
+    const names = { chat: "聊天紀錄", memory: "長期記憶與摘要", tools: "清單、提醒、保管箱、日記、語音備忘、證件" };
     const picked = Object.keys(names).filter((k) => f.get(k));
     if (!picked.length) return alert("請至少勾選一項");
     const typed = prompt(`即將清除：${picked.map((k) => names[k]).join("、")}\n清除後無法復原。\n\n確定的話請輸入「清除」`);
@@ -2051,8 +2102,11 @@ function toolCards() {
     return [
       ["calendar", "calendar", "行事曆", "行程、提醒、訂閱到手機日曆"],
       ["notes", "book", "知識庫", "連結、筆記、照片文件"],
+      ["memo", "mic", "語音備忘", "錄音、會議記錄自動整理"],
       ["checklist", "list", "清單", "待辦、購物"],
       ["reminders", "bell", "提醒", "時間到通知你"],
+      ["diary", "notebook", "日記", "每週（或每天）自動寫"],
+      ["iddocs", "idcard", "證件到期", "護照、駕照到期前提醒"],
       ["memories", "bookmark", "記憶", "AI 記得你的事，可以刪改"],
     ];
   }
@@ -2115,6 +2169,370 @@ function renderToolPanel(st, b) {
       renderDiaryEditor(st, b);
       break;
   }
+}
+
+// ---------- 🎙️ 語音備忘：錄音（每 5 分鐘切一段上傳，邊錄邊轉文字）或上傳錄音檔 ----------
+
+const VOICE_HINT = (s) =>
+  s.voiceEngine === "private"
+    ? "錄音和摘要都不經過 Google；每天能轉的時數比較少（整個網站共用），摘要也比較簡單。"
+    : s.gemini
+      ? "用你的 Gemini 金鑰轉文字（中文比較準），額度用完自動改用 Cloudflare Whisper。免費版 Gemini 的內容可能被 Google 拿去改進產品，在意的話選隱私模式。"
+      : "還沒填 Gemini 金鑰，會用 Cloudflare Whisper 轉文字。";
+const DIARY_MODES = [["weekly", "每週一篇（週一早上）"], ["daily", "每天一篇（隔天早上）"], ["off", "不要自動寫"]];
+const SEG_MS = 5 * 60_000;
+const UPLOAD_PART = 8_000_000;
+const REC = { on: false, id: null, stream: null, rec: null, mime: "", seq: 0, t0: 0, timer: null, cut: null, lock: null, queue: [], busy: false, fails: 0, note: "" };
+S.memoText = {};
+
+const fmtDur = (sec) => {
+  const t = Math.max(0, Math.round(sec));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), x = t % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}` : `${m}:${String(x).padStart(2, "0")}`;
+};
+
+function memoStatus(m) {
+  if (m.status === "recording") return `錄音中（已收到 ${m.segs} 段）`;
+  if (m.status === "processing") return `${m.title || "錄音"}：${m.done_segs < m.segs ? `轉文字中 ${m.done_segs}/${m.segs} 段` : "整理重點中"}${m.error ? `｜${m.error}` : ""}`;
+  if (m.status === "error") return `⚠️ ${m.error || "處理失敗"}`;
+  return "";
+}
+
+function pickAudioMime() {
+  if (!window.MediaRecorder) return "";
+  return ["audio/webm;codecs=opus", "audio/mp4", "audio/webm", "audio/ogg;codecs=opus"].find((t) => MediaRecorder.isTypeSupported?.(t)) || "";
+}
+
+async function recStart() {
+  const mime = pickAudioMime();
+  if (!mime || !navigator.mediaDevices?.getUserMedia) return alert("這個瀏覽器不能錄音，請改用「上傳錄音檔」");
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+  } catch {
+    return alert("沒有麥克風權限：請到手機的設定允許這個 App 使用麥克風");
+  }
+  const r = await api("/api/memo/start", { mime });
+  if (!r.ok) {
+    stream.getTracks().forEach((t) => t.stop());
+    return alert(r.error || "開始錄音失敗");
+  }
+  Object.assign(REC, { on: true, id: r.id, stream, mime, seq: 0, t0: Date.now(), note: "" });
+  // 系統把麥克風收走（來電、鎖定螢幕）：把錄到的送出去整理
+  stream.getAudioTracks()[0]?.addEventListener("ended", () => recStop("錄音被系統中斷（可能是來電、鎖定螢幕或切到別的 App），已把錄到的部分送去整理。"));
+  recSegment();
+  REC.timer = setInterval(() => {
+    const el = $("#rec-time");
+    if (el) el.textContent = fmtDur((Date.now() - REC.t0) / 1000);
+  }, 1000);
+  try {
+    REC.lock = await navigator.wakeLock?.request("screen");
+  } catch {}
+  renderPanel();
+}
+
+// 每 5 分鐘換一個錄音器：每一段都是完整的音檔，可以先上傳、先轉文字
+function recSegment() {
+  let rec;
+  try {
+    rec = new MediaRecorder(REC.stream, { mimeType: REC.mime, audioBitsPerSecond: 32000 });
+  } catch {
+    rec = new MediaRecorder(REC.stream);
+  }
+  const chunks = [];
+  const seq = REC.seq++;
+  const started = Date.now();
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  rec.onstop = () => {
+    const live = REC.on && REC.stream?.getAudioTracks()[0]?.readyState === "live";
+    recEnqueue({ id: REC.id, seq, blob: new Blob(chunks, { type: rec.mimeType || REC.mime }), seconds: (Date.now() - started) / 1000, last: !live });
+    if (live) recSegment();
+    else if (REC.on) recStop();
+  };
+  rec.start(10_000);
+  REC.rec = rec;
+  clearTimeout(REC.cut);
+  REC.cut = setTimeout(() => rec.state === "recording" && rec.stop(), SEG_MS);
+}
+
+function recStop(note = "") {
+  if (!REC.on) return;
+  REC.on = false;
+  REC.note = note;
+  clearTimeout(REC.cut);
+  clearInterval(REC.timer);
+  if (REC.rec && REC.rec.state !== "inactive") REC.rec.stop();
+  // 錄音器已經停了（被系統中斷）：補一個「錄完了」的訊號
+  else recEnqueue({ id: REC.id, seq: REC.seq, blob: new Blob([]), seconds: 0, last: true });
+  setTimeout(() => REC.stream?.getTracks().forEach((t) => t.stop()), 500);
+  REC.lock?.release?.().catch(() => {});
+  REC.lock = null;
+  if (S.panel === "memo") renderPanel();
+}
+
+function recEnqueue(item) {
+  REC.queue.push(item);
+  recPump();
+}
+
+// 依序上傳；失敗就等一下再試（最多約 10 分鐘），網路恢復會接著傳
+async function recPump() {
+  if (REC.busy) return;
+  REC.busy = true;
+  try {
+    while (REC.queue.length) {
+      const it = REC.queue[0];
+      if (await uploadSegment(it)) {
+        REC.queue.shift();
+        REC.fails = 0;
+      } else {
+        REC.fails++;
+        recNote();
+        if (REC.fails > 20) break;
+        await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * REC.fails)));
+      }
+    }
+  } finally {
+    REC.busy = false;
+    recNote();
+  }
+}
+
+async function uploadSegment({ id, seq, blob, seconds, last }) {
+  const parts = Math.max(1, Math.ceil(blob.size / UPLOAD_PART));
+  for (let k = 0; k < parts; k++) {
+    try {
+      const res = await fetch(`/api/memo/${id}/seg?seq=${seq}&part=${k}&parts=${parts}&seconds=${Math.round(seconds)}&last=${last ? 1 : 0}`, {
+        method: "POST",
+        headers: { "content-type": blob.type || "application/octet-stream" },
+        body: blob.slice(k * UPLOAD_PART, (k + 1) * UPLOAD_PART),
+      });
+      if (res.status === 409) return true; // 伺服器已經收過、錄音已結束
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        if (res.status === 400 || res.status === 404 || res.status === 413) {
+          alert(e.error || "上傳失敗");
+          return true;
+        }
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function recNote() {
+  const el = $("#rec-status");
+  if (!el) return;
+  const waiting = REC.queue.length;
+  el.textContent = REC.note || (waiting ? (REC.fails ? `網路不穩，${waiting} 段等待重新上傳…` : `上傳中（${waiting} 段）…`) : "");
+  const retry = $("#rec-retry");
+  if (retry) retry.hidden = !(waiting && REC.fails > 20);
+}
+
+// 上傳手機錄好的檔案（語音備忘錄、Line 錄音…）
+async function memoUploadFile(file) {
+  if (!file) return;
+  if (file.size > 100_000_000) return alert("檔案太大（上限 100MB）。長的會議建議直接在這裡錄音。");
+  const ext = (file.name.split(".").pop() || "").toLowerCase();
+  const mime = (file.type || { m4a: "audio/mp4", mp3: "audio/mpeg", wav: "audio/wav", webm: "audio/webm", aac: "audio/aac", ogg: "audio/ogg", mp4: "video/mp4", mov: "video/quicktime" }[ext] || "").split(";")[0];
+  const seconds = await new Promise((resolve) => {
+    const a = document.createElement("audio");
+    const url = URL.createObjectURL(file);
+    const done = (v) => {
+      URL.revokeObjectURL(url);
+      resolve(Number.isFinite(v) ? v : 0);
+    };
+    a.preload = "metadata";
+    a.onloadedmetadata = () => done(a.duration);
+    a.onerror = () => done(0);
+    setTimeout(() => done(0), 4000);
+    a.src = url;
+  });
+  const r = await api("/api/memo/start", { mime, title: file.name.replace(/\.[^.]+$/, "").slice(0, 60), source: "file" });
+  if (!r.ok) return alert(r.error || "上傳失敗");
+  recEnqueue({ id: r.id, seq: 0, blob: file, seconds, last: true });
+  REC.note = "上傳中…傳完會自動轉文字，可以先離開這頁";
+  recNote();
+}
+
+addEventListener("beforeunload", (e) => {
+  if (REC.on || REC.queue.length) {
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+
+function renderMemoPanel(st, b) {
+  els.panelTitle.textContent = "🎙️ 語音備忘";
+  const s = S.settings || {};
+  const memos = st.memos || [];
+  const card = (m) => {
+    let acts = [];
+    try {
+      acts = JSON.parse(m.actions || "[]");
+    } catch {}
+    const status = memoStatus(m);
+    const text = S.memoText[m.id];
+    return `<div class="card memo">
+      <div class="row between" style="align-items:flex-start;gap:8px"><b>${escapeHtml(m.title || (m.source === "file" ? "上傳的錄音" : "錄音"))}</b><span class="small muted" style="white-space:nowrap">${dayText(m.ts)} ${timeText(m.ts)}${m.seconds ? `｜${fmtDur(m.seconds)}` : ""}</span></div>
+      ${status ? `<div class="small ${m.status === "error" ? "bad-text" : "muted"}">${escapeHtml(status)}</div>` : ""}
+      ${m.status === "done" ? `<div class="small msg-text">${md(m.summary || "")}</div>` : ""}
+      ${acts.length ? `<div class="memo-acts">${acts.map((a, i) => `<div class="memo-act small"><span>${a.added ? "✅" : "▫️"} ${escapeHtml(a.item)}${a.who ? `<span class="muted">（${escapeHtml(a.who)}）</span>` : ""}${a.due ? `<span class="muted">｜${escapeHtml(a.due)}</span>` : ""}</span>${a.added ? "" : `<button type="button" class="btn small" data-memo-todo="${m.id}" data-idx="${i}">加到待辦</button>`}</div>`).join("")}
+        ${acts.filter((a) => !a.added).length > 1 ? `<button type="button" class="btn small primary-sm" data-memo-todo="${m.id}">全部加到待辦</button>` : ""}</div>` : ""}
+      ${text != null ? `<div class="transcript small">${escapeHtml(text)}</div>` : ""}
+      <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:6px">
+        ${m.status === "done" ? `<button type="button" class="btn small" data-memo-text="${m.id}">${text != null ? "收起逐字稿" : "看逐字稿"}</button>` : ""}
+        ${m.note_id ? `<a class="btn small" href="#note-${m.note_id}">在知識庫</a>` : ""}
+        ${m.status === "error" ? `<button type="button" class="btn small" data-memo-retry="${m.id}">重試</button>` : ""}
+        ${REC.on && REC.id === m.id ? "" : `<button type="button" class="btn small danger" data-memo-del="${m.id}">刪除</button>`}
+      </div>
+    </div>`;
+  };
+  b.innerHTML = `
+    ${backToHub()}
+    <div class="card rec-card${REC.on ? " on" : ""}">
+      ${REC.on
+        ? `<div class="rec-live"><span class="rec-dot"></span><span class="rec-time" id="rec-time">${fmtDur((Date.now() - REC.t0) / 1000)}</span></div>
+           <div class="small muted">錄音中…每 5 分鐘自動送出一段，邊錄邊轉文字</div>
+           <button type="button" class="btn danger big-btn" id="rec-stop">⏹ 停止並整理</button>`
+        : `<button type="button" class="primary" id="rec-start">🎙️ 開始錄音</button>
+           <label class="btn big-btn center">📁 上傳錄音檔<input type="file" id="memo-file" accept="audio/*,video/mp4,video/quicktime,.m4a,.mp3,.wav,.aac" hidden /></label>`}
+      <div class="small" id="rec-status"></div>
+      <button type="button" class="btn small" id="rec-retry" hidden>重新上傳</button>
+      <p class="small muted">開會、上課、想記事情時錄下來，錄完會自動轉成文字、整理重點和待辦，存進知識庫。錄音時畫面請保持開著（可以調暗），不要鎖定螢幕或切到別的 App，不然手機會暫停錄音。</p>
+    </div>
+    <div class="card small">
+      <label class="row between"><span>語音轉文字</span><select id="voice-engine"><option value="gemini" ${s.voiceEngine !== "private" ? "selected" : ""}>Gemini 優先</option><option value="private" ${s.voiceEngine === "private" ? "selected" : ""}>隱私模式（只用 Cloudflare）</option></select></label>
+      <div class="muted" style="margin-top:4px">${VOICE_HINT(s)}</div>
+    </div>
+    ${memos.map(card).join("") || `<div class="card small muted">還沒有錄音。</div>`}`;
+  bindBack(b);
+  recNote();
+  $("#rec-start", b)?.addEventListener("click", (e) => {
+    e.target.disabled = true;
+    recStart().finally(() => (e.target.disabled = false));
+  });
+  $("#rec-stop", b)?.addEventListener("click", () => recStop());
+  $("#rec-retry", b).addEventListener("click", () => {
+    REC.fails = 0;
+    recPump();
+  });
+  $("#memo-file", b)?.addEventListener("change", (e) => memoUploadFile(e.target.files[0]));
+  $("#voice-engine", b).addEventListener("change", (e) => action({ action: "settings", voiceEngine: e.target.value }));
+  b.querySelectorAll("[data-memo-todo]").forEach((x) =>
+    x.addEventListener("click", () => action({ action: "memo_todo", id: Number(x.dataset.memoTodo), ...(x.dataset.idx != null ? { idx: Number(x.dataset.idx) } : {}) })),
+  );
+  b.querySelectorAll("[data-memo-text]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const id = Number(x.dataset.memoText);
+      if (S.memoText[id] != null) {
+        delete S.memoText[id];
+        renderPanel();
+      } else action({ action: "memo_transcript", id });
+    }),
+  );
+  b.querySelectorAll("[data-memo-retry]").forEach((x) => x.addEventListener("click", () => action({ action: "memo_retry", id: Number(x.dataset.memoRetry) })));
+  b.querySelectorAll("[data-memo-del]").forEach((x) =>
+    x.addEventListener("click", () => confirm("刪除這段錄音？（已經存進知識庫的逐字稿會保留）") && action({ action: "memo_delete", id: Number(x.dataset.memoDel) })),
+  );
+}
+
+// ---------- 🪪 證件到期 ----------
+
+function renderIdDocsPanel(st, b) {
+  els.panelTitle.textContent = "🪪 證件到期";
+  const docs = st.idDocs || [];
+  b.innerHTML = `
+    ${backToHub()}
+    <p class="small muted">記下護照、身分證、駕照…的到期日，到期前會在聊天和手機通知提醒你（護照提前 6 個月，其他提前 3 個月、1 個月、1 週）。只記號碼末四碼，不要輸入完整號碼。</p>
+    <form class="card form" id="id-add">
+      <div class="row" style="gap:6px"><select name="kind" style="width:7.5em;flex:none">${["護照", "身分證", "駕照", "機車駕照", "健保卡", "居留證", "信用卡", "其他"].map((k) => `<option>${k}</option>`).join("")}</select><input name="holder" placeholder="持有人（例如 我、小美）" style="flex:1;min-width:0" /></div>
+      <div class="row" style="gap:6px"><label class="small" style="flex:1">到期日<input type="date" name="expires" required /></label><label class="small" style="width:7.5em">末四碼<input name="last4" inputmode="numeric" maxlength="4" placeholder="選填" autocomplete="off" /></label></div>
+      <button class="btn primary-sm">新增</button>
+    </form>
+    ${docs.map((d) => `<div class="card id-doc${d.days < 0 ? " bad" : d.days <= 90 ? " warn" : ""}">
+      <div><b>${escapeHtml(d.holder)}・${escapeHtml(d.kind)}</b>${d.last4 ? ` <span class="small muted">末四碼 ${escapeHtml(d.last4)}</span>` : ""}
+        <div class="small">${escapeHtml(d.expires)} 到期｜${d.days < 0 ? `已過期 ${-d.days} 天` : d.days === 0 ? "今天到期" : `還有 ${d.days} 天`}</div></div>
+      <button type="button" class="btn small danger" data-id-del="${d.id}">刪除</button>
+    </div>`).join("") || `<div class="card small muted">還沒有記錄。也可以在聊天說「我的護照 2028/3/5 到期」。</div>`}`;
+  bindBack(b);
+  $("#id-add", b).addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    action({ action: "iddoc_add", kind: f.get("kind"), holder: f.get("holder"), expires: f.get("expires"), last4: f.get("last4") });
+    e.target.reset();
+  });
+  b.querySelectorAll("[data-id-del]").forEach((x) => x.addEventListener("click", () => confirm("刪除這筆證件紀錄？") && action({ action: "iddoc_delete", id: Number(x.dataset.idDel) })));
+}
+
+// ---------- 📔 個人日記：預設每週一篇，也可以改成每天一篇 ----------
+
+function renderPersonalDiary(st, b) {
+  els.panelTitle.textContent = "📔 日記";
+  const ds = st.diaries ?? [];
+  const mode = S.settings?.diaryMode || "weekly";
+  const range = (d) => {
+    const span = Number(d.span) || 1;
+    if (span <= 1) return dateLabel(d.date);
+    const from = new Date(Date.parse(d.date + "T00:00:00Z") - (span - 1) * 86400e3);
+    return `${from.getUTCMonth() + 1}/${from.getUTCDate()}–${dateLabel(d.date)}`;
+  };
+  b.innerHTML = `
+    ${backToHub()}
+    <div class="card diary-top">
+      <p class="small muted">${mode === "weekly" ? "每週一早上，AI 會用上一週的對話、照片、行事曆幫你寫一篇週記。" : mode === "daily" ? "每天早上，AI 會用前一天的對話、照片、行事曆幫你寫一篇日記。" : "自動日記已關閉，可以隨時按「現在寫一篇」。"}只有你看得到。</p>
+      <label class="row between small"><span>自動寫日記</span><select id="diary-mode">${DIARY_MODES.map(([v, t]) => `<option value="${v}" ${mode === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+      <a class="diary-main" href="/api/album?room=${ROOM}" target="_blank" rel="noopener">${svg("book")}打開日記網頁</a>
+      <div class="diary-row">
+        <a class="btn" href="/api/album?room=${ROOM}&print=1" target="_blank" rel="noopener">下載 PDF</a>
+        <button type="button" class="btn" id="diary-now">${mode === "daily" ? "現在寫今天的" : "現在寫最近 7 天"}</button>
+      </div>
+    </div>
+    ${ds.length
+      ? ds.map((d) => {
+          const photos = JSON.parse(d.photo_ids || "[]");
+          const excerpt = String(d.text || "").replace(/\s+/g, " ").slice(0, 100);
+          return `<div class="diary-card">
+            <a href="/api/album?room=${ROOM}#${escapeHtml(d.date)}" target="_blank" rel="noopener">
+              ${photos[0] ? `<img src="/api/photo/${escapeHtml(photos[0])}" loading="lazy" alt="" />` : ""}
+              <div class="diary-card-body">
+                <div class="diary-kicker">${Number(d.span) > 1 ? "週記" : "日記"}・${range(d)}・${photos.length} 張照片</div>
+                <h3>${escapeHtml(d.title || "日記")}</h3>
+                <p>${escapeHtml(excerpt)}…</p>
+              </div>
+            </a>
+            <div class="diary-card-btns">
+              <button type="button" class="btn small" data-edit-diary="${escapeHtml(d.date)}">編輯文字與照片</button>
+              <button type="button" class="btn small" data-rewrite="${escapeHtml(d.date)}">AI 重寫</button>
+            </div>
+          </div>`;
+        }).join("")
+      : `<div class="card small muted">還沒有日記。</div>`}`;
+  bindBack(b);
+  $("#diary-mode", b).addEventListener("change", (e) => action({ action: "settings", diaryMode: e.target.value }));
+  $("#diary-now", b).addEventListener("click", (e) => {
+    e.target.disabled = true;
+    e.target.textContent = "寫作中，約需 30 秒…";
+    action({ action: "diary_now" });
+  });
+  b.querySelectorAll("[data-edit-diary]").forEach((x) =>
+    x.addEventListener("click", () => {
+      const d = ds.find((y) => y.date === x.dataset.editDiary);
+      S.diaryEdit = { date: d.date, title: d.title || "", text: d.text || "", photos: JSON.parse(d.photo_ids || "[]"), base: d.ts, editedBy: d.edited_by || "", dirty: false };
+      openPanel("diary-edit");
+    }),
+  );
+  b.querySelectorAll("[data-rewrite]").forEach((x) =>
+    x.addEventListener("click", () => {
+      if (!confirm("用那段時間的對話和照片重新寫這篇？（你改過的文字和照片會被蓋掉）")) return;
+      x.disabled = true;
+      x.textContent = "重寫中，約需 30 秒…";
+      action({ action: "diary_rewrite", date: x.dataset.rewrite });
+    }),
+  );
 }
 
 const backToHub = () => `<button class="btn small" data-go-hub>← 工具箱</button>`;
@@ -2553,6 +2971,7 @@ function renderRemindersPanel(st, b) {
 
 // 每天一張卡片（封面照＋標題＋摘要），點進去是圖文版日記網頁，那裡可以下載 PDF、分享
 function renderDiaryPanel(st, b) {
+  if (isPersonal()) return renderPersonalDiary(st, b);
   els.panelTitle.textContent = "📔 旅遊日記";
   const ds = st.diaries ?? [];
   const share = S.settings?.share ? location.origin + S.settings.share : "";
@@ -3037,6 +3456,22 @@ document.addEventListener(
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
 
+function routeCapture() {
+  const q = new URLSearchParams(location.search);
+  const parts = [];
+  for (const k of ["title", "text", "url"]) {
+    const v = (q.get(k) || "").trim();
+    if (v && !parts.some((p) => p.includes(v))) parts.push(v);
+  }
+  const mine = (store("ta-trips") || []).find((t) => t.kind === "personal");
+  if (!mine) {
+    alert("要先在這支手機打開過個人助理，才能用分享存進知識庫");
+    return location.replace("/");
+  }
+  location.replace(`/t/${mine.id}${parts.length ? `?share=${encodeURIComponent(parts.join("\n").slice(0, 4000))}` : ""}`);
+}
+
 if (ROOM) checkSession();
+else if (location.pathname === "/capture") routeCapture();
 else if (location.pathname === "/new") renderWizard();
 else renderLanding();

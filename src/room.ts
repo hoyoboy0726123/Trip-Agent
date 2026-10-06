@@ -5,7 +5,7 @@ import {
   BASE_CHECKLIST, EMPTY_GUIDE, diffFromTaiwan, flagEmoji, localDateTime, localToUtc, travelersText, tripDays, tripLine, validTimezone, zoned,
   type Traveler, type TripProfile,
 } from "./profile";
-import { geminiProvider, parseArgs, providerFor, WorkersAiQuotaError, type GeminiGate } from "./providers";
+import { geminiProvider, isQuotaError, parseArgs, providerFor, uploadGeminiFile, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
 import { disasterAlerts, DRAFT_TOOLS, homeOf, reverseArea, type EventInput, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
@@ -27,6 +27,22 @@ const PHOTO_KINDS = ["景點", "風景", "美食", "人物", "購物", "交通",
 const NOT_DIARY_PHOTO = new Set(["收據", "截圖", "文件", "旅途外"]);
 /** 照片說明的評分標準版本：標準改了就加 1，舊的說明會重看一次 */
 const PHOTO_NOTE_V = 2;
+
+/** 語音備忘：Gemini 一次請求最多 20MB（base64 會大 1/3），超過就先傳 Files API；Whisper 只收比較小的檔 */
+const GEMINI_INLINE_MAX = 14_000_000;
+const WHISPER_MAX = 9_000_000;
+/** 一個空間暫存的錄音最多 300MB（轉完文字就刪） */
+const MEMO_AUDIO_LIMIT = 300_000_000;
+const AUDIO_MIME = /^(audio\/[\w.+-]+|video\/(mp4|webm|quicktime))$/;
+const TRANSCRIBE_PROMPT =
+  "逐字轉錄這段錄音：繁體中文（台灣用語），加上標點符號。換人說話時換行，開頭標「說話者A：」「說話者B：」（只有一個人說話就不用標）。" +
+  "聽不清楚的地方寫（聽不清楚），不要猜、不要摘要、不要加任何說明。完全沒有人說話就只輸出「（沒有聲音）」。";
+/** 證件到期前幾天提醒；護照出國通常要 6 個月以上效期 */
+const ID_STEPS = [90, 30, 7, 0];
+const PASSPORT_STEPS = [180, 90, 30, 7, 0];
+/** 語意相似度（bge-m3 的 cosine）超過這個值才加分：實測相關的約 0.42–0.75，不相關的 0.2–0.39；只靠語意要 0.45 以上才找得到 */
+const SEM_MIN = 0.4;
+const SEM_W = 10;
 
 function parseJsonArray(text: string): any[] | null {
   const a = text.indexOf("["), b = text.lastIndexOf("]");
@@ -85,6 +101,85 @@ function systemMade(m: { meta: string | null }): boolean {
   } catch {
     return false;
   }
+}
+
+/** 語意相似度換成搜尋分數 */
+function semanticBoost(sim: number | undefined): number {
+  return sim != null && sim > SEM_MIN ? (sim - SEM_MIN) * SEM_W : 0;
+}
+
+function cosine(a: Float32Array, b: Float32Array): number {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length && i < b.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return na && nb ? dot / Math.sqrt(na * nb) : 0;
+}
+
+/** 文字指紋（FNV-1a）：內容沒變就不用重算向量 */
+function textHash(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16);
+}
+
+function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+/** 手機錄音 App、瀏覽器給的檔案類型 → Gemini 認得的寫法 */
+function geminiMime(mime: string): string {
+  if (/m4a|x-m4a/.test(mime)) return "audio/mp4";
+  if (/mpeg|mp3/.test(mime)) return "audio/mp3";
+  if (/wav/.test(mime)) return "audio/wav";
+  if (mime === "video/quicktime") return "video/mov";
+  return mime;
+}
+
+/** 秒數 → 1:02:03／12:34 */
+function fmtDuration(sec: number): string {
+  const t = Math.max(0, Math.round(sec));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), x = t % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}` : `${m}:${String(x).padStart(2, "0")}`;
+}
+
+/** YYYY-MM-DD → 10/5 */
+function mdText(date: string): string {
+  return `${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))}`;
+}
+
+/** 證件到期日：2028-03-05、2028/3/5、2028年3月5日；只有年月就算那個月最後一天 */
+function normalizeExpiry(text: string): string | null {
+  const m = text.trim().match(/^(\d{4})\D{1,2}(\d{1,2})(?:\D{1,2}(\d{1,2}))?/);
+  if (!m) return null;
+  const y = Number(m[1]), mo = Number(m[2]);
+  if (y < 1990 || y > 2100 || mo < 1 || mo > 12) return null;
+  const last = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  const d = m[3] ? Number(m[3]) : last;
+  if (d < 1 || d > last) return null;
+  return `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+function daysUntil(today: string, date: string): number {
+  return Math.round((Date.parse(date + "T00:00:00Z") - Date.parse(today + "T00:00:00Z")) / 86400_000);
+}
+
+/** 分享選單給的標題、文字、網址常常重複（文字裡已經有網址）：去掉重複的再接起來 */
+function joinShared(fields: unknown[]): string {
+  const out: string[] = [];
+  for (const f of fields) {
+    const t = typeof f === "string" ? f.trim() : f == null ? "" : String(f).trim();
+    if (t && !out.some((o) => o.includes(t))) out.push(t);
+  }
+  return out.join("\n");
 }
 
 /** YYYY-MM-DD 加減天數 */
@@ -329,8 +424,16 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     // 日記挑照片用：AI 看過每張照片的說明
     this.sql.exec("CREATE TABLE IF NOT EXISTS photo_notes (photo_id TEXT PRIMARY KEY, kind TEXT, score INTEGER, note TEXT, ts INTEGER, v INTEGER)");
     if (!this.sql.exec("PRAGMA table_info(photo_notes)").toArray().some((c) => c.name === "v")) this.sql.exec("ALTER TABLE photo_notes ADD COLUMN v INTEGER");
-    // 家人修改日記：記下最後是誰改的
-    for (const col of ["edited_by TEXT", "edited_at INTEGER", "layout TEXT"]) {
+    // 第四階段：語音備忘（錄音分段上傳，轉完文字就刪音檔）、語意搜尋的向量、證件到期
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS memos (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, status TEXT, mime TEXT, source TEXT, segs INTEGER DEFAULT 0, done_segs INTEGER DEFAULT 0, ended INTEGER DEFAULT 0, seconds INTEGER DEFAULT 0, engine TEXT, transcript TEXT, summary TEXT, actions TEXT, note_id INTEGER, error TEXT, updated INTEGER);
+      CREATE TABLE IF NOT EXISTS memo_segs (memo_id INTEGER, seq INTEGER, bytes INTEGER, seconds REAL, status TEXT DEFAULT 'pending', text TEXT, engine TEXT, tries INTEGER DEFAULT 0, PRIMARY KEY (memo_id, seq));
+      CREATE TABLE IF NOT EXISTS memo_audio (memo_id INTEGER, seq INTEGER, part INTEGER, data BLOB, PRIMARY KEY (memo_id, seq, part));
+      CREATE TABLE IF NOT EXISTS embeddings (kind TEXT, ref INTEGER, hash TEXT, vec BLOB, PRIMARY KEY (kind, ref));
+      CREATE TABLE IF NOT EXISTS id_docs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, kind TEXT, holder TEXT, last4 TEXT, expires TEXT, author TEXT, notified INTEGER DEFAULT 100000);
+    `);
+    // 家人修改日記：記下最後是誰改的；個人日記的週記 span＝7（一篇涵蓋幾天）
+    for (const col of ["edited_by TEXT", "edited_at INTEGER", "layout TEXT", "span INTEGER"]) {
       if (!this.sql.exec("PRAGMA table_info(diaries)").toArray().some((c) => c.name === col.split(" ")[0])) this.sql.exec(`ALTER TABLE diaries ADD COLUMN ${col}`);
     }
   }
@@ -402,6 +505,9 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       pushDevices: this.sql.exec("SELECT COUNT(*) AS n FROM push_subs").one().n as number,
       ics: this.setting("ics_token") ? `/ics/${this.roomId()}/${this.setting("ics_token")}.ics` : null, // 行事曆訂閱連結
       lastDream: this.setting("dream_last") ? JSON.parse(this.setting("dream_last")) : null,
+      voiceEngine: this.setting("voice_engine", "gemini"), // gemini＝自己的 Gemini 優先；private＝只用 Cloudflare（不經過 Google）
+      diaryMode: this.setting("diary_mode", "weekly"), // 個人日記：weekly｜daily｜off
+      inbox: this.setting("inbox_token") ? `/in/${this.roomId()}/${this.setting("inbox_token")}` : null, // iPhone 捷徑的收件網址
     };
   }
 
@@ -562,6 +668,9 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       if (!token || !safeEqual(ics[1], token)) return new Response("Not found", { status: 404 });
       return new Response(this.icsFeed(), { headers: { "content-type": "text/calendar; charset=utf-8", "cache-control": "no-store" } });
     }
+    // iPhone 捷徑「分享 → 存到助理」：不用登入，收不收由網址裡的密語決定
+    const inbox = url.pathname.match(/^\/inbox\/([\w-]+)$/);
+    if (inbox && req.method === "POST") return this.inboxCapture(inbox[1], req);
     // 日記分享連結：不用登入，要在登入檢查之前處理
     const shared = url.pathname.match(/^\/share\/([\w-]+)(?:\/photo\/([\w-]+))?$/);
     if (shared) return this.shared(shared[1], shared[2], req, url);
@@ -599,6 +708,13 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       return new Response(JSON.stringify(this.exportData(), null, 1), {
         headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename="trip-agent-${date}.json"`, "cache-control": "no-store" },
       });
+    }
+
+    // 語音備忘：開始一段錄音、上傳每一段（錄音每 5 分鐘一段；大的檔案切成好幾塊上傳）
+    const memo = url.pathname.match(/^\/memo\/(?:start|(\d+)\/seg)$/);
+    if (memo && req.method === "POST") {
+      if (!this.isPersonal()) return Response.json({ ok: false, error: "語音備忘只有個人助理可以用" }, { status: 403 });
+      return memo[1] ? this.memoSegment(Number(memo[1]), url, req) : this.memoStart(req, user.name);
     }
 
     if (url.pathname === "/ws") {
@@ -883,6 +999,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
           if (typeof msg[k] === "boolean") this.setSetting(key, msg[k] ? "1" : "0");
         }
         if (Number.isInteger(msg.briefHour) && msg.briefHour >= 5 && msg.briefHour <= 11) this.setSetting("brief_hour", String(msg.briefHour));
+        if (msg.voiceEngine === "gemini" || msg.voiceEngine === "private") this.setSetting("voice_engine", msg.voiceEngine);
+        if (["weekly", "daily", "off"].includes(msg.diaryMode)) this.setSetting("diary_mode", msg.diaryMode);
         this.broadcast({ type: "settings", settings: this.settings() });
         break;
 
@@ -1080,9 +1198,16 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         if (this.isPersonal()) await this.postPersonalBrief(this.today());
         else await this.postMorningBrief(this.today());
         break;
-      case "diary_now":
-        await this.writeDiary(this.today());
+      case "diary_now": {
+        if (!this.isPersonal()) {
+          await this.writeDiary(this.today());
+          break;
+        }
+        // 個人日記：週記模式寫最近 7 天，日記模式寫今天
+        const err = await this.writePersonalDiary(this.today(), this.setting("diary_mode", "weekly") === "daily" ? 1 : 7);
+        if (err) return reply(false, err);
         break;
+      }
       // 家人修改日記：標題、內文、照片（只能用已上傳的照片）；有人同時在改就擋下，免得互相蓋掉
       case "diary_edit": {
         const date = String(msg.date ?? "");
@@ -1128,7 +1253,11 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       case "diary_rewrite": {
         const date = String(msg.date ?? "");
         if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !this.sql.exec("SELECT 1 FROM diaries WHERE date = ?", date).toArray().length) return reply(false, "找不到這天的日記");
-        await this.writeDiary(date, false);
+        if (this.isPersonal()) {
+          const span = Number(this.sql.exec("SELECT span FROM diaries WHERE date = ?", date).one().span) || 1;
+          const err = await this.writePersonalDiary(date, span, false);
+          if (err) return reply(false, err);
+        } else await this.writeDiary(date, false);
         break;
       }
       // 日記分享連結：開啟後拿到連結的人不用登入就能看日記與照片，關閉後舊連結立刻失效
@@ -1174,6 +1303,53 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         this.sql.exec("DELETE FROM phrases WHERE id = ?", Number(msg.id));
         this.broadcastState();
         break;
+      // ---- 第四階段：分享收件網址、語音備忘、證件到期 ----
+      case "inbox_on":
+      case "inbox_reset":
+        // 重設＝換一組密語，舊的捷徑立刻失效
+        this.setSetting("inbox_token", randomToken());
+        this.broadcast({ type: "settings", settings: this.settings() });
+        break;
+      case "inbox_off":
+        this.setSetting("inbox_token", "");
+        this.broadcast({ type: "settings", settings: this.settings() });
+        break;
+      case "memo_todo": {
+        const err = this.memoTodo(Number(msg.id), msg.idx == null ? null : Number(msg.idx), user.name);
+        if (err) return reply(false, err);
+        break;
+      }
+      case "memo_transcript": {
+        const row = this.sql.exec("SELECT transcript FROM memos WHERE id = ?", Number(msg.id)).toArray()[0];
+        if (!row) return reply(false, "找不到這段錄音");
+        this.send(ws, { type: "memo_transcript", id: Number(msg.id), text: String(row.transcript ?? "") });
+        break;
+      }
+      case "memo_retry":
+        // 失敗的段落音檔還在才能重試
+        this.sql.exec(
+          "UPDATE memo_segs SET status = 'pending', tries = 0 WHERE memo_id = ? AND status = 'failed' AND EXISTS (SELECT 1 FROM memo_audio a WHERE a.memo_id = memo_segs.memo_id AND a.seq = memo_segs.seq)",
+          Number(msg.id),
+        );
+        this.sql.exec("UPDATE memos SET status = 'processing', ended = 1, error = NULL, updated = ? WHERE id = ? AND status IN ('error', 'processing')", Date.now(), Number(msg.id));
+        this.setSetting("memo_retry_at", "0");
+        this.broadcastState();
+        this.kickMemos();
+        break;
+      case "memo_delete":
+        for (const t of ["memo_audio", "memo_segs"]) this.sql.exec(`DELETE FROM ${t} WHERE memo_id = ?`, Number(msg.id));
+        this.sql.exec("DELETE FROM memos WHERE id = ?", Number(msg.id));
+        this.broadcastState();
+        break;
+      case "iddoc_add": {
+        const r = this.idDocAdd({ kind: msg.kind, holder: msg.holder, expires: msg.expires, last4: msg.last4 }, user.name);
+        if ("error" in r) return reply(false, String(r.error));
+        break;
+      }
+      case "iddoc_delete":
+        this.sql.exec("DELETE FROM id_docs WHERE id = ?", Number(msg.id));
+        this.broadcastState();
+        break;
       case "reset": {
         // 管理員清除資料：測試結束正式使用前使用。只清勾選的項目
         const cleared: string[] = [];
@@ -1210,6 +1386,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
           this.sql.exec("DELETE FROM documents");
           this.sql.exec("DELETE FROM doc_folders");
           this.sql.exec("DELETE FROM diaries");
+          for (const t of ["memos", "memo_segs", "memo_audio", "id_docs"]) this.sql.exec(`DELETE FROM ${t}`);
           cleared.push("清單、提醒、票券、日記");
         }
         if (!cleared.length) return reply(false, "請至少勾選一項");
@@ -1493,6 +1670,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       )
       .one().id as number;
     this.broadcastState();
+    if (this.isPersonal()) this.ctx.waitUntil(this.syncEmbeddings());
     return id;
   }
 
@@ -1780,7 +1958,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
   private async scheduleNext() {
     if (!this.profile()) return;
     const remind = this.sql.exec("SELECT MIN(due) AS due FROM reminders WHERE sent = 0").one().due as number | null;
-    const next = Math.min(remind ?? Infinity, this.isPersonal() ? this.nextEventReminder() ?? Infinity : Infinity);
+    const next = Math.min(remind ?? Infinity, this.isPersonal() ? Math.min(this.nextEventReminder() ?? Infinity, this.nextMemoWork() ?? Infinity) : Infinity);
     const at = Math.max(Date.now() + 5_000, Math.min(next, Date.now() + 5 * 60_000));
     await this.ctx.storage.setAlarm(at);
   }
@@ -1801,6 +1979,10 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
         this.dailyMaintenance(now.date);
         await this.deliverEventReminders();
         await this.maybeDream(now);
+        await this.processMemos();
+        await this.checkIdExpiry(now.date);
+        await this.maybePersonalDiary(now);
+        await this.syncEmbeddings();
         const hour = Number(this.setting("brief_hour", "7"));
         if (this.settings().autoBrief && now.hour >= hour && now.hour < hour + 3 && this.setting("brief_sent") !== now.date) await this.postPersonalBrief(now.date);
         return;
@@ -1873,7 +2055,7 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
    * 日記挑照片前先看過每張照片：拍了什麼、適不適合放進日記（收據、截圖、證件不放）。
    * 看過的存進 photo_notes，重寫日記不用再看；一次送 5 張，照片多也不會太慢
    */
-  private async describePhotos(rows: MessageRow[]): Promise<Map<string, PhotoNote>> {
+  private async describePhotos(rows: MessageRow[], personal = false): Promise<Map<string, PhotoNote>> {
     const notes = new Map<string, PhotoNote>();
     const ids = rows.map((m) => m.photo_id as string);
     if (!ids.length) return notes;
@@ -1890,12 +2072,12 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
       if (!batch.length) continue;
       const parts: Part[] = [
         {
-          text: `以下是家庭旅遊群組今天的 ${batch.length} 張照片，依序編號。請逐張判斷，只輸出 JSON 陣列：[{"n":1,"kind":"…","score":3,"note":"…"}]
-kind 只能是：${PHOTO_KINDS.join("、")}（收據＝收據、發票、帳單；截圖＝手機或網頁畫面截圖；文件＝票券、證件、表單等文字資料；旅途外＝不是這趟旅行拍的，例如家裡的寵物、家裡、舊照片）
+          text: `${personal ? "以下是個人助理收到的" : "以下是家庭旅遊群組今天的"} ${batch.length} 張照片，依序編號。請逐張判斷，只輸出 JSON 陣列：[{"n":1,"kind":"…","score":3,"note":"…"}]
+kind 只能是：${(personal ? PHOTO_KINDS.filter((k) => k !== "旅途外") : PHOTO_KINDS).join("、")}（收據＝收據、發票、帳單；截圖＝手機或網頁畫面截圖；文件＝票券、證件、表單等文字資料${personal ? "" : "；旅途外＝不是這趟旅行拍的，例如家裡的寵物、家裡、舊照片"}）
 note：繁體中文 20–60 字，具體寫出看到什麼：地點或招牌、食物或商品名稱、人（大人或小孩）在做什麼、表情動作；看不出來的照實寫，不要猜人名
-score：當旅遊日記插圖的價值，大部分照片是 2–4 分：
+score：當${personal ? "生活" : "旅遊"}日記插圖的價值，大部分照片是 2–4 分：
 5＝一看就有故事（家人生動的表情或互動、壯觀的景色、招牌美食上桌）
-4＝好看的旅途紀錄（景點、街景、店面、美食、家人合照）
+4＝${personal ? "好看的生活紀錄（出遊、街景、店面、美食、家人朋友合照）" : "好看的旅途紀錄（景點、街景、店面、美食、家人合照）"}
 3＝普通的紀錄
 2＝資訊類照片（菜單、時刻表、告示牌、販賣機、垃圾桶、商品包裝特寫），或沒有重點的日常照（低頭滑手機、排隊等待、只拍到背影）
 1＝沒意義（模糊、隨手亂拍、看不出內容）`,
@@ -1909,7 +2091,7 @@ score：當旅遊日記插圖的價值，大部分照片是 2–4 分：
       for (const pid of order) {
         try {
           const r = await (await this.provider(pid, 1, 20_000)).generate({
-            system: "你是幫家庭旅遊日記挑照片的編輯，只輸出 JSON。",
+            system: personal ? "你是幫生活日記挑照片的編輯，只輸出 JSON。" : "你是幫家庭旅遊日記挑照片的編輯，只輸出 JSON。",
             turns: [{ role: "user", parts }],
             json: true,
           });
@@ -2039,9 +2221,28 @@ ${catalog || "（今天沒有照片）"}
 群組對話：
 ${transcript || "（今天群組沒什麼對話）"}`;
     const raw = await this.generateLong("你是幫家庭寫旅遊日記的溫暖作家，文筆生動細膩，只根據提供的資料寫。", prompt);
-    const { paragraphs, marks, ...parsed } = parseDiary(raw);
     // 模型沒寫標題（第一行就是內文）：標題用當天行程
-    const title = parsed.title && parsed.title.length <= 30 ? parsed.title : today?.title ? String(today.title) : "旅途中的一天";
+    const { title, text, photos, layout } = this.diaryLayout(raw, pool, tag, notes, today?.title ? String(today.title) : "旅途中的一天");
+    this.sql.exec(
+      "INSERT INTO diaries (date, ts, title, text, photo_ids, layout) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, title = excluded.title, text = excluded.text, photo_ids = excluded.photo_ids, layout = excluded.layout, edited_by = NULL, edited_at = NULL",
+      date, Date.now(), title, text, JSON.stringify(photos), layout.length ? JSON.stringify(layout) : null,
+    );
+    if (announce) {
+      const caption = new Map(layout.map((l) => [l.id, l.caption]));
+      const images: AttachedImage[] = photos.slice(0, 8).map((id) => ({ src: `/api/photo/${id}`, caption: caption.get(id) ?? "", source: "今天的照片" }));
+      this.postAiMessage(
+        `📔 **${date.slice(5).replace("-", "/")} 旅遊日記｜${title}**\n\n${text}\n\n（下方「工具箱」→ 旅遊日記：看圖文版、下載 PDF 或分享給親友）`,
+        { kind: "diary", images },
+      );
+    }
+    this.broadcastState();
+  }
+
+  /** 日記照片排版：照 AI 標的 [P編號｜說明] 放照片，每段最多 2 張、整篇最多 10 張；沒標就挑精彩度高的穿插 */
+  private diaryLayout(raw: string, pool: MessageRow[], tag: Map<string, string>, notes: Map<string, PhotoNote>, fallbackTitle: string) {
+    const score = (m: MessageRow) => notes.get(m.photo_id as string)?.score ?? 3;
+    const { paragraphs, marks, ...parsed } = parseDiary(raw);
+    const title = parsed.title && parsed.title.length <= 30 ? parsed.title : fallbackTitle;
     const text = paragraphs.join("\n\n");
     const byTag = new Map(pool.map((m) => [tag.get(m.photo_id as string)!, m.photo_id as string]));
     const used = new Set<string>();
@@ -2065,19 +2266,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     const photos = layout.length
       ? layout.map((l) => l.id)
       : [...pool].sort((a, b) => score(b) - score(a)).slice(0, 8).sort((a, b) => a.ts - b.ts).map((m) => m.photo_id as string);
-    this.sql.exec(
-      "INSERT INTO diaries (date, ts, title, text, photo_ids, layout) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, title = excluded.title, text = excluded.text, photo_ids = excluded.photo_ids, layout = excluded.layout, edited_by = NULL, edited_at = NULL",
-      date, Date.now(), title, text, JSON.stringify(photos), layout.length ? JSON.stringify(layout) : null,
-    );
-    if (announce) {
-      const caption = new Map(layout.map((l) => [l.id, l.caption]));
-      const images: AttachedImage[] = photos.slice(0, 8).map((id) => ({ src: `/api/photo/${id}`, caption: caption.get(id) ?? "", source: "今天的照片" }));
-      this.postAiMessage(
-        `📔 **${date.slice(5).replace("-", "/")} 旅遊日記｜${title}**\n\n${text}\n\n（下方「工具箱」→ 旅遊日記：看圖文版、下載 PDF 或分享給親友）`,
-        { kind: "diary", images },
-      );
-    }
-    this.broadcastState();
+    return { title, text, photos, layout };
   }
 
   /** 附近的大地震、影響這個國家的颱風／洪水／火山、隔天強風豪雨：有新狀況才在群組發通知 */
@@ -2122,8 +2311,9 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     const photoBase = mode === "share" ? `${sharePath}/photo/` : "/api/photo/";
     const plan = new Map(this.itinerary().map((d) => [String(d.date), String(d.title ?? "")]));
     const start = Date.parse(p.startDate + "T00:00:00Z");
+    const personal = this.isPersonal();
     const days = this.sql
-      .exec("SELECT * FROM diaries ORDER BY date")
+      .exec(`SELECT * FROM diaries ORDER BY date${personal ? " DESC" : ""}`)
       .toArray()
       .map((d) => {
         const date = String(d.date);
@@ -2131,8 +2321,11 @@ ${transcript || "（今天群組沒什麼對話）"}`;
         return {
           date,
           dayNo: Math.floor((Date.parse(date + "T00:00:00Z") - start) / 86400_000) + 1,
-          title: String(d.title || plan.get(date) || "旅途中的一天"),
-          plan: plan.get(date) ?? "",
+          title: String(d.title || plan.get(date) || (personal ? "日記" : "旅途中的一天")),
+          plan: personal ? "" : plan.get(date) ?? "",
+          ...(personal
+            ? { label: Number(d.span) > 1 ? "週記" : "日記", when: Number(d.span) > 1 ? `${mdText(shiftDays(date, 1 - Number(d.span)))}–${mdText(date)}` : undefined }
+            : {}),
           text: String(d.text ?? ""),
           photos: (JSON.parse((d.photo_ids as string) || "[]") as string[]).map((id) => {
             const l = layout.get(id);
@@ -2141,9 +2334,12 @@ ${transcript || "（今天群組沒什麼對話）"}`;
         };
       });
     const html = renderDiaryPage({
-      tripTitle: p.title,
-      dates: `${p.startDate.replaceAll("-", "/")} – ${p.endDate.slice(5).replace("-", "/")}`,
-      travelers: p.travelers.map((t) => t.name).join("、"),
+      tripTitle: personal ? `${p.travelers[0]?.name || "我"}的日記` : p.title,
+      dates: personal
+        ? days.length ? `${days[days.length - 1].date.replaceAll("-", "/")} – ${days[0].date.replaceAll("-", "/")}` : ""
+        : `${p.startDate.replaceAll("-", "/")} – ${p.endDate.slice(5).replace("-", "/")}`,
+      travelers: personal ? "" : p.travelers.map((t) => t.name).join("、"),
+      ...(personal ? { kicker: "LIFE DIARY ・ 生活日記", footer: "由個人助理根據你的對話、照片和行事曆整理", unit: "篇", suffix: "", noShare: true } : {}),
       accent: "#1d4ed8",
       days,
       mode,
@@ -2190,13 +2386,14 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     const all = this.memories();
     if (all.length <= 40) return { list: all, total: all.length };
     const q = bigrams(text);
+    const sims = this.memQuery?.text === text ? this.memQuery.sims : null;
     const scored = all.map((m, i) => {
       const g = bigrams(String(m.content));
       let hit = 0;
       for (const x of q) if (g.has(x)) hit++;
       const recent = i >= all.length - 8 ? 0.5 : 0;
       const urgent = m.category === "待辦" || m.category === "預訂" ? 0.3 : 0;
-      return { m, score: (q.size ? hit / Math.sqrt(q.size) : 0) + recent + urgent };
+      return { m, score: (q.size ? hit / Math.sqrt(q.size) : 0) + recent + urgent + semanticBoost(sims?.get(`memory:${m.id}`)) };
     });
     const list = scored.sort((a, b) => b.score - a.score).slice(0, 25).map((x) => x.m).sort((a, b) => Number(a.ts) - Number(b.ts));
     return { list, total: all.length };
@@ -2216,7 +2413,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       reminders: this.reminderList(),
       documents: this.documentFind().map((d) => ({ id: d.id, title: d.title, note: d.note, author: d.author, ts: d.ts, photo: `/api/photo/${d.photo_id}`, folder: d.folder_id ?? null })),
       docFolders: this.sql.exec("SELECT id, name, parent_id AS parent FROM doc_folders ORDER BY id").toArray(),
-      diaries: this.sql.exec("SELECT date, ts, title, text, photo_ids, edited_by, edited_at FROM diaries ORDER BY date DESC").toArray(),
+      diaries: this.sql.exec("SELECT date, ts, title, text, photo_ids, edited_by, edited_at, span FROM diaries ORDER BY date DESC").toArray(),
       // 置頂訊息附完整內容：訊息再舊、畫面上沒載入也看得到
       pins: this.sql
         .exec<MessageRow & { pin_ts: number; pin_by: string }>("SELECT m.*, p.ts AS pin_ts, p.by AS pin_by FROM pins p JOIN messages m ON m.id = p.message_id ORDER BY p.ts DESC")
@@ -2235,6 +2432,8 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             cards: this.sql.exec("SELECT id, ts, kind, title, body FROM cards WHERE status = 'pending' ORDER BY ts DESC LIMIT 10").toArray(),
             dreamOps: this.sql.exec("SELECT id, ts, op, before, after, reason, undone FROM dream_ops ORDER BY id DESC LIMIT 20").toArray(),
             episodes: this.sql.exec("SELECT date, summary, weekly FROM episodes ORDER BY date DESC LIMIT 10").toArray(),
+            memos: this.sql.exec("SELECT id, ts, title, status, source, segs, done_segs, ended, seconds, engine, summary, actions, note_id, error FROM memos ORDER BY id DESC LIMIT 20").toArray(),
+            idDocs: this.idDocList(),
           }
         : {}),
     };
@@ -2748,11 +2947,12 @@ ${transcript}
       id = Number(this.sql.exec("INSERT INTO notes (ts, author, title, summary, content, url, tags, thumb, inbox) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id", Date.now(), author, n.title, n.summary, n.content ?? null, n.url ?? null, tags, n.thumb ?? null, inbox ? 1 : 0).one().id);
     }
     this.broadcastState();
+    if (this.isPersonal()) this.ctx.waitUntil(this.syncEmbeddings());
     return { saved_id: id, updated: !!old, note: "已存進 工具箱 → 知識庫" };
   }
 
-  /** 知識庫搜尋：關鍵字（標題、摘要、原文、標籤）＋雙字詞相似度 */
-  noteSearch(keyword: string) {
+  /** 知識庫搜尋：關鍵字（標題、摘要、原文、標籤）＋雙字詞相似度＋語意（用詞不同、意思相近也找得到） */
+  async noteSearch(keyword: string) {
     const rows = [
       ...this.sql.exec("SELECT 'note' AS kind, id, ts, title, summary, content, url, tags FROM notes ORDER BY ts DESC").toArray(),
       ...this.sql.exec("SELECT 'doc' AS kind, d.id, d.ts, d.title, d.note AS summary, f.name AS content, NULL AS url, '[]' AS tags FROM documents d LEFT JOIN doc_folders f ON f.id = d.folder_id ORDER BY d.ts DESC").toArray(),
@@ -2765,6 +2965,7 @@ ${transcript}
     if (!k) return { found: rows.length, notes: rows.filter((r) => r.kind === "note").slice(0, 8).map(fmt) };
     const words = k.split(/\s+/).filter(Boolean);
     const q = bigrams(k);
+    const sims = this.isPersonal() ? await this.similarity(k) : null;
     const scored = rows
       .map((r) => {
         const text = `${r.title} ${r.summary} ${r.content ?? ""} ${r.tags}`.toLowerCase();
@@ -2772,12 +2973,552 @@ ${transcript}
         const g = bigrams(text);
         let hit = 0;
         for (const x of q) if (g.has(x)) hit++;
-        return { r, score: exact + (q.size ? hit / q.size : 0) };
+        return { r, score: exact + (q.size ? hit / q.size : 0) + semanticBoost(sims?.get(`${r.kind}:${r.id}`)) };
       })
       .filter((x) => x.score >= 0.5)
       .sort((a, b) => b.score - a.score)
       .slice(0, 8);
     return scored.length ? { found: scored.length, notes: scored.map((x) => fmt(x.r)) } : { found: 0, note: "知識庫裡找不到相關的內容" };
+  }
+
+  // ================= 語意搜尋：知識庫、保管箱、記憶的向量（Workers AI bge-m3，存在這個空間自己的資料庫） =================
+
+  private async embedTexts(texts: string[]): Promise<Float32Array[] | null> {
+    if (!texts.length) return [];
+    if (await this.workersAiBlocked()) return null;
+    try {
+      const r = (await this.env.AI.run("@cf/baai/bge-m3" as any, { text: texts })) as { data?: number[][] };
+      const data = r?.data ?? [];
+      return data.length === texts.length ? data.map((v) => Float32Array.from(v)) : null;
+    } catch (e) {
+      if (isQuotaError(e)) this.noteQuota(new WorkersAiQuotaError());
+      else console.error("embedding failed", e);
+      return null;
+    }
+  }
+
+  /** 要算向量的東西：知識庫（標題＋標籤＋摘要）、保管箱的照片文件、有效的記憶 */
+  private embedSources(): { key: string; kind: string; ref: number; text: string }[] {
+    const out: { key: string; kind: string; ref: number; text: string }[] = [];
+    for (const n of this.sql.exec("SELECT id, title, summary, tags FROM notes").toArray()) {
+      let tags = "";
+      try {
+        tags = (JSON.parse(String(n.tags || "[]")) as string[]).join("、");
+      } catch {}
+      out.push({ key: `note:${n.id}`, kind: "note", ref: Number(n.id), text: `${n.title}\n${tags}\n${n.summary}`.slice(0, 1500) });
+    }
+    for (const d of this.sql.exec("SELECT id, title, note FROM documents").toArray()) {
+      out.push({ key: `doc:${d.id}`, kind: "doc", ref: Number(d.id), text: `${d.title}\n${d.note ?? ""}`.slice(0, 800) });
+    }
+    for (const m of this.memories()) out.push({ key: `memory:${m.id}`, kind: "memory", ref: Number(m.id), text: String(m.content).slice(0, 500) });
+    return out;
+  }
+
+  private embedBusy = false;
+  /** 新增、改過的才重算，刪掉的順便清掉；一次最多 max 筆（Workers AI 額度用完就等下次） */
+  private async syncEmbeddings(max = 60) {
+    if (!this.isPersonal() || this.embedBusy) return;
+    this.embedBusy = true;
+    try {
+      const have = new Map(this.sql.exec("SELECT kind, ref, hash FROM embeddings").toArray().map((r) => [`${r.kind}:${r.ref}`, String(r.hash)]));
+      const src = this.embedSources().map((x) => ({ ...x, hash: textHash(x.text) }));
+      const live = new Set(src.map((x) => x.key));
+      for (const k of have.keys()) {
+        if (live.has(k)) continue;
+        const [kind, ref] = k.split(":");
+        this.sql.exec("DELETE FROM embeddings WHERE kind = ? AND ref = ?", kind, Number(ref));
+      }
+      const todo = src.filter((x) => have.get(x.key) !== x.hash).slice(0, max);
+      for (let i = 0; i < todo.length; i += 20) {
+        const batch = todo.slice(i, i + 20);
+        const vecs = await this.embedTexts(batch.map((b) => b.text));
+        if (!vecs) break;
+        batch.forEach((b, k) => this.sql.exec("INSERT OR REPLACE INTO embeddings (kind, ref, hash, vec) VALUES (?, ?, ?, ?)", b.kind, b.ref, b.hash, vecs[k].buffer));
+      }
+    } catch (e) {
+      console.error("syncEmbeddings failed", e);
+    } finally {
+      this.embedBusy = false;
+    }
+  }
+
+  /** 問句跟每一筆的語意相似度（0–1）；Workers AI 不能用時回 null，搜尋就只看關鍵字 */
+  private async similarity(text: string): Promise<Map<string, number> | null> {
+    if (!this.sql.exec("SELECT 1 FROM embeddings LIMIT 1").toArray().length) return null;
+    const q = (await this.embedTexts([text.slice(0, 500)]))?.[0];
+    if (!q) return null;
+    const out = new Map<string, number>();
+    for (const r of this.sql.exec("SELECT kind, ref, vec FROM embeddings").toArray()) out.set(`${r.kind}:${r.ref}`, cosine(q, new Float32Array(r.vec as ArrayBuffer)));
+    return out;
+  }
+
+  /** 記憶很多時，挑跟這次對話最相關的放進提示詞：先把問句的語意算好 */
+  private memQuery: { text: string; sims: Map<string, number> } | null = null;
+  private async prepareMemoryQuery(text: string) {
+    this.memQuery = null;
+    if (!text.trim() || this.memories().length <= 40) return;
+    const sims = await this.similarity(text);
+    if (sims) this.memQuery = { text, sims };
+  }
+
+  // ================= 語音備忘：錄音分段上傳 → 逐段轉文字（Gemini 優先，Whisper 備援）→ 整理重點、待辦，存進知識庫 =================
+
+  private async memoStart(req: Request, author: string): Promise<Response> {
+    const b = (await req.json().catch(() => ({}))) as { mime?: string; title?: string; source?: string };
+    const mime = String(b.mime ?? "").split(";")[0].trim().toLowerCase();
+    if (!AUDIO_MIME.test(mime)) return Response.json({ ok: false, error: "不支援這種檔案，請選錄音檔" }, { status: 400 });
+    const open = this.sql.exec("SELECT COUNT(*) AS n FROM memos WHERE status = 'recording'").one().n as number;
+    if (open >= 3) return Response.json({ ok: false, error: "還有好幾段錄音沒結束，請先停止再開始新的" }, { status: 429 });
+    const id = this.sql
+      .exec(
+        "INSERT INTO memos (ts, author, title, status, mime, source, updated) VALUES (?, ?, ?, 'recording', ?, ?, ?) RETURNING id",
+        Date.now(), author, String(b.title ?? "").trim().slice(0, 60), mime, b.source === "file" ? "file" : "rec", Date.now(),
+      )
+      .one().id as number;
+    this.broadcastState();
+    return Response.json({ ok: true, id });
+  }
+
+  private async memoSegment(id: number, url: URL, req: Request): Promise<Response> {
+    const fail = (error: string, status = 400) => Response.json({ ok: false, error }, { status });
+    const m = this.sql.exec("SELECT status FROM memos WHERE id = ?", id).toArray()[0];
+    if (!m) return fail("找不到這段錄音", 404);
+    if (m.status !== "recording") return fail("這段錄音已經結束", 409);
+    const n = (k: string, d: number) => Number(url.searchParams.get(k) ?? d);
+    const seq = n("seq", 0), part = n("part", 0), parts = n("parts", 1);
+    if (![seq, part, parts].every(Number.isInteger) || seq < 0 || seq > 300 || parts < 1 || parts > 20 || part < 0 || part >= parts) return fail("上傳參數不正確");
+    const data = new Uint8Array(await req.arrayBuffer());
+    if (data.byteLength > 10_000_000) return fail("這一塊太大", 413);
+    const last = url.searchParams.get("last") === "1" && part === parts - 1;
+    if (data.byteLength) {
+      const used = this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM memo_audio").one().n as number;
+      if (used + data.byteLength > MEMO_AUDIO_LIMIT) return fail("還有太多錄音在排隊轉文字，請稍後再傳", 507);
+      // Durable Object 的資料庫一格最多 2MB：切成 1.5MB 一塊存（編號＝第幾塊上傳×100＋第幾小塊）
+      for (let off = 0, k = 0; off < data.byteLength; off += 1_500_000, k++) {
+        this.sql.exec("INSERT OR REPLACE INTO memo_audio (memo_id, seq, part, data) VALUES (?, ?, ?, ?)", id, seq, part * 100 + k, data.slice(off, off + 1_500_000).buffer);
+      }
+      if (part === parts - 1) {
+        const bytes = this.sql.exec("SELECT COALESCE(SUM(LENGTH(data)), 0) AS n FROM memo_audio WHERE memo_id = ? AND seq = ?", id, seq).one().n as number;
+        const seconds = Math.max(0, Math.min(6 * 3600, n("seconds", 0) || 0));
+        this.sql.exec(
+          "INSERT INTO memo_segs (memo_id, seq, bytes, seconds, status, tries) VALUES (?, ?, ?, ?, 'pending', 0) ON CONFLICT(memo_id, seq) DO UPDATE SET bytes = excluded.bytes, seconds = excluded.seconds, status = 'pending', tries = 0",
+          id, seq, bytes, seconds,
+        );
+      }
+    } else if (!last) return fail("沒有收到音檔");
+    const segs = this.sql.exec("SELECT COUNT(*) AS n FROM memo_segs WHERE memo_id = ?", id).one().n as number;
+    this.sql.exec("UPDATE memos SET segs = ?, updated = ?, ended = ?, status = ? WHERE id = ?", segs, Date.now(), last ? 1 : 0, last ? "processing" : "recording", id);
+    this.broadcastState();
+    this.kickMemos();
+    return Response.json({ ok: true });
+  }
+
+  private memoBusy = false;
+  private kickMemos() {
+    this.ctx.waitUntil(this.processMemos());
+  }
+
+  /** 下一次要處理錄音的時間（排程用）：有段落在排隊就 15 秒後；額度用完在等就等到重試時間 */
+  private nextMemoWork(): number | null {
+    const waiting =
+      this.sql.exec("SELECT 1 FROM memo_segs s JOIN memos m ON m.id = s.memo_id WHERE s.status = 'pending' AND m.status IN ('recording', 'processing') LIMIT 1").toArray().length ||
+      this.sql.exec("SELECT 1 FROM memos WHERE status = 'processing' AND ended = 1 LIMIT 1").toArray().length;
+    if (!waiting) return null;
+    return Math.max(Date.now() + 15_000, Number(this.setting("memo_retry_at", "0")));
+  }
+
+  private async processMemos() {
+    if (this.memoBusy || !this.isPersonal()) return;
+    if (Date.now() < Number(this.setting("memo_retry_at", "0"))) return;
+    this.memoBusy = true;
+    try {
+      // 錄到一半斷線（手機沒電、關掉 App）：6 小時沒有新的段落就當作錄完，用已經收到的整理
+      this.sql.exec("UPDATE memos SET ended = 1, status = 'processing' WHERE status = 'recording' AND updated < ?", Date.now() - 6 * 3600_000);
+      for (let i = 0; i < 40; i++) {
+        const seg = this.sql
+          .exec("SELECT s.memo_id, s.seq, s.tries, m.mime FROM memo_segs s JOIN memos m ON m.id = s.memo_id WHERE s.status = 'pending' AND m.status IN ('recording', 'processing') ORDER BY s.memo_id, s.seq LIMIT 1")
+          .toArray()[0];
+        if (!seg) break;
+        if ((await this.transcribeSegment(Number(seg.memo_id), Number(seg.seq), String(seg.mime), Number(seg.tries))) === "later") return;
+      }
+      for (const m of this.sql.exec("SELECT id FROM memos WHERE status = 'processing' AND ended = 1").toArray()) {
+        const left = this.sql.exec("SELECT COUNT(*) AS n FROM memo_segs WHERE memo_id = ? AND status = 'pending'", m.id).one().n as number;
+        if (!left) await this.finishMemo(Number(m.id));
+      }
+    } catch (e) {
+      console.error("processMemos failed", e);
+    } finally {
+      this.memoBusy = false;
+    }
+  }
+
+  /** 轉一段錄音：done＝轉好了；later＝AI 額度暫時用完（音檔留著，晚點自動再試）；failed＝這次失敗（最多試 3 次） */
+  private async transcribeSegment(memoId: number, seq: number, mime: string, tries: number): Promise<"done" | "later" | "failed"> {
+    const audio = concatBytes(this.sql.exec("SELECT data FROM memo_audio WHERE memo_id = ? AND seq = ? ORDER BY part", memoId, seq).toArray().map((r) => new Uint8Array(r.data as ArrayBuffer)));
+    const seconds = Number(this.sql.exec("SELECT seconds FROM memo_segs WHERE memo_id = ? AND seq = ?", memoId, seq).toArray()[0]?.seconds) || 0;
+    const priv = this.setting("voice_engine", "gemini") === "private";
+    const engines: ("gemini" | "whisper")[] = [];
+    if (!priv && (await this.keys()).gemini) engines.push("gemini");
+    if (audio.byteLength <= WHISPER_MAX) engines.push("whisper");
+    let lastError = !audio.byteLength
+      ? "音檔不見了"
+      : engines.length ? "" : priv ? "隱私模式只能轉 9MB 以內的檔案（在 App 裡直接錄音沒有限制）" : "檔案太大，要有 Gemini 金鑰才能轉";
+    let limited = 0;
+    for (const engine of audio.byteLength ? engines : []) {
+      try {
+        const text = engine === "gemini" ? await this.transcribeGemini(audio, mime, seconds) : await this.transcribeWhisper(audio);
+        this.sql.exec("UPDATE memo_segs SET status = 'done', text = ?, engine = ? WHERE memo_id = ? AND seq = ?", text, engine, memoId, seq);
+        this.sql.exec("DELETE FROM memo_audio WHERE memo_id = ? AND seq = ?", memoId, seq);
+        this.sql.exec("UPDATE memos SET done_segs = done_segs + 1, error = NULL, updated = ? WHERE id = ?", Date.now(), memoId);
+        this.broadcastState();
+        return "done";
+      } catch (e: any) {
+        lastError = String(e?.message ?? e).slice(0, 300);
+        if (e instanceof RateLimitedError || e instanceof WorkersAiQuotaError || /Gemini (429|503)/.test(lastError)) limited++;
+        else console.error(`transcribe via ${engine} failed`, lastError);
+      }
+    }
+    if (engines.length && limited === engines.length) {
+      // 每個引擎都是額度用完：5 分鐘後自動再試，不算失敗次數
+      this.setSetting("memo_retry_at", String(Date.now() + 5 * 60_000));
+      this.sql.exec("UPDATE memos SET error = ? WHERE id = ?", "AI 額度暫時用完，稍後會自動再試", memoId);
+      this.broadcastState();
+      return "later";
+    }
+    const giveUp = tries + 1 >= 3 || !engines.length || !audio.byteLength;
+    this.sql.exec("UPDATE memo_segs SET tries = tries + 1, status = ?, text = ? WHERE memo_id = ? AND seq = ?", giveUp ? "failed" : "pending", giveUp ? lastError : null, memoId, seq);
+    if (giveUp) this.sql.exec("UPDATE memos SET done_segs = done_segs + 1, error = ?, updated = ? WHERE id = ?", lastError, Date.now(), memoId);
+    this.broadcastState();
+    return "failed";
+  }
+
+  private async transcribeGemini(audio: Uint8Array, mime: string, seconds: number): Promise<string> {
+    const key = (await this.keys()).gemini;
+    const type = geminiMime(mime);
+    const media =
+      audio.byteLength <= GEMINI_INLINE_MAX
+        ? { mime: type, data: toBase64(audio.buffer as ArrayBuffer), seconds: seconds || undefined }
+        : { mime: type, uri: await uploadGeminiFile(key, audio, type), seconds: seconds || undefined };
+    const r = await (await this.provider("gemini-own", 1, 30_000)).generate({
+      system: "你是專業的逐字稿聽打員，只輸出逐字稿。",
+      turns: [{ role: "user", parts: [{ media }, { text: TRANSCRIBE_PROMPT }] }],
+      timeoutMs: 300_000,
+    });
+    return r.text.trim() || "（沒有聲音）";
+  }
+
+  private async transcribeWhisper(audio: Uint8Array): Promise<string> {
+    if (await this.workersAiBlocked()) throw new WorkersAiQuotaError();
+    try {
+      const r = (await this.env.AI.run("@cf/openai/whisper-large-v3-turbo" as any, {
+        audio: toBase64(audio.buffer as ArrayBuffer),
+        language: "zh",
+        // 開頭給一句繁體中文，輸出才會是繁體
+        initial_prompt: "以下是繁體中文的錄音逐字稿。",
+        vad_filter: true,
+      })) as { text?: string };
+      return String(r?.text ?? "").trim() || "（沒有聲音）";
+    } catch (e) {
+      if (isQuotaError(e)) {
+        const q = new WorkersAiQuotaError();
+        this.noteQuota(q);
+        throw q;
+      }
+      throw e;
+    }
+  }
+
+  /** 每一段都轉好了：接成逐字稿，請 AI 整理重點、決定、待辦，存進知識庫並在聊天通知 */
+  private async finishMemo(id: number) {
+    const m = this.sql.exec("SELECT * FROM memos WHERE id = ?", id).toArray()[0];
+    if (!m) return;
+    const segs = this.sql.exec("SELECT seq, status, text, seconds, engine FROM memo_segs WHERE memo_id = ? ORDER BY seq", id).toArray();
+    let offset = 0;
+    const pieces: string[] = [];
+    for (const g of segs) {
+      const head = segs.length > 1 ? `【${fmtDuration(offset)}】\n` : "";
+      pieces.push(head + (g.status === "done" ? String(g.text ?? "") : "（這段轉錄失敗）"));
+      offset += Number(g.seconds) || 0;
+    }
+    const transcript = pieces.join("\n\n").trim();
+    const seconds = Math.round(offset);
+    const engine = [...new Set(segs.map((g) => String(g.engine ?? "")).filter(Boolean))].join("+");
+    const heard = segs.some((g) => g.status === "done" && String(g.text ?? "").trim() && String(g.text).trim() !== "（沒有聲音）");
+    if (!heard) {
+      // 一個字都沒轉出來：音檔先留著，可以按「重試」
+      const failed = segs.find((g) => g.status === "failed");
+      this.sql.exec(
+        "UPDATE memos SET status = 'error', error = ?, seconds = ?, engine = ?, updated = ? WHERE id = ?",
+        failed ? `轉文字失敗：${String(failed.text || "").slice(0, 120)}` : "沒有聽到說話的聲音", seconds, engine, Date.now(), id,
+      );
+      this.broadcastState();
+      return;
+    }
+    const owner = this.p().travelers[0]?.name || "使用者";
+    const today = this.today();
+    const priv = this.setting("voice_engine", "gemini") === "private";
+    const cap = priv ? 24_000 : 100_000;
+    const body = transcript.length > cap ? `${transcript.slice(0, cap / 2)}\n…（中間省略）…\n${transcript.slice(-cap / 2)}` : transcript;
+    const prompt = `下面是${owner}${m.source === "file" ? "上傳" : "錄"}的一段錄音逐字稿（今天是 ${today}${seconds ? `，長度約 ${fmtDuration(seconds)}` : ""}），可能是會議、上課、訪談或自己的口述備忘。請整理成 JSON：
+{"title": "15 字內的標題，說清楚是什麼", "summary": "重點摘要，Markdown 條列 3–8 點，寫具體的數字、日期、人名、地點", "decisions": ["做出的決定"], "actions": [{"item": "要做的事（動詞開頭）", "who": "負責的人（沒說就空字串）", "due": "期限 YYYY-MM-DD（沒說就空字串）"}], "tags": ["2–5 個標籤"]}
+只根據逐字稿，不要編造；聽不清楚的地方略過。「下週三」這類日期用今天 ${today} 換算成實際日期。沒有決定或待辦就給空陣列。
+
+逐字稿：
+${body}`;
+    let j: Record<string, any> = {};
+    try {
+      const system = "你是幫忙整理會議記錄的助理，只根據逐字稿，只輸出 JSON。";
+      // 隱私模式：摘要也只用 Cloudflare 的模型
+      const raw = priv
+        ? (await (await this.provider("workers-ai")).generate({ system, turns: [{ role: "user", parts: [{ text: prompt }] }], json: true, maxTokens: 4096 })).text
+        : await this.generateText(system, prompt, true, 1, 4096);
+      j = parseArgs(raw.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as Record<string, any>;
+    } catch (e) {
+      console.error("memo summary failed", e);
+    }
+    const arr = (x: unknown): any[] => (Array.isArray(x) ? x : []);
+    const title = (String(j.title ?? "").trim() || String(m.title ?? "").trim() || `${mdText(today)} 的錄音`).slice(0, 40);
+    const summary = String(j.summary ?? "").trim().slice(0, 3000) || "（AI 暫時不能整理重點，逐字稿已經存好）";
+    const decisions = arr(j.decisions).map((d) => String(d).trim()).filter(Boolean).slice(0, 10);
+    const actions = arr(j.actions)
+      .map((a) => ({
+        item: String(typeof a === "string" ? a : a?.item ?? "").trim().slice(0, 120),
+        who: String(a?.who ?? "").trim().slice(0, 20),
+        due: /^\d{4}-\d{2}-\d{2}$/.test(String(a?.due ?? "")) ? String(a.due) : "",
+        added: false,
+      }))
+      .filter((a) => a.item)
+      .slice(0, 15);
+    const tags = arr(j.tags).map((t) => String(t).trim().slice(0, 20)).filter(Boolean).slice(0, 5);
+    const actionLines = actions.map((a) => `- ${a.item}${a.who ? `（${a.who}）` : ""}${a.due ? `｜${a.due}` : ""}`).join("\n");
+    // 語音備忘頁的待辦另外列（可以一鍵加進清單），那邊的摘要只放重點和決定；知識庫那筆三樣都放
+    const brief = [summary, decisions.length ? `**決定**\n${decisions.map((d) => `- ${d}`).join("\n")}` : ""].filter(Boolean).join("\n\n");
+    const full = [brief, actions.length ? `**待辦**\n${actionLines}` : ""].filter(Boolean).join("\n\n");
+    const saved = this.noteSave({ title: `🎙️ ${title}`, summary: full, content: transcript.slice(0, 300_000), tags: [...new Set([...tags, "錄音"])] }, String(m.author), false) as { saved_id?: number };
+    this.sql.exec(
+      "UPDATE memos SET status = 'done', title = ?, summary = ?, actions = ?, transcript = ?, seconds = ?, engine = ?, note_id = ?, error = NULL, updated = ? WHERE id = ?",
+      title, brief, JSON.stringify(actions), transcript, seconds, engine, saved.saved_id ?? null, Date.now(), id,
+    );
+    for (const t of ["memo_audio", "memo_segs"]) this.sql.exec(`DELETE FROM ${t} WHERE memo_id = ?`, id);
+    this.postAiMessage(
+      `🎙️ **錄音整理好了｜${title}**${seconds ? `（${fmtDuration(seconds)}）` : ""}\n\n${summary}${actions.length ? `\n\n**待辦建議**\n${actionLines}` : ""}\n\n逐字稿和重點已存進[知識庫](#note-${saved.saved_id})；到「工具箱 → 語音備忘」可以把待辦一鍵加進清單。`,
+      { kind: "memo" },
+    );
+    this.broadcastState();
+    await this.pushAll({ title: "🎙️ 錄音整理好了", body: title, tag: `memo-${id}` });
+  }
+
+  /** 把錄音整理出的待辦加進清單（idx＝第幾項；沒給就全部） */
+  private memoTodo(id: number, idx: number | null, by: string): string | null {
+    const m = this.sql.exec("SELECT actions FROM memos WHERE id = ?", id).toArray()[0];
+    if (!m) return "找不到這段錄音";
+    const acts = JSON.parse(String(m.actions || "[]")) as { item: string; who: string; due: string; added: boolean }[];
+    const pick = acts.filter((a, i) => !a.added && (idx == null || i === idx));
+    if (!pick.length) return "這些待辦已經加過了";
+    this.checklistAdd("待辦", pick.map((a) => `${a.item}${a.due ? `（${mdText(a.due)} 前）` : ""}`), "", by);
+    for (const a of pick) a.added = true;
+    this.sql.exec("UPDATE memos SET actions = ? WHERE id = ?", JSON.stringify(acts), id);
+    this.broadcastState();
+    return null;
+  }
+
+  // ================= 從手機分享進來（iPhone 捷徑打收件網址；Android 的分享選單會打開 App 頁面） =================
+
+  private async inboxCapture(token: string, req: Request): Promise<Response> {
+    const say = (text: string, status = 200) => new Response(text, { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+    const saved = this.setting("inbox_token");
+    if (!this.isPersonal() || !saved || !safeEqual(token, saved)) return say("這個收件網址已經失效，請到個人助理的設定重新產生", 404);
+    // 一小時最多 30 則：網址外流也不會被灌爆
+    const hour = Math.floor(Date.now() / 3600_000);
+    const [h, n] = this.setting("inbox_rate", "0:0").split(":").map(Number);
+    const count = h === hour ? n + 1 : 1;
+    if (count > 30) return say("這一小時收太多了，請稍後再試", 429);
+    this.setSetting("inbox_rate", `${hour}:${count}`);
+    const raw = (await req.text()).slice(0, 20_000);
+    let fields: unknown[] = [raw];
+    if (/^\s*[{[]/.test(raw)) {
+      try {
+        const j = JSON.parse(raw);
+        if (j && typeof j === "object" && !Array.isArray(j)) fields = [j.title, j.text, j.url, j.input];
+      } catch {}
+    } else if (/form-urlencoded/.test(req.headers.get("content-type") ?? "")) {
+      const f = new URLSearchParams(raw);
+      fields = [f.get("title"), f.get("text"), f.get("url")];
+    }
+    const content = joinShared(fields).slice(0, 4000);
+    if (!content) return say("沒有收到內容", 400);
+    this.captureMessage(content, "share");
+    return say("✅ 已送到個人助理，整理好會存進知識庫");
+  }
+
+  /** 分享進來的東西：當成本人在聊天說「存到知識庫：…」，照一般流程讀連結、整理、存進知識庫 */
+  private captureMessage(content: string, via: string) {
+    const owner = this.p().travelers[0]?.name || "我";
+    const row = this.insertMessage({ author: owner, role: "user", text: `存到知識庫：${content}`, photo_id: null, lat: null, lon: null, meta: JSON.stringify({ via }) });
+    this.broadcast({ type: "message", message: this.publicMessage(row) });
+    const job = this.queue.then(() => this.runAgent(row, { name: owner, admin: true, joined: Date.now() }));
+    this.queue = job.catch(() => {});
+    this.ctx.waitUntil(job);
+  }
+
+  // ================= 證件到期：只記種類、持有人、到期日、末四碼，到期前提醒 =================
+
+  private idSteps(kind: string): number[] {
+    return /護照|passport/i.test(kind) ? PASSPORT_STEPS : ID_STEPS;
+  }
+
+  idDocAdd(d: { kind?: unknown; holder?: unknown; expires?: unknown; last4?: unknown }, author: string): { error: string } | Record<string, unknown> {
+    const kind = String(d.kind ?? "").trim().slice(0, 12) || "證件";
+    const holder = String(d.holder ?? "").trim().slice(0, 16) || this.p().travelers[0]?.name || "我";
+    const expires = normalizeExpiry(String(d.expires ?? ""));
+    if (!expires) return { error: "到期日看不懂，請寫成 YYYY-MM-DD" };
+    // 只留末四碼：就算傳來完整號碼也不存
+    const last4 = String(d.last4 ?? "").replace(/[^0-9A-Za-z]/g, "").slice(-4);
+    const days = daysUntil(this.today(), expires);
+    const steps = this.idSteps(kind);
+    // 已經過了的提醒點不補發（剛記下來的人自己知道）
+    const notified = steps.filter((t) => days <= t).reduce((a, b) => Math.min(a, b), 100_000);
+    const id = this.sql
+      .exec("INSERT INTO id_docs (ts, kind, holder, last4, expires, author, notified) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id", Date.now(), kind, holder, last4, expires, author, notified)
+      .one().id as number;
+    this.broadcastState();
+    const ahead = steps.filter((t) => t > 0 && t < days).map((t) => (t >= 30 ? `${Math.round(t / 30)} 個月` : `${t} 天`));
+    return { saved_id: id, kind, holder, expires, days_left: days, note: ahead.length ? `到期前 ${ahead.join("、")} 會提醒` : "到期當天會提醒" };
+  }
+
+  idDocList() {
+    const today = this.today();
+    return this.sql
+      .exec("SELECT id, kind, holder, last4, expires FROM id_docs ORDER BY expires")
+      .toArray()
+      .map((r) => ({ ...r, days: daysUntil(today, String(r.expires)) }));
+  }
+
+  /** 每天檢查一次：跨過提醒點（護照 6 個月、3 個月、1 個月、1 週、當天）就在聊天和手機通知 */
+  private async checkIdExpiry(today: string) {
+    if (this.setting("id_check") === today) return;
+    this.setSetting("id_check", today);
+    for (const d of this.sql.exec("SELECT * FROM id_docs").toArray()) {
+      const days = daysUntil(today, String(d.expires));
+      const hit = this.idSteps(String(d.kind)).filter((t) => days <= t && t < Number(d.notified));
+      if (!hit.length) continue;
+      this.sql.exec("UPDATE id_docs SET notified = ? WHERE id = ?", Math.min(...hit), d.id);
+      const who = `${d.holder}的${d.kind}${d.last4 ? `（末四碼 ${d.last4}）` : ""}`;
+      const tip = /護照/.test(String(d.kind)) ? "出國時護照效期通常要 6 個月以上，記得提早換發。" : "記得提早辦理換發。";
+      const text =
+        days < 0 ? `🪪 **證件已過期**：${who}在 ${d.expires} 到期了。${tip}`
+        : days === 0 ? `🪪 **證件今天到期**：${who}。${tip}`
+        : `🪪 **證件快到期**：${who}在 ${d.expires} 到期，還有 ${days} 天。${tip}`;
+      this.postAiMessage(text, { kind: "id_expiry" });
+      await this.pushAll({ title: days < 0 ? "🪪 證件已過期" : "🪪 證件快到期", body: pushText(text), tag: `id-${d.id}` });
+    }
+    this.broadcastState();
+  }
+
+  // ================= 個人日記：預設每週一篇（週一早上寫上一週），也可以改成每天一篇（隔天早上寫前一天） =================
+
+  private async maybePersonalDiary(now: ReturnType<typeof zoned>) {
+    const mode = this.setting("diary_mode", "weekly");
+    if (mode === "off" || now.hour < 5) return;
+    const yesterday = shiftDays(now.date, -1);
+    if (this.setting("pdiary_sent") === yesterday) return;
+    if (mode === "weekly" && new Date(now.date + "T00:00:00Z").getUTCDay() !== 1) return;
+    this.setSetting("pdiary_sent", yesterday);
+    await this.writePersonalDiary(yesterday, mode === "daily" ? 1 : 7);
+  }
+
+  /** 寫 endDate 為止 span 天的日記（span＝7 是週記）；資料太少回傳原因，不寫 */
+  private async writePersonalDiary(endDate: string, span: number, announce = true): Promise<string | null> {
+    const p = this.p();
+    const owner = p.travelers[0]?.name || "我";
+    const startDate = shiftDays(endDate, 1 - span);
+    const start = localToUtc(startDate, "00:00", p.timezone) ?? Date.parse(startDate + "T00:00:00Z");
+    const end = localToUtc(shiftDays(endDate, 1), "00:00", p.timezone) ?? start + span * 86400_000;
+    const msgs = this.sql.exec<MessageRow>("SELECT * FROM messages WHERE ts >= ? AND ts < ? ORDER BY ts", start, end).toArray().filter((m) => !systemMade(m));
+    // 證件、票券照片不能進日記
+    const docs = new Set(this.sql.exec("SELECT photo_id FROM documents WHERE photo_id IS NOT NULL").toArray().map((r) => r.photo_id as string));
+    const photoMsgs = msgs.filter((m) => m.photo_id && m.role === "user" && !docs.has(m.photo_id)).slice(-40);
+    const said = msgs.filter((m) => m.role === "user" && m.text.trim());
+    const events = this.eventList(startDate, endDate);
+    if (said.length < 2 && !photoMsgs.length && !events.length) return "這段時間沒什麼對話、照片或行程，寫不出日記";
+    const notes = await this.describePhotos(photoMsgs, true);
+    const score = (m: MessageRow) => notes.get(m.photo_id as string)?.score ?? 3;
+    let pool = photoMsgs.filter((m) => {
+      const n = notes.get(m.photo_id as string);
+      return !n || (!["收據", "截圖", "文件"].includes(n.kind) && n.score >= 3);
+    });
+    if (pool.length > 30) {
+      const keep = new Set([...pool].sort((a, b) => score(b) - score(a)).slice(0, 30));
+      pool = pool.filter((m) => keep.has(m));
+    }
+    const tag = new Map(pool.map((m, i) => [m.photo_id as string, `P${i + 1}`]));
+    const when = (ts: number) => (span > 1 ? `${this.localTime(ts).slice(5, 10).replace("-", "/")} ` : "") + this.hhmm(ts);
+    const catalog = pool
+      .map((m) => {
+        const n = notes.get(m.photo_id as string);
+        return `[${tag.get(m.photo_id as string)}] ${when(m.ts)}｜${n ? `${n.kind}｜精彩度 ${n.score}｜${n.note}` : "（沒有說明）"}${m.text ? `｜附言：「${m.text.slice(0, 60)}」` : ""}`;
+      })
+      .join("\n");
+    const lines = (withAi: boolean) =>
+      msgs
+        .filter((m) => m.role === "user" || (withAi && m.role === "assistant"))
+        .map((m) => {
+          if (m.role === "assistant") {
+            const t = m.text.replace(/\s+/g, " ");
+            return `${when(m.ts)} 助理：${t.slice(0, 120)}${t.length > 120 ? "…" : ""}`;
+          }
+          const pic = m.photo_id ? (tag.has(m.photo_id) ? `（傳了照片 ${tag.get(m.photo_id)}）` : "（傳了照片）") : "";
+          return `${when(m.ts)} ${owner}：${m.text.slice(0, 300)}${pic}`;
+        })
+        .join("\n");
+    let transcript = lines(true);
+    if (transcript.length > 16000) transcript = lines(false);
+    if (transcript.length > 16000) transcript = `${transcript.slice(0, 8000)}\n…（中間省略）…\n${transcript.slice(-8000)}`;
+    const prefix = (date: string) => (span > 1 ? `${mdText(date)} ` : "");
+    const bought = this.sql
+      .exec("SELECT date, description, category FROM expenses WHERE date >= ? AND date <= ? ORDER BY ts", startDate, endDate)
+      .toArray()
+      .slice(0, 40)
+      .map((r) => `${prefix(String(r.date))}${r.description}${r.category ? `（${r.category}）` : ""}`);
+    const kept = this.sql.exec("SELECT title FROM notes WHERE ts >= ? AND ts < ? ORDER BY ts", start, end).toArray().slice(0, 20).map((r) => String(r.title));
+    const cal = events.map((e) => `${prefix(e.date)}${e.start || "整天"} ${e.title}${e.location ? `（${e.location}）` : ""}`);
+    const weekly = span > 1;
+    const prompt = `請根據下面的資料，用第一人稱「我」幫${owner}寫${weekly ? `${startDate} 到 ${endDate} 這一週的週記` : `${endDate} 的日記`}，繁體中文，像${owner}自己寫的生活日記：真誠、自然、有溫度。
+
+【寫法】
+- 第一行寫「標題：」加上標題（8–16 字，不加引號），空一行後寫內文。
+- ${weekly ? "依時間順序挑出這週 3–6 件最值得記下的事（工作、家人、朋友、生活小事、學到的東西、心情），每件事寫一段；最後一段寫這週的感想和下週想做的事。" : "依時間順序寫這一天做了什麼、遇到什麼、心情如何，最有意思的事多寫一點；最後一段寫一點感想。"}
+- 寫出具體的人、地點、事情，可以引用${owner}說過的話；不要寫空泛的句子。
+- 長短跟著資料走：資料多就寫 ${weekly ? "5–8 段、全文 700–1200 字" : "4–6 段、全文 400–800 字"}，資料少就寫短一點。絕對不要編造資料裡沒有的事情、地點或心情。
+- 助理的回答只是建議或解答，不代表${owner}真的做了；以${owner}自己說的話、照片、行事曆和記帳為準。不要提到 AI、助理、App、聊天或手機，不要寫花了多少錢，不要寫證件號碼、卡號、密碼。
+
+【照片】
+- 從照片清單挑最精彩、而且跟內文對得上的照片（最多 8 張，照片少就挑好的就好），放在寫到那件事的段落後面，另起一行寫成 [P編號｜照片說明]，例如：
+[P3｜週末的鬆餅早午餐]
+- 照片說明 6–18 字，內容要跟照片相符；每段最多 2 張、每張最多用一次；對不上的不要放。
+
+期間：${weekly ? `${startDate} – ${endDate}` : endDate}
+行事曆：${cal.join("、") || "（沒有）"}
+記帳的品項：${bought.join("、") || "（沒有）"}
+存進知識庫的東西：${kept.join("、") || "（沒有）"}
+照片清單：
+${catalog || "（沒有照片）"}
+對話（${owner}和助理）：
+${transcript || "（沒什麼對話）"}`;
+    const raw = await this.generateLong(`你是幫${owner}寫生活日記的作家，文筆真誠自然，只根據提供的資料寫。`, prompt);
+    const { title, text, photos, layout } = this.diaryLayout(raw, pool, tag, notes, weekly ? "這一週" : "平凡的一天");
+    this.sql.exec(
+      "INSERT INTO diaries (date, ts, title, text, photo_ids, layout, span) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(date) DO UPDATE SET ts = excluded.ts, title = excluded.title, text = excluded.text, photo_ids = excluded.photo_ids, layout = excluded.layout, span = excluded.span, edited_by = NULL, edited_at = NULL",
+      endDate, Date.now(), title, text, JSON.stringify(photos), layout.length ? JSON.stringify(layout) : null, span,
+    );
+    if (announce) {
+      const caption = new Map(layout.map((l) => [l.id, l.caption]));
+      const images: AttachedImage[] = photos.slice(0, 8).map((id) => ({ src: `/api/photo/${id}`, caption: caption.get(id) ?? "", source: weekly ? "這週的照片" : "這天的照片" }));
+      const label = weekly ? `${mdText(startDate)}–${mdText(endDate)} 週記` : `${mdText(endDate)} 日記`;
+      this.postAiMessage(`📔 **${label}｜${title}**\n\n${text}\n\n（工具箱 → 日記：看圖文版、下載 PDF）`, { kind: "diary", images });
+    }
+    this.broadcastState();
+    return null;
   }
 
   /** 記帳後檢查預算：到八成、超支各提醒一次（聊天＋手機推播） */
@@ -2894,6 +3635,8 @@ ${transcript}
     if (this.setting("maint_date") === today) return;
     this.setSetting("maint_date", today);
     this.sql.exec("UPDATE memories SET status = 'expired', updated = ? WHERE COALESCE(status, 'active') = 'active' AND expires IS NOT NULL AND expires < ?", Date.now(), today);
+    // 轉文字失敗、留著等重試的錄音：7 天後刪掉音檔
+    this.sql.exec("DELETE FROM memo_audio WHERE memo_id IN (SELECT id FROM memos WHERE status = 'error' AND updated < ?)", Date.now() - 7 * 86400_000);
   }
 
   /** 匯出：聊天文字、記憶、清單、提醒、帳本、保管箱的清單（照片太大不放） */
@@ -2914,6 +3657,8 @@ ${transcript}
       notes: rows("SELECT ts, title, summary, content, url, tags FROM notes ORDER BY ts"),
       events: rows("SELECT date, start, end_time, title, location, note, remind_min FROM events ORDER BY date, start"),
       episodes: rows("SELECT date, summary, weekly FROM episodes ORDER BY date"),
+      memos: rows("SELECT ts, title, seconds, summary, actions, transcript FROM memos WHERE status = 'done' ORDER BY ts"),
+      id_docs: rows("SELECT kind, holder, last4, expires FROM id_docs ORDER BY expires"),
     };
   }
 
@@ -2958,6 +3703,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - ${owner}貼了連結（只貼連結，或說「存起來／存到知識庫」）：先用 read_webpage 讀內容（Facebook、Instagram 的 Reels 也看得到影片內容），整理成標題＋3–6 點具體重點＋2–5 個標籤，用 save_note 存進知識庫（url 填原始連結，content 放貼文文字），再回覆重點並說已存進「知識庫」。${owner}只是問連結在講什麼，就回答後問要不要存進知識庫。讀不到內容就照實說，請${owner}貼文字或截圖。
 - 問以前存過的文章、影片、資料、保管箱裡的照片文件 → search_notes；回答用到的內容在句尾加上來源連結，例如 [1](#note-12)（網址用結果裡的 ref）。
 - 行事曆：約會、會議、看診、上課、出遊、繳費截止這類「某天的事」→ add_event（產生確認卡片，按確認才寫入；說了提前提醒就填 remind_minutes）；問這週、某天有什麼事、有沒有空 → list_events；改時間、取消 → update_event／delete_event。只是「幾點提醒我做某件事」用 create_reminder。日期一律換成實際日期再填。
+- 證件到期（護照、身分證、駕照、健保卡…）→ id_expiry（action add）：只記種類、持有人、到期日和號碼末四碼，絕對不要記完整號碼；問哪些證件快到期 → id_expiry（action list）。
+- 錄音（語音備忘）整理好的會議記錄、逐字稿都存在知識庫：問開會、上課說了什麼 → search_notes。
 - remember 只用來記之後還會用到的事。只有「過了某天就不再成立」的事（考試、約會、這週的安排）才填 expires；人名、家人、年齡、喜好、習慣、住址都不要填。
 - 身分證字號、信用卡號、密碼這類敏感資料不要用 remember 記，也提醒${owner}不要在聊天裡傳。`;
   }
@@ -3133,6 +3880,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     // 附了位置就先把地名查好，AI 才不會自己猜在哪裡
     if (trigger.lat != null) await this.ensureArea(trigger.author);
     const history = this.recentMessages(HISTORY_WINDOW);
+    if (this.isPersonal()) await this.prepareMemoryQuery(trigger.text);
     const system = this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
     const images: AttachedImage[] = [];
     const toolsUsed: string[] = [];

@@ -24,6 +24,8 @@ function estimateTokens(system: string, turns: Turn[], tools?: ToolDecl[]): numb
     for (const p of t.parts) {
       if ("text" in p) chars += p.text.length;
       else if ("image" in p) images++;
+      // 音檔一秒約 32 個 token；不知道長度就用大小粗估（32kbps 約每秒 4KB）
+      else if ("media" in p) chars += Math.round((p.media.seconds ?? (p.media.data ? (p.media.data.length * 0.75) / 4000 : 600)) * 32 * 1.8);
       else chars += JSON.stringify("call" in p ? p.call.args : p.result.response).length + 40;
     }
   }
@@ -44,6 +46,7 @@ export function geminiProvider(env: Env, id: ProviderId, apiKey: string, gate?: 
           parts: t.parts.map((p) => {
             if ("text" in p) return { text: p.text };
             if ("image" in p) return { inlineData: { mimeType: p.image.mime, data: p.image.data } };
+            if ("media" in p) return p.media.uri ? { fileData: { mimeType: p.media.mime, fileUri: p.media.uri } } : { inlineData: { mimeType: p.media.mime, data: p.media.data } };
             if ("call" in p) {
               const part: Record<string, unknown> = { functionCall: { id: p.call.id, name: p.call.name, args: p.call.args } };
               if (p.call.sig) part.thoughtSignature = p.call.sig;
@@ -131,6 +134,7 @@ export function workersAIProvider(env: Env, model?: string): Provider {
         for (const p of t.parts) {
           if ("text" in p) texts.push(p.text);
           else if ("image" in p) images.push(`data:${p.image.mime};base64,${p.image.data}`);
+          else if ("media" in p) continue; // Gemma 聽不到音檔（錄音改用 Whisper 轉文字）
           else if ("call" in p) calls.push({ id: p.call.id, type: "function", function: { name: p.call.name, arguments: JSON.stringify(p.call.args) } });
           else messages.push({ role: "tool", tool_call_id: p.result.id, name: p.result.name, content: JSON.stringify(p.result.response) });
         }
@@ -187,6 +191,44 @@ export function workersAIProvider(env: Env, model?: string): Provider {
 }
 
 const CHANNEL_TAG = /<\|?\/?channel\|?>/g;
+
+/**
+ * 大的錄音檔（超過一次請求 20MB 的上限）先傳到 Gemini Files API，回傳檔案網址（Google 48 小時後自動刪除）。
+ * 用 resumable 上傳：先要一個上傳網址，再一次把整個檔案送上去
+ */
+export async function uploadGeminiFile(apiKey: string, bytes: Uint8Array, mime: string): Promise<string> {
+  const base = "https://generativelanguage.googleapis.com";
+  const start = await fetch(`${base}/upload/v1beta/files`, {
+    method: "POST",
+    headers: {
+      "x-goog-api-key": apiKey.trim(),
+      "X-Goog-Upload-Protocol": "resumable",
+      "X-Goog-Upload-Command": "start",
+      "X-Goog-Upload-Header-Content-Length": String(bytes.byteLength),
+      "X-Goog-Upload-Header-Content-Type": mime,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ file: { display_name: "memo" } }),
+  });
+  const uploadUrl = start.headers.get("x-goog-upload-url");
+  if (!start.ok || !uploadUrl) throw new Error(`Gemini ${start.status}: ${(await start.text()).slice(0, 200)}`);
+  const res = await fetch(uploadUrl, {
+    method: "POST",
+    headers: { "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize" },
+    body: bytes,
+    signal: AbortSignal.timeout(180_000),
+  });
+  const j = (await res.json().catch(() => ({}))) as { file?: { name: string; uri: string; state: string } };
+  if (!res.ok || !j.file?.uri) throw new Error(`Gemini ${res.status}: ${JSON.stringify(j).slice(0, 200)}`);
+  // 音檔通常幾秒就處理好；還在處理就等一下
+  let file = j.file;
+  for (let i = 0; i < 40 && file.state === "PROCESSING"; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    file = (await (await fetch(`${base}/v1beta/${file.name}`, { headers: { "x-goog-api-key": apiKey.trim() } })).json()) as typeof file;
+  }
+  if (file.state !== "ACTIVE") throw new Error(`Gemini 檔案處理失敗（${file.state}）`);
+  return file.uri;
+}
 
 export function isQuotaError(e: unknown): boolean {
   return /4006|daily free allocation|neurons/i.test(String((e as any)?.message ?? e));

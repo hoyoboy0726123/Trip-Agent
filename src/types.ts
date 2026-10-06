@@ -37,6 +37,8 @@ export interface SessionUser {
 export type Part =
   | { text: string }
   | { image: { mime: string; data: string } }
+  /** 錄音、影片：data＝base64 直接附上；uri＝先傳到 Gemini Files API 的大檔；seconds 用來估 token */
+  | { media: { mime: string; data?: string; uri?: string; seconds?: number } }
   | { call: { id: string; name: string; args: Record<string, unknown>; sig?: string } }
   | { result: { id: string; name: string; response: unknown } };
 

@@ -1502,19 +1502,31 @@ function renderPanelInner() {
       els.panelTitle.textContent = "🌏 旅程設定";
       b.innerHTML = `${tripForm(S.trip)}
         <div class="row" style="gap:8px"><button class="btn" id="te-rerun" style="flex:1">🔄 請 AI 重新查詢</button><button class="btn primary-sm" id="te-save" style="flex:1">儲存</button></div>
-        <div class="card next-trip-card"><b>🧳 換一個國家繼續玩</b>
-          <div class="small muted">同一群家人去下一個國家：AI 記得大家的口味和習慣，介面整個換成新的國家。</div>
+        <div class="card next-trip-card"><b>🧳 開始下一趟旅程</b>
+          <div class="small muted">同一群家人的下一趟（換國家、換城市都可以）：AI 記得大家的口味和習慣，介面換成新的目的地。</div>
           <button type="button" class="btn" id="te-next">開始設定下一趟</button></div>`;
       const read = bindTripForm(b, S.trip);
-      $("#te-save", b).addEventListener("click", () => action({ action: "update_profile", profile: read() }));
+      /**
+       * 是不是其實要開始下一趟：新日期跟這趟完全不重疊，或換了國家。
+       * 只改城市、飯店是同一趟的修正（城市會影響時區、計程車、交通卡、天氣，重新查詢是對的），不提醒
+       */
+      const looksLikeNextTrip = (what) => {
+        const f = $("#trip-form", b);
+        const t = S.trip;
+        const country = f.country.value.trim(), start = f.startDate.value, end = f.endDate.value;
+        const newDates = start && end && (start > t.endDate || end < t.startDate);
+        const newCountry = country && country !== t.country;
+        if (!newDates && !newCountry) return false;
+        const why = newDates ? `新的日期（${start}～${end}）跟現在這趟（${t.startDate}～${t.endDate}）沒有重疊` : `國家改成「${country}」了`;
+        return !confirm(`${why}，看起來是下一趟旅程。\n\n建議按下面的「開始下一趟旅程」，上一趟的照片、帳目才不會混在一起。\n\n只是修正這一趟的資料，按「確定」繼續${what}。`);
+      };
+      $("#te-save", b).addEventListener("click", () => !looksLikeNextTrip("儲存") && action({ action: "update_profile", profile: read() }));
       $("#te-next", b).addEventListener("click", () => {
         PH.data = null;
         openPanel("nexttrip");
       });
       $("#te-rerun", b).addEventListener("click", () => {
-        // 換了國家：照片、帳目、聊天會跟上一趟混在一起，建議用「換一個國家繼續玩」
-        const country = $("#trip-form", b).country.value.trim();
-        if (country && country !== S.trip.country && !confirm(`國家改成「${country}」了。\n\n如果是要去下一個國家玩，建議按下面的「換一個國家繼續玩」，上一趟的照片、帳目才不會混在一起。\n\n只是改正打錯的國家，按「確定」繼續重新查詢。`)) return;
+        if (looksLikeNextTrip("重新查詢")) return;
         if (confirm("用表單上的國家、城市、日期，讓 AI 重新查一次當地資料？\n\n時區、貨幣、語言、緊急電話、旅遊指南、計程車費率、AI 產生的常用語和清單會換成新查的結果（自己加的不會動）。查完要再確認一次，期間大家暫時不能聊天。")) {
           action({ action: "rerun_init", profile: read() });
           els.panel.close();
@@ -3799,10 +3811,10 @@ else if (location.pathname === "/capture") routeCapture();
 else if (location.pathname === "/new") renderWizard();
 else renderLanding();
 
-// ================= 換一個國家繼續玩（管理員） =================
+// ================= 開始下一趟旅程（管理員） =================
 
 function renderNextTripPanel(st, b) {
-  els.panelTitle.textContent = "🧳 換一個國家繼續玩";
+  els.panelTitle.textContent = "🧳 開始下一趟旅程";
   if (!PH.data && !PH.loading) loadPhotos();
   const t = S.trip || {};
   const ph = PH.data;
@@ -3811,7 +3823,7 @@ function renderNextTripPanel(st, b) {
   const tickets = (st.documents || []).length;
   const expenses = st.expenses?.count || 0;
   b.innerHTML = `
-    <div class="card"><h3>「${escapeHtml(t.title || "")}」之後，換到下一個國家</h3>
+    <div class="card"><h3>「${escapeHtml(t.title || "")}」之後的下一趟</h3>
       <div class="small">會重新跑一次一開始的設定：目的地 → 日期 → 住宿 → 旅伴，AI 再查一次當地資料，你在確認頁按「確認」才算換好。</div></div>
     <div class="card"><h3>會留下來</h3><ul class="small nt-list">
       <li>🧠 長期記憶：家人的口味、過敏、習慣照常記得；只跟這一趟有關的（訂位、待辦、當地行程）會變成「${escapeHtml(t.title || "")}」的回憶</li>

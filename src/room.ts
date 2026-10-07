@@ -451,6 +451,15 @@ function videoButton(question: string) {
   return { buttons: [{ label: "🎬 找相關短片", text: `幫我找剛才介紹的地點的 IG、YouTube 短片（原本的問題：「${q}」）` }] };
 }
 
+/** 成員要中文的影片（台灣人拍的、聽得懂的）：find_short_videos 一定用 language=chinese */
+const CHINESE_ASK = /中文|華語|國語|台灣|臺灣|聽得懂/;
+function chineseButton(places: string[]) {
+  const names = [...new Set(places.filter(Boolean))].slice(0, 2);
+  return {
+    buttons: [{ label: "🗣️ 改找中文介紹的", text: names.length ? `幫我改找「${names.join("」「")}」的中文介紹影片` : "幫我改找中文介紹的影片（剛才那些地點）" }],
+  };
+}
+
 /** 模型自己寫的 IG／YouTube／TikTok 網址常是編的：不是工具找到的就拿掉（連結文字留著） */
 const SOCIAL_HOST = /^https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com)\//i;
 function dropFakeVideoLinks(text: string, known: string): string {
@@ -4886,7 +4895,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結。不要自己寫 Google 地圖網址或短網址，也不要用自己記得的地址或座標當連結。
 - 要看自己傳過的照片（上週拍的、某天的照片、拉麵的照片）→ find_chat_photos（日期換算好，內容寫進 keyword），照片會顯示在回答下方；沒找到就照實說，不要拿網路圖片代替。
 - 要看網路上的照片、圖片時用 find_images（圖片會顯示在回答下方），並說明是網路圖片、僅供參考；沒有要求就不要找圖片。
-- 成員想看任何地點、店家、美食、景點的影片或實際畫面時，不管怎麼說（短片、影片、Reels、YouTube、有人拍嗎、想看看長怎樣、好啊找找看…），都用 find_short_videos 去找（places 填當地語言名稱、中文名稱、地區、類別、keywords），影片卡片會自動顯示在回答下方；不要沒查就叫成員自己去 IG 或 YouTube 搜尋，也絕對不要自己寫 IG、YouTube、TikTok 的影片網址。
+- 成員想看任何地點、店家、美食、景點的影片或實際畫面時，不管怎麼說（短片、影片、Reels、YouTube、有人拍嗎、想看看長怎樣、好啊找找看…），都用 find_short_videos 去找（places 填當地語言名稱、中文名稱、地區、類別、keywords），影片卡片會自動顯示在回答下方；不要沒查就叫成員自己去 IG 或 YouTube 搜尋，也絕對不要自己寫 IG、YouTube、TikTok 的影片網址。預設找當地語言的；成員想看中文介紹的（台灣人拍的、聽得懂的），language 填 chinese 再找一次。
 - 收到照片：辨識內容並說明；說要「存起來」→ save_document（說了資料夾就填 folder）；要找存過的文件、票券 → find_documents。
 - 一次收到好幾張照片（例如菜單好幾頁、好幾張文件）：當成同一份資料一起整理，不要一張一張分開回答。
 - 記帳：${owner}說花了多少錢、只講「項目＋金額」（例如「午餐 120」「加油 1500」是加汽油的錢），或傳收據照片 → add_expense 產生記帳卡片（收據要讀出店名、日期、總金額；民國年加 1911），等${owner}按確認才寫入，不要說「已記好」。問花了多少、預算還剩多少 → expense_summary。花費不要用 remember 記。
@@ -4981,7 +4990,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 要看「大家自己拍、傳到聊天室的照片」（第一天的照片、我們在某地的合照、某人傳的照片、昨天吃的拉麵）→ find_chat_photos（「第一天」「昨天」換算成日期，內容寫進 keyword），照片會顯示在回答下方，不是網路圖片；沒找到就照實說，不要拿網路圖片代替。
 - 你可以用 find_images 把網路上的圖片直接顯示給成員（照片、捷運／地鐵路線圖、平面圖、菜單…），絕對不要說「無法傳送圖片」。
 - 成員要求看網路上的照片／圖片／路線圖時，一定要用 find_images（店名或景點名稱加地名；好幾個地方就放進 queries 一次查完）；圖片會自動顯示在回答下方。絕對不要自己產生圖片網址或圖片搜尋連結，並提醒是網路圖片、僅供參考。沒有要求就不要找圖片。
-- 成員想看任何地點、店家、美食、景點的影片或實際畫面時，不管怎麼說（短片、影片、Reels、YouTube、有人拍嗎、想看看長怎樣、好啊找找看…），都用 find_short_videos 去找（places 填當地語言名稱、中文名稱、地區、類別、keywords），影片卡片會自動顯示在回答下方；不要沒查就叫成員自己去 IG 或 YouTube 搜尋，也絕對不要自己寫 IG、YouTube、TikTok 的影片網址。
+- 成員想看任何地點、店家、美食、景點的影片或實際畫面時，不管怎麼說（短片、影片、Reels、YouTube、有人拍嗎、想看看長怎樣、好啊找找看…），都用 find_short_videos 去找（places 填當地語言名稱、中文名稱、地區、類別、keywords），影片卡片會自動顯示在回答下方；不要沒查就叫成員自己去 IG 或 YouTube 搜尋，也絕對不要自己寫 IG、YouTube、TikTok 的影片網址。預設找當地語言的；成員想看中文介紹的（台灣人拍的、聽得懂的），language 填 chinese 再找一次。
 - 問「我附近有什麼」：直接用 find_nearby，near 留空（系統會自動用發問者的 GPS），回答時列出實際店名、距離、步行分鐘與地圖連結；需要評價再用 web_search 補充。問「我在哪」用 get_member_locations，說出區域與最近的車站。
 - 問計程車多少錢、要多久 → taxi_fare；問地震、颱風、天氣會不會影響行程 → disaster_alerts；問樂園排隊 → theme_park_wait_times。${hasTool("train_status") ? "問電車有沒有延誤、停駛 → train_status。" : ""}
 - 收到收據照片（或說「記帳這張收據」）：讀出店名、日期、總金額、幣別與主要品項，用 add_expense 產生記帳卡片（description 寫「店名：品項」），付款人預設是發問者。幣別要看清楚：當地收據是 ${p.currency}，台灣收據是 TWD（NT$、民國年、統一發票）；民國年要加 1911（113 年＝2024 年）。若可能達退稅門檻，順便提醒。
@@ -5102,6 +5111,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const images: AttachedImage[] = [];
     // 這次工具回傳的內容：檢查回答裡的影片網址是不是工具找到的
     let toolJson = "";
+    // 這次找短片的地點（「改找中文介紹的」按鈕要寫上店名）
+    const videoPlaces: string[] = [];
     const toolsUsed: string[] = [];
     const lastResults: Record<string, unknown> = {};
     const drafts: number[] = [];
@@ -5197,6 +5208,10 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
           for (const c of res.calls) {
             toolsUsed.push(c.name);
             this.broadcast({ type: "ai_tool", id, name: c.name, label: toolLabel(c.name), args: c.args });
+            if (c.name === "find_short_videos") {
+              if (CHINESE_ASK.test(trigger.text)) c.args = { ...c.args, language: "chinese" };
+              for (const p of Array.isArray(c.args.places) ? (c.args.places as any[]) : []) videoPlaces.push(String(p?.name_zh || p?.name_local || "").slice(0, 30));
+            }
             const result = await runTool(c.name, c.args, ctx);
             lastResults[c.name] = result;
             toolJson += JSON.stringify(result ?? "");
@@ -5214,7 +5229,9 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             ? routeCheckButton(trigger.text)
             : !health && available.has("find_short_videos") && !toolsUsed.includes("find_short_videos") && !trigger.photo_id && finalText.length > 80 && (PLACE_ASK.test(trigger.text) || (finalText.match(PLACE_LINK) ?? []).length >= 2)
               ? videoButton(trigger.text)
-              : null;
+              : toolsUsed.includes("find_short_videos") && !CHINESE_ASK.test(trigger.text)
+                ? chineseButton(videoPlaces)
+                : null;
         finalText = dropFakeVideoLinks(finalText, toolJson + images.map((im) => im.page ?? "").join(" "));
         if (!finalText.trim()) finalText = images.length ? "幫你找到這些圖片 👇（網路圖片，僅供參考）" : "嗯…我沒有想到好的回答，可以換個方式問我嗎？";
         const row = this.insertMessage({

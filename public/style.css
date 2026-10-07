@@ -641,3 +641,8 @@ input[type="date"]::-webkit-date-and-time-value, input[type="time"]::-webkit-dat
 .nt-warn { border-left: 4px solid #dc2626; }
 .nt-ok { gap: 8px; align-items: center; margin: 12px 4px; }
 .nt-btn { width: 100%; margin-top: 8px; }
+
+/* 只看我和 AI 的對話 */
+.messages.only-mine .msg[data-mine="0"], .messages.only-mine .unread-sep, .messages.only-mine .day-sep[data-empty="1"] { display: none; }
+.mine-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 12px; padding: 8px 12px; border-radius: 12px; background: var(--red-soft); font-size: 14px; }
+.mine-bar[hidden] { display: none; }

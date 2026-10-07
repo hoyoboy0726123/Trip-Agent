@@ -398,6 +398,7 @@ function photoMatch(keyword: string, text: string): number {
   return score;
 }
 
+
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
 function requiredTool(text: string, used: string[], hasPhoto: boolean, available: Set<string>): string | null {
   for (const i of INTENTS) {
@@ -420,9 +421,38 @@ function memoryText(m: { text: string; meta: string | null }): string {
   return `${m.text} ${quoted.slice(0, 300)}`.trim();
 }
 
+/** 問怎麼搭車、怎麼去：回答要先審查（自己傳了照片的不算，照片上看得到的可以照著回答） */
+const ROUTE_Q = /(地鐵|捷運|電車|地下鐵|地下鉄|メトロ|JR|新幹線|輕軌|私鐵|火車|巴士|公車).{0,12}(怎麼|如何|哪|幾站|轉|換|搭|坐)|(怎麼|如何).{0,6}(搭|坐|轉乘|換車|去|到|走)|轉乘|換車|換線|幾站|哪一站下|(搭|坐)到.{0,8}站/;
+/** 審查後還留著這些路線細節，就改用固定的安全回答（連結文字不算） */
+const ROUTE_DETAIL = /\d+\s*站|[一二三四五六七八九十兩]\s*站|轉乘|換乘|換車|往.{1,10}方向|大致路線|[\u4e00-\u9fff\u30a0-\u30ffA-Za-z]{1,6}(?<![路連直在視動航熱天電底專])線/;
+const REVIEW_PROMPT = (question: string, draft: string) => `成員問：「${question}」
+
+AI 的回答草稿：
+${draft}
+
+請刪掉草稿裡所有搭車路線的細節：路線名稱（例如某某線、JR、地鐵某某線）、方向、轉乘站、要轉幾次、站數、出口、所需時間、「大致路線參考」整段。這些不可靠，要請大家看 Google 地圖。
+保留：開頭的稱呼、Google 地圖連結（markdown 連結原樣保留，一個字都不要改）、跟路線細節無關的資訊（例如票價、注意事項、天氣）。
+不要新增任何內容，不要解釋你改了什麼。只輸出修改後的回答。`;
+
+/** 審查員也刪不乾淨時的安全回答：只給 Google 地圖連結 */
+function safeRouteAnswer(draft: string): string {
+  const links = [...draft.matchAll(/\[[^\]\n]*\]\((https:\/\/www\.google\.com\/maps[^)\s]*)\)/g)].map((m) => m[0]);
+  return `路線請直接點開 Google 地圖，裡面會顯示要搭哪條線、往哪個方向、在哪一站換車、坐幾站、走哪個出口和即時班次：
+${links.length ? links.map((l) => `- ${l}`).join("\n") : "（告訴我出發地和目的地，我給你 Google 地圖連結）"}
+
+為了避免報錯站讓大家走冤枉路，路線細節我都以 Google 地圖為準，不自己寫。`;
+}
+
+/** 審查後的回答能不能用：沒有殘留路線細節，而且草稿裡的 Google 地圖連結都還在 */
+function routeAnswerOk(reviewed: string, draft: string): boolean {
+  const links = [...draft.matchAll(/\[[^\]\n]*\]\((https:\/\/www\.google\.com\/maps[^)\s]*)\)/g)].map((m) => m[0]);
+  return !!reviewed.trim() && !ROUTE_DETAIL.test(reviewed.replace(/\[[^\]]*\]\([^)]*\)/g, "")) && links.every((l) => reviewed.includes(l));
+}
+
 /** 模型偶爾學對話紀錄的格式，回答開頭多一個「［爸爸］」，存檔前拿掉 */
 function stripSpeakerTag(text: string): string {
-  return text.replace(/^\s*［[^］\n]{1,16}］\s*/, "");
+  // 也拿掉結尾假的工具呼叫文字（模型偶爾把 find_images{queries:[...]} 寫進回答）
+  return text.replace(/^\s*［[^］\n]{1,16}］\s*/, "").replace(/(\s*\b[a-z]+(?:_[a-z]+)+\s*[{(][^\n]*[})])+\s*$/, "");
 }
 
 /** 對話紀錄裡標出「這則是在回覆誰的哪句話」 */
@@ -2473,6 +2503,16 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
 - 住宿：${p.accommodation.name || p.accommodation.address}${p.accommodation.note ? `，${p.accommodation.note}` : ""}`;
     const text = await this.generateText(this.systemPrompt(), prompt, false, 1);
     this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
+  }
+
+  /** 審查問路的回答：刪掉沒有根據的路線細節，只留 Google 地圖連結和其他資訊；刪不乾淨就改用安全回答 */
+  private async reviewRoute(question: string, draft: string): Promise<string> {
+    try {
+      const out = stripSpeakerTag((await this.generateText("你是審查員，只刪掉不可靠的內容，不新增內容。", REVIEW_PROMPT(question, draft), false, 1)).trim());
+      return routeAnswerOk(out, draft) ? out : safeRouteAnswer(draft);
+    } catch {
+      return safeRouteAnswer(draft);
+    }
   }
 
   /**
@@ -4810,7 +4850,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 問以前說過的事：先看「長期記憶」和「以前聊過」，不夠再用 search_history。
 - 「幾點提醒我…」→ create_reminder（時間用 ${p.timezone} 的 YYYY-MM-DD HH:mm）；問有哪些提醒 → list_reminders。
 - 待辦、購物：明確說「加到待辦／購物清單」才用 add_checklist_items（list 填「待辦」或「購物」）；做完、買了 → update_checklist_item；問清單 → get_checklist。只是隨口提到要做的事，就在回答最後問一句要不要加進待辦。
-- 天氣 → get_weather；附近有什麼 → find_nearby（near 留空會用${owner}的位置，沒有位置就用住的地方）；怎麼去 → plan_route；匯率 → convert_currency。
+- 天氣 → get_weather；附近有什麼 → find_nearby（near 留空會用${owner}的位置，沒有位置就用住的地方）；怎麼去 → plan_route（路線名稱、轉乘、站數、出口都請看 Google 地圖，不要憑記憶寫）；匯率 → convert_currency。
 - 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結。不要自己寫 Google 地圖網址或短網址，也不要用自己記得的地址或座標當連結。
 - 要看自己傳過的照片（上週拍的、某天的照片、拉麵的照片）→ find_chat_photos（日期換算好，內容寫進 keyword），照片會顯示在回答下方；沒找到就照實說，不要拿網路圖片代替。
 - 要看網路上的照片、圖片時用 find_images（圖片會顯示在回答下方），並說明是網路圖片、僅供參考；沒有要求就不要找圖片。
@@ -4899,7 +4939,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 工具回傳 error 代表失敗：要如實告訴成員沒有完成，不可以說已完成。記帳前確認分攤對象是否符合成員說的人數。
 - 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。
 - 提到 ${p.currency} 價格時附上約合台幣（用 convert_currency）。
-- 問路：用 plan_route 給 Google Maps 連結，必要時用 web_search 補充轉乘與票價。
+- 問路、問地鐵電車怎麼搭：用 plan_route 給 Google 地圖連結，告訴大家點開就有要搭哪條線、往哪個方向、在哪轉乘、幾站、出口和即時班次。你自己不要寫路線名稱、方向、轉乘站、站數、出口或所需時間，也不要寫「大致路線參考」——你的記憶和網路片段常出錯，寫錯一個字全家就會走錯。成員自己傳路線圖、時刻表或車站照片來問時，才可以照片上清楚看得到的內容回答，看不清楚就說看不清楚。票價可以用 web_search 查。
 - 住宿的位置寫成 [📍住宿](map)（系統會換成正確位置）；要帶路回住宿就用 plan_route，destination 填「住宿」。不要自己用住宿名稱或地址搜尋，常會跑到別的地方。
 - 地圖連結：工具回傳的連結可以直接用（find_nearby 給的是那家店的座標，照抄，不要改成店名搜尋，連鎖店用店名會跑到別家分店）；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結（地點名稱用日文或英文的正式名稱，連鎖店要加分店名，例如 [📍ドン・キホーテ 池袋駅西口店](map)）。不要自己寫 Google 地圖網址，絕對不要編 maps.app.goo.gl 短網址，也不要用自己記得的地址或座標當連結（記錯一個字就會指到別的地方）。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
@@ -5040,6 +5080,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     let lastError = "";
     // 跨模型共用：前一個模型中途被限流時，下一個模型接著已完成的工具結果繼續，不會重複記帳或重複查詢
     let turns = this.buildTurns(history, trigger, photoParts);
+    const routeQ = !health && ROUTE_Q.test(trigger.text) && !trigger.photo_id;
     const onWait = (ms: number) => this.broadcast({ type: "ai_note", id, text: `Gemini 額度冷卻中，等待 ${Math.ceil(ms / 1000)} 秒…` });
 
     for (const pid of order) {
@@ -5053,7 +5094,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       try {
         for (let step = 0; step < MAX_STEPS; step++) {
           const res = await provider.generate({
-            system, turns, tools: decls, onDelta: (delta) => this.broadcast({ type: "ai_delta", id, delta }),
+            // 問路的草稿先不顯示，審查完才送出
+            system, turns, tools: decls, onDelta: routeQ ? undefined : (delta) => this.broadcast({ type: "ai_delta", id, delta }),
             // 好幾張照片（菜單好幾頁）回答會很長，45 秒不夠
             ...(photoParts.length > 1 ? { timeoutMs: 120_000 } : {}),
           });
@@ -5123,10 +5165,17 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
           turns = [...turns, { role: "model", parts: modelParts }, { role: "user", parts: resultParts }];
           if (step === MAX_STEPS - 1) finalText = res.text || "（查了很多資料，但還沒整理完，請再問一次更具體的問題 🙏）";
         }
+        // 問路：草稿先審查，沒根據的路線細節拿掉（自己傳了照片的照片內容可以回答，不審查）
+        if (routeQ && finalText.trim()) {
+          this.broadcast({ type: "ai_note", id, text: "🔎 正在核對路線…" });
+          finalText = await this.reviewRoute(trigger.text, finalText);
+        }
         if (!finalText.trim()) finalText = images.length ? "幫你找到這些圖片 👇（網路圖片，僅供參考）" : "嗯…我沒有想到好的回答，可以換個方式問我嗎？";
         const row = this.insertMessage({
           id, author: AI_NAME, role: "assistant", text: fixMapLinks(stripSpeakerTag(finalText), this.mapFix()), photo_id: null, lat: null, lon: null,
           meta: JSON.stringify({
+            // 回答的是誰（「只看我和 AI 的對話」用）
+            for: { id: trigger.id, author: trigger.author },
             provider: provider.id, providerLabel: PROVIDER_LABEL[provider.id], model: provider.model, tools: [...new Set(toolsUsed)].map(toolLabel),
             ...(images.length ? { images } : {}),
             ...(drafts.length ? { drafts } : {}),

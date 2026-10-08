@@ -441,7 +441,7 @@ function routeCheckButton(question: string) {
 }
 
 /** 問景點、美食、餐廳：回答下方放「找相關短片」按鈕（關鍵字沒中、AI 自己判斷要查時，find_short_videos 照樣能用） */
-const PLACE_ASK = /好吃|美食|餐廳|吃|喝|拉麵|燒肉|串燒|燒鳥|居酒屋|燒烤|火鍋|壽司|丼|定食|早餐|午餐|晚餐|宵夜|咖啡|甜點|小吃|酒吧|景點|好玩|推薦|必去|必逛|逛街|購物|百貨|伴手禮|夜市|市場|商圈|神社|寺|公園|博物館|美術館|樂園|展望台|晴空塔|迪士尼|值得去/;
+const PLACE_ASK = /好吃|美食|餐廳|吃|喝|拉麵|燒肉|串燒|燒鳥|居酒屋|燒烤|火鍋|壽司|丼|定食|早餐|午餐|晚餐|宵夜|咖啡|甜點|小吃|酒吧|景點|好玩|推薦|必去|必逛|逛街|購物|百貨|伴手禮|夜市|市場|商圈|神社|寺|公園|博物館|美術館|樂園|展望台|值得去/;
 /** 回答說找了影片、或叫成員自己去搜影片，卻沒呼叫 find_short_videos：提醒它真的去找（不管成員怎麼問） */
 const VIDEO_CLAIM = /(找|搜尋|搜|查|看|整理|附上|提供).{0,15}(影片|短片|shorts|reels)|(影片|短片|shorts|reels).{0,10}(如下|在下方|附在|供您|給您|參考)/i;
 /** 回答裡推薦了地點（地圖連結）：2 個以上就算在介紹地方，也放「找相關短片」按鈕 */
@@ -2546,6 +2546,24 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
 - 住宿：${p.accommodation.name || p.accommodation.address}${p.accommodation.note ? `，${p.accommodation.note}` : ""}`;
     const text = await this.generateText(this.systemPrompt(), prompt, false, 1);
     this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
+  }
+
+  /** 工具請 AI 判斷一件事（例如影片是不是在講這個地點）：JSON 模式，照模型順序試，都不能用回 null */
+  async aiJson(prompt: string): Promise<any | null> {
+    for (const id of await this.chain(false)) {
+      try {
+        const r = await (await this.provider(id, 1, 10_000)).generate({
+          system: "你只輸出 JSON。",
+          turns: [{ role: "user", parts: [{ text: prompt }] }],
+          json: true,
+          timeoutMs: 20_000,
+        });
+        return parseArgs(r.text.replace(/^\s*```(?:json)?|```\s*$/g, "").trim());
+      } catch (e) {
+        if (!(e instanceof RateLimitedError)) console.error(`aiJson via ${id} failed`, e);
+      }
+    }
+    return null;
   }
 
   /** 只根據路線圖回答怎麼搭（check_route_map 用）；密密麻麻的路線圖只有 Gemini 看得清楚，不能用就回 null */

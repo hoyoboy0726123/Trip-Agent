@@ -3026,7 +3026,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
             core: this.setting("core_profile"),
             memoryArchive: this.sql.exec("SELECT * FROM memories WHERE COALESCE(status, 'active') NOT IN ('active', 'hypothesis') ORDER BY COALESCE(updated, ts) DESC LIMIT 60").toArray(),
             brief: this.latestBrief(),
-            notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb, inbox, file_id, LENGTH(COALESCE(content, '')) AS clen FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
+            notes: this.sql.exec("SELECT id, ts, title, summary, url, tags, thumb, inbox, file_id, (SELECT mime FROM files WHERE files.id = notes.file_id) AS file_mime, LENGTH(COALESCE(content, '')) AS clen FROM notes ORDER BY ts DESC LIMIT 300").toArray(),
             files: this.sql.exec("SELECT id, ts, name, bytes, status, error, note_id FROM files WHERE status != 'done' ORDER BY id DESC LIMIT 20").toArray(),
             health: this.health().summary(),
             events: this.eventList(shiftDays(this.today(), -7), shiftDays(this.today(), 90)),
@@ -3846,11 +3846,19 @@ ${transcript}
         controller.enqueue(new Uint8Array(sql.exec("SELECT data FROM file_data WHERE file_id = ? AND part = ?", id, parts[i++]).one().data as ArrayBuffer));
       },
     });
+    const mime = String(f.mime || "application/octet-stream");
+    // PDF、圖片、純文字在網頁裡直接開；Office 檔（PPTX、DOCX、XLSX…）手機網頁開不了（一片空白），
+    // HTML 在網頁裡開會在 App 的網址下執行程式，一律改成下載
+    const inline = /^(application\/pdf|image\/|text\/plain)/.test(mime);
+    const ext = (String(f.name).match(/\.[a-z0-9]{1,5}$/i)?.[0] ?? "").toLowerCase();
     return new Response(body, {
       headers: {
-        "content-type": String(f.mime || "application/octet-stream"),
+        "content-type": mime,
         "content-length": String(total),
-        "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(String(f.name))}`,
+        "content-disposition": `${inline ? "inline" : "attachment"}; filename="file${ext}"; filename*=UTF-8''${encodeURIComponent(String(f.name))}`,
+        // 上傳的檔案不准在 App 的網址下執行程式（PDF 例外：Chrome 的 PDF 檢視器遇到 sandbox 會整頁擋掉）
+        ...(mime === "application/pdf" ? {} : { "content-security-policy": "sandbox" }),
+        "x-content-type-options": "nosniff",
         "cache-control": "private, max-age=3600",
       },
     });

@@ -34,6 +34,8 @@ export interface RoomApi {
   addExpense(e: ExpenseInput): unknown;
   deleteExpense(id: number): boolean;
   expenseSummary(): unknown;
+  /** 查帳目明細（日期區間、關鍵字、付款人） */
+  findExpenses(q: { from?: string; to?: string; keyword?: string; payer?: string }): unknown;
   checklistAdd(list: string, items: string[], forWhom: string, author: string): unknown;
   checklistUpdate(match: { id?: number; keyword?: string; list?: string }, patch: { done?: boolean; remove?: boolean }, by: string): unknown;
   checklistGet(list?: string): unknown;
@@ -1328,6 +1330,28 @@ export const TOOLS: Tool[] = [
     async run(args, { room, profile }) {
       if (profile.kind === "personal") return room.ledger(args.month ? String(args.month) : undefined);
       return room.expenseSummary();
+    },
+  },
+  {
+    label: "🧾 查帳目",
+    decl: {
+      name: "find_expenses",
+      description:
+        "查記帳明細：某天或某段日期買了什麼、多少錢、誰付的；可以用品項、店名或分類關鍵字、付款人篩選。" +
+        "問「前幾天買了什麼」「那天花了多少」「藥妝花了多少」「媽媽付了哪些」時用（expense_summary 只有最近幾筆）。",
+      parameters: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "開始日期 YYYY-MM-DD（含）" },
+          to: { type: "string", description: "結束日期 YYYY-MM-DD（含）；只查一天就跟 from 一樣" },
+          keyword: { type: "string", description: "品項、店名或分類的關鍵字（例如 藥妝、拉麵、交通）；記帳時寫的是什麼語言就用什麼語言" },
+          payer: { type: "string", description: "誰付的" },
+        },
+      },
+    },
+    async run(args, { room }) {
+      const s = (v: unknown) => String(v ?? "").trim().slice(0, 40) || undefined;
+      return room.findExpenses({ from: s(args.from), to: s(args.to), keyword: s(args.keyword), payer: s(args.payer) });
     },
   },
   {

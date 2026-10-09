@@ -328,6 +328,8 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   // 「路線圖」「傳圖給我」也算要看圖；自己附了照片時是要 AI 看那張照片，不是上網找圖
   { tool: "find_chat_photos", test: (t, p) => !p && OWN_PHOTO.test(t) && !/長什麼樣|網路|網上|存成|票券/.test(t), alt: ["find_images", "find_documents"] },
   { tool: "find_images", test: (t, p) => !p && /照片|圖片|相片|看圖|附圖|長什麼樣|路線圖|地鐵圖|捷運圖|平面圖|示意圖|菜單圖|(傳|給|找|看).{0,6}圖(?!書)|photo|picture|image/i.test(t) && !/存|票券|地圖/.test(t) && !OWN_PHOTO.test(t), alt: ["find_chat_photos", "check_route_map"] },
+  // 問買過什麼、花了多少：查帳目明細（說「幫我記」的是要新增帳目，不算）
+  { tool: "find_expenses", test: (t, p) => !p && /買了(什麼|哪些|啥)|買過(什麼|哪些)|花了多少|花多少|總共花|付了(哪些|多少)|消費(紀錄|明細)|帳目(明細|清單)|查.{0,4}帳/.test(t) && !/幫我記|記一筆|記一下|記帳/.test(t) },
   {
     tool: "add_expense",
     test: (t, p) => (p && /收據|發票|記帳/.test(t)) || /(我付了|付了|花了|請客|記帳).{0,20}\d/.test(t) || /\d.{0,12}(元|圓|円|幣|銖|盾|塊|€|\$|₩|฿|£).{0,12}(我付|付的|記帳)/.test(t),
@@ -2278,6 +2280,27 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
   itineraryDay(date: string) {
     const r = this.sql.exec("SELECT * FROM itinerary WHERE date = ?", date).toArray()[0];
     return r ? { title: (r.title as string) ?? "", detail: (r.detail as string) ?? "", status: (r.status as string) ?? "" } : null;
+  }
+
+  /** 查帳目明細：依日期（區間）、品項／店名／分類關鍵字、付款人篩選（AI 回答「前幾天買了什麼、多少錢」用） */
+  findExpenses(q: { from?: string; to?: string; keyword?: string; payer?: string }) {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (q.from) (where.push("date >= ?"), args.push(q.from));
+    if (q.to) (where.push("date <= ?"), args.push(q.to));
+    if (q.payer) (where.push("payer LIKE ?"), args.push(`%${q.payer}%`));
+    if (q.keyword) (where.push("(description LIKE ? OR category LIKE ?)"), args.push(`%${q.keyword}%`, `%${q.keyword}%`));
+    const rows = this.sql.exec(`SELECT * FROM expenses${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY date, ts`, ...args).toArray();
+    const sum = (k: string) => Math.round(rows.reduce((n, r) => n + Number(r[k] ?? 0), 0));
+    return {
+      count: rows.length, total_local: sum("amount_local"), total_twd: sum("amount_twd"),
+      items: rows.slice(0, 80).map((r) => ({
+        id: r.id, date: r.date, description: r.description, amount: r.amount, currency: r.currency, local: r.amount_local, twd: r.amount_twd,
+        payer: r.payer, split_among: JSON.parse((r.split_among as string) || "[]"), category: r.category,
+      })),
+      ...(rows.length > 80 ? { note: `共 ${rows.length} 筆，只列前 80 筆；請縮小日期或關鍵字` } : {}),
+      ...(rows.length ? {} : { note: "沒有符合的帳目：照實說，可以換個關鍵字（記帳時可能用別的寫法）或放寬日期再查" }),
+    };
   }
 
   expenseSummary() {

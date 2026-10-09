@@ -405,6 +405,8 @@ hr.soft { border: 0; border-top: 1px dashed var(--line); margin: 12px 0; }
 .cat-row { display: grid; grid-template-columns: 4.5em 1fr auto; gap: 10px; align-items: center; font-size: 14px; padding: 4px 0; font-variant-numeric: tabular-nums; }
 .today { outline: 2px solid var(--red); }
 .btn { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 7px 12px; font-size: 14px; }
+/* 用連結做的按鈕（下載 CSV、原檔）：行內元素的上下間距不生效，會疊到上一行 */
+a.btn { display: inline-block; color: inherit; text-decoration: none; }
 .btn.danger { color: var(--danger); }
 .btn.primary-sm { background: var(--red); color: #fff; border-color: var(--red); }
 .form { display: grid; gap: 8px; }

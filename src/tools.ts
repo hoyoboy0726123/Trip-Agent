@@ -467,14 +467,19 @@ async function placeVideos(room: RoomApi, key: string, country: string, city: st
       : await collect(`${withArea(p.name_local)} ${p.category} ${reel}`, `${withArea(p.name_zh || p.name_local)} shorts`),
   );
   // 找不太到：分店名、類別、少人用的譯名常讓搜尋跑偏，改用店名本身（中文優先用俗稱）＋地區再找一次
+  const isZhName = (k: string) => /[\u4e00-\u9fff]/.test(k) && !/[\u3040-\u30ff\uac00-\ud7af]/.test(k);
   if (ok.length < 2) {
-    const isZhName = (k: string) => /[\u4e00-\u9fff]/.test(k) && !/[\u3040-\u30ff\uac00-\ud7af]/.test(k);
     const name =
       (zh && (p.keywords.find((k) => isZhName(k) && !p.name_zh.includes(k)) || p.keywords.find(isZhName))) || p.keywords[0] || tokens[0] || p.name_local;
     ok = [
       ...ok,
       ...(await judge(await (zh ? collect(`${withArea(name)} ${country}`, `${withArea(name)} ${country} shorts`) : collect(`${withArea(name)} ${reel}`, `${withArea(name)} shorts`)))),
     ];
+  }
+  // 還是一支都沒有：連鎖店這家分店常沒人拍，改用店名本身（不加地區）再找；判斷照舊，同城市或沒講是哪間分店的才算
+  if (!ok.length && p.area) {
+    const core = (zh && p.keywords.find(isZhName)) || p.keywords[0] || tokens[0] || p.name_local;
+    ok = await judge(await (zh ? collect(`${core} ${country}`, `${core} ${country} shorts`) : collect(`${core} ${reel}`, `${core} shorts`)));
   }
   ok.sort(
     (a, b) =>
@@ -1103,7 +1108,8 @@ export const TOOLS: Tool[] = [
               method: "POST",
               headers: { "content-type": "application/json", authorization: `Bearer ${tavilyKey}` },
               body: JSON.stringify({ query, max_results: 5, include_images: true, include_image_descriptions: true, search_depth: "basic" }),
-              signal: AbortSignal.timeout(20_000),
+              // 路線圖這類圖多的搜尋常超過 20 秒，等不到就整組 0 張
+              signal: AbortSignal.timeout(30_000),
             });
             if (!res.ok) {
               if (quotaOut(res.status)) out = true;
@@ -1120,7 +1126,10 @@ export const TOOLS: Tool[] = [
             };
             for (const img of d.images ?? []) add(img);
             for (const r of d.results ?? []) for (const img of r.images ?? []) add(img, r.url);
-            const checked = await Promise.all(candidates.slice(0, 8).map(async (c) => ((await imageUsable(c.url)) ? c : null)));
+            // 不是要看地圖時，拿掉店家位置的地圖截圖（不是照片）
+            const wantMap = /地圖|地图|路線|路线|路線図|map|route/i.test(query);
+            const photos = candidates.filter((c) => wantMap || !/static-?map|staticmap|\/maps\/api\//i.test(c.url));
+            const checked = await Promise.all(photos.slice(0, 8).map(async (c) => ((await imageUsable(c.url)) ? c : null)));
             const usable = checked.filter((c): c is NonNullable<typeof c> => !!c);
             if (usable.length) room.cacheSet(`img:${query}`, JSON.stringify(usable));
             return { query, picked: usable.slice(0, perQuery) };

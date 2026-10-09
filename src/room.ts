@@ -329,7 +329,9 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   { tool: "find_chat_photos", test: (t, p) => !p && OWN_PHOTO.test(t) && !/長什麼樣|網路|網上|存成|票券/.test(t), alt: ["find_images", "find_documents"] },
   { tool: "find_images", test: (t, p) => !p && /照片|圖片|相片|看圖|附圖|長什麼樣|路線圖|地鐵圖|捷運圖|平面圖|示意圖|菜單圖|(傳|給|找|看).{0,6}圖(?!書)|photo|picture|image/i.test(t) && !/存|票券|地圖/.test(t) && !OWN_PHOTO.test(t), alt: ["find_chat_photos", "check_route_map"] },
   // 問買過什麼、花了多少：查帳目明細（說「幫我記」的是要新增帳目，不算）
-  { tool: "find_expenses", test: (t, p) => !p && /買了(什麼|哪些|啥)|買過(什麼|哪些)|花了多少|花多少|總共花|付了(哪些|多少)|消費(紀錄|明細)|帳目(明細|清單)|查.{0,4}帳/.test(t) && !/幫我記|記一筆|記一下|記帳/.test(t) },
+  { tool: "find_expenses", test: (t, p) => !p && /買了(什麼|哪些|啥)|買過(什麼|哪些)|花了多少|花多少|總共花|付了(哪些|多少)|消費(紀錄|明細)|帳目(明細|清單)|查.{0,4}帳/.test(t) && !/幫我記|記一筆|記一下|記帳/.test(t), alt: ["expense_summary"] },
+  // 開銷分析、花費統計：用帳目工具（不然模型拿系統提示裡的摘要回答，又被要求上網查證）
+  { tool: "expense_summary", test: (t, p) => !p && /(開銷|花費|支出|消費|帳目|旅費|花了).{0,4}(分析|統計|總結|報告|比例|總額)/.test(t), alt: ["find_expenses"] },
   {
     tool: "add_expense",
     test: (t, p) => (p && /收據|發票|記帳/.test(t)) || /(我付了|付了|花了|請客|記帳).{0,20}\d/.test(t) || /\d.{0,12}(元|圓|円|幣|銖|盾|塊|€|\$|₩|฿|£).{0,12}(我付|付的|記帳)/.test(t),
@@ -448,12 +450,16 @@ function routeReply(text: string): boolean {
  * AI 的記憶常過時（店收了、展覽結束了、雕像拆了），旅遊時照舊資訊跑一趟就白費了
  */
 const FACT_HINT = /\[📍[^\]\n]*\]\((?!https:\/\/www\.google\.com\/maps\/dir)|營業|開放時間|展覽|展出|活動期間|期間限定|門票|票價|休館|公休|開幕|閉館|拆除|樓層|\d+\s*樓/;
-const GROUNDING_TOOLS = new Set(["web_search", "read_webpage", "find_nearby", "check_route_map"]);
+/** 不提供事實的工具（只產生地圖連結、找圖、找短片）：只用了這些就等於憑記憶回答 */
+const PRESENTATION_TOOLS = new Set(["plan_route", "find_images", "find_short_videos"]);
 function needsVerification(text: string, toolsUsed: string[]): boolean {
-  return FACT_HINT.test(text) && !toolsUsed.some((t) => GROUNDING_TOOLS.has(t));
+  // 用了讀資料的工具（帳目、行程、提醒、天氣、搜尋…）就是根據資料回答，不要求查證（例如帳目裡的「門票」）
+  return FACT_HINT.test(text) && toolsUsed.every((t) => PRESENTATION_TOOLS.has(t));
 }
-const VERIFY_NUDGE =
-  "（系統提醒：你剛才的回答有店家、景點、展覽活動或營業資訊，但這一輪還沒上網查證。請先用 web_search 查證最新狀況（店還在不在、營業時間、展覽或活動是否還在進行），再根據查到的結果回答，並註明資料來源；查不到的就說查不到，不要憑記憶。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）";
+/** 要它先上網查證：帶上成員原本的問題，不然它會跑去查聊天室裡別的話題 */
+function verifyNudge(asker: string, question: string): string {
+  return `（系統提醒：${asker}問：「${question.slice(0, 200)}」。你剛才的回答有店家、景點、展覽活動或營業資訊，但這一輪還沒上網查證。請針對這個問題，先用 web_search 查證你要講的內容的最新狀況（店還在不在、營業時間、展覽或活動是否還在進行），再根據查到的結果回答這個問題，並註明資料來源；查不到的就說查不到，不要憑記憶，也不要改去回答聊天室裡別的話題。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）`;
+}
 
 const BACKUP_ROUTE_NOTE = "⚠️ 這次由備援模型回答，路線的方向和轉乘可能不準，出發前請以 Google 地圖為準。";
 
@@ -5253,7 +5259,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               turns = [
                 ...turns,
                 { role: "model", parts: [{ text: res.text || "（略）" }] },
-                { role: "user", parts: [{ text: need === "web_search" ? VERIFY_NUDGE : `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
+                { role: "user", parts: [{ text: need === "web_search" ? verifyNudge(trigger.author, trigger.text) : `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
               ];
               continue;
             }

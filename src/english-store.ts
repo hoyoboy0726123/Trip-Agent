@@ -13,6 +13,8 @@ export const EN_REMIND_HOUR = 20;
 const MAX_FREEZES = 2;
 /** 查過的單字最多留幾筆 */
 const MAX_WORDS = 500;
+/** 朗讀音檔最多留幾句（一句約 100–200KB） */
+const MAX_AUDIO = 300;
 
 export interface EnCard {
   id: number;
@@ -35,7 +37,7 @@ export class EnglishStore {
       CREATE TABLE IF NOT EXISTS en_cards (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, en TEXT UNIQUE, zh TEXT, note TEXT, source TEXT, step INTEGER DEFAULT 0, due TEXT, reps INTEGER DEFAULT 0, lapses INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_lessons (date TEXT PRIMARY KEY, ts INTEGER, topic TEXT, level TEXT, data TEXT, done INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_days (date TEXT PRIMARY KEY, practice INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0);
-      -- en_audio：舊版的 Gemini 朗讀快取（已停用，改用手機語音），清除紀錄時一起清掉
+      -- en_audio：朗讀音檔快取（MeloTTS 唸過的句子，重播不再花額度）
       CREATE TABLE IF NOT EXISTS en_audio (key TEXT PRIMARY KEY, ts INTEGER, data BLOB);
       CREATE TABLE IF NOT EXISTS en_words (key TEXT PRIMARY KEY, ts INTEGER, data TEXT);
     `);
@@ -277,6 +279,18 @@ export class EnglishStore {
       sessions: count("SELECT COUNT(*) AS n FROM en_sessions WHERE status = 'done'"),
       practice_days: count("SELECT COUNT(*) AS n FROM en_days WHERE practice > 0"),
     };
+  }
+
+  // ---------- 朗讀音檔快取 ----------
+
+  audioGet(key: string): ArrayBuffer | null {
+    const r = this.sql.exec("SELECT data FROM en_audio WHERE key = ?", key).toArray()[0];
+    return r ? (r.data as ArrayBuffer) : null;
+  }
+
+  audioPut(key: string, data: ArrayBuffer) {
+    this.sql.exec("INSERT INTO en_audio (key, ts, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts, data = excluded.data", key, Date.now(), data);
+    this.sql.exec("DELETE FROM en_audio WHERE key NOT IN (SELECT key FROM en_audio ORDER BY ts DESC LIMIT ?)", MAX_AUDIO);
   }
 
   /** 清除所有英語練習紀錄（設定保留） */

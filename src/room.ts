@@ -641,6 +641,34 @@ function enMissing(heard: string, target: string): string[] {
   return [...new Set(words(target).filter((w) => !got.has(w)))].slice(0, 6);
 }
 
+/** MeloTTS 回的是 44.1kHz WAV：人聲降成一半取樣率一樣清楚，存起來小一半；看不懂的格式原樣回傳 */
+function halveWav(wav: Uint8Array): ArrayBuffer {
+  const copy = () => wav.slice().buffer as ArrayBuffer;
+  if (wav.length < 44 || String.fromCharCode(...wav.subarray(0, 4)) !== "RIFF") return copy();
+  const v = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+  const rate = v.getUint32(24, true);
+  if (v.getUint16(20, true) !== 1 || v.getUint16(22, true) !== 1 || v.getUint16(34, true) !== 16 || rate < 32000) return copy();
+  let o = 12;
+  while (o + 8 <= wav.length && String.fromCharCode(...wav.subarray(o, o + 4)) !== "data") o += 8 + v.getUint32(o + 4, true);
+  if (o + 8 > wav.length) return copy();
+  const n = Math.floor(Math.min(v.getUint32(o + 4, true), wav.length - o - 8) / 4);
+  const pcm = new Uint8Array(n * 2);
+  const pv = new DataView(pcm.buffer);
+  for (let i = 0; i < n; i++) pv.setInt16(i * 2, (v.getInt16(o + 8 + i * 4, true) + v.getInt16(o + 10 + i * 4, true)) >> 1, true);
+  return pcmToWav(pcm, Math.round(rate / 2)).buffer as ArrayBuffer;
+}
+/** 原始 PCM（16 位元單聲道）加上 WAV 檔頭，瀏覽器才能播 */
+function pcmToWav(pcm: Uint8Array, rate: number): Uint8Array {
+  const out = new Uint8Array(44 + pcm.length);
+  const v = new DataView(out.buffer);
+  const w = (o: number, s: string) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + pcm.length, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, pcm.length, true);
+  out.set(pcm, 44);
+  return out;
+}
+
 const PROVIDER_LABEL: Record<ProviderId, string> = { gemini: "Gemini", "gemini-own": "Gemini（旅程金鑰）", "workers-ai": "Workers AI" };
 
 export class TripRoom extends DurableObject<Env> implements RoomApi {
@@ -2882,6 +2910,8 @@ ${recentChat || "（沒有）"}
         case "settings":
           E.saveSettings(body);
           return ok(await this.englishState());
+        case "tts":
+          return this.enTts(String(url.searchParams.get("text") ?? ""));
 
         // ---- 情境角色扮演 ----
         case "start": {
@@ -3129,6 +3159,39 @@ ${recentChat || "（沒有）"}
     E.finish(id, report);
     E.touch();
     return E.session(id);
+  }
+
+  /**
+   * 示範發音：Workers AI 的 MeloTTS（一句約 1 個 neuron，幾乎不吃額度、不會把句子內容演出來），唸過就存起來，重播不再花。
+   * 額度用完或失敗回 503，前端改用手機內建語音。（Gemini 朗讀模型免費每天只有 10 句，而且會演戲，不用）
+   */
+  private async enTts(text: string): Promise<Response> {
+    const t = enStr(text, 300);
+    if (!/[A-Za-z]/.test(t)) return new Response("no text", { status: 400 });
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`melotts|${t}`));
+    const key = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+    const wav = (data: ArrayBuffer) => new Response(data, { headers: { "content-type": "audio/wav", "cache-control": "private, max-age=86400" } });
+    const E = this.english();
+    const hit = E.audioGet(key);
+    if (hit) return wav(hit);
+    if (await this.workersAiBlocked()) return new Response("tts unavailable", { status: 503 });
+    try {
+      const r: any = await this.env.AI.run("@cf/myshell-ai/melotts" as any, { prompt: t, lang: "en" });
+      const bytes =
+        typeof r?.audio === "string" ? Uint8Array.from(atob(r.audio), (c) => c.charCodeAt(0))
+        : r instanceof ReadableStream ? new Uint8Array(await new Response(r).arrayBuffer())
+        : r instanceof ArrayBuffer ? new Uint8Array(r)
+        : r instanceof Uint8Array ? r
+        : null;
+      if (!bytes?.length) throw new Error("MeloTTS 沒有回傳聲音");
+      const buf = halveWav(bytes);
+      E.audioPut(key, buf);
+      return wav(buf);
+    } catch (e) {
+      if (isQuotaError(e)) this.noteQuota(new WorkersAiQuotaError());
+      else console.error("melotts failed", String((e as any)?.message ?? e).slice(0, 200));
+      return new Response("tts unavailable", { status: 503 });
+    }
   }
 
   /** 每天：補簽卡自動抵用；晚上 8 點還沒練英文就推播提醒（只對用過英語家教的人） */

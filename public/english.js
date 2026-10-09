@@ -6,7 +6,7 @@ ICONS.english = '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/
 
 const EN = {
   tab: "talk", state: null, loading: false, loadedAt: 0, session: null, busy: false, rec: null, hint: null,
-  results: {}, reveal: false, cards: null, draft: "", taskDraft: "", target: "", voice: store("en-voice") || "",
+  results: {}, reveal: false, cards: null, draft: "", taskDraft: "", target: "", voice: store("en-phone-voice") || "", audio: null, cache: new Map(),
   autoPlay: store("en-autoplay") !== 0,
   liveMode: store("en-live") === 1,
 };
@@ -257,7 +257,7 @@ function enMe() {
       <label class="row between small"><span>程度</span><select id="en-level">${EN_LEVELS.map(([v, t]) => `<option value="${v}" ${s.level === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
       <label class="row between small"><span>每週目標（天）</span><select id="en-goal">${[3, 4, 5, 6, 7].map((n) => `<option ${s.weekGoal === n ? "selected" : ""}>${n}</option>`).join("")}</select></label>
       <label class="row between small"><span>朗讀聲音</span><span class="row" style="gap:6px"><select id="en-voice">${enVoiceOptions()}</select><button type="button" class="en-play" data-enplay="Hi! Could I get an iced latte with oat milk, please?">🔊 試聽</button></span></label>
-      <p class="small muted">朗讀用手機內建的英文語音（不限次數）。想要更自然：iPhone「設定 → 輔助使用 → 朗讀內容 → 聲音 → 英文」下載有「進階」或「加強版」的聲音（例如 Ava、Zoe、Evan），再回來這裡選。</p>
+      <p class="small muted">預設用雲端語音，不用設定；雲端額度用完時會自動改用手機內建的英文語音。也可以直接選一個手機聲音。</p>
       <label class="row between small"><span>晚上 8 點還沒練就通知我</span><input type="checkbox" id="en-remind" ${s.remind ? "checked" : ""} /></label>
       <p class="small muted">要收到通知，先到「設定 → 手機通知」開啟。</p>
       <button type="button" class="btn small danger" data-enreset>清除英語練習紀錄</button>
@@ -272,13 +272,18 @@ function enScroll() {
   if (c) c.scrollTop = c.scrollHeight;
 }
 
-/** iPhone 的朗讀要先在手指點的當下講過一次（無聲），AI 回覆完才能自動朗讀 */
+/** iPhone 只有在手指點的當下才能開始出聲：點擊時先用同一個播放器播一段無聲、手機語音也先講一次無聲，AI 回覆完才能自動朗讀 */
 function enUnlockAudio() {
-  if (EN.unlocked || !("speechSynthesis" in window)) return;
+  EN.audio ??= new Audio();
+  if (EN.unlocked) return;
   EN.unlocked = true;
-  const u = new SpeechSynthesisUtterance(" ");
-  u.volume = 0;
-  speechSynthesis.speak(u);
+  EN.audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
+  EN.audio.play().catch(() => {});
+  if ("speechSynthesis" in window) {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    speechSynthesis.speak(u);
+  }
 }
 
 // iPhone 的搞怪聲音和老式電子聲（Albert、Bad News、Eddy、Fred…）排在清單前面，不能拿來當示範發音
@@ -296,14 +301,38 @@ function enVoices() {
 
 function enVoiceOptions() {
   const list = enVoices();
-  if (!list.length) return `<option value="">手機沒有英文語音</option>`;
   const label = (v) => `${v.name}（${v.lang.replace("_", "-")}）`;
-  return `<option value="">自動：${escapeHtml(label(list[0]))}</option>${list.map((v) => `<option value="${escapeHtml(v.name)}" ${EN.voice === v.name ? "selected" : ""}>${escapeHtml(label(v))}</option>`).join("")}`;
+  return `<option value="">雲端語音（預設）</option>${list.map((v) => `<option value="${escapeHtml(v.name)}" ${EN.voice === v.name ? "selected" : ""}>${escapeHtml(label(v))}</option>`).join("")}`;
 }
 
-/** 示範發音：手機內建的英文語音（不限次數、馬上出聲、每句都同一個聲音）；rate < 1 是慢速 */
-function enPlay(text, rate = 1) {
-  if (!("speechSynthesis" in window)) return alert("這個瀏覽器不能朗讀");
+/**
+ * 示範發音：預設用伺服器的雲端語音（MeloTTS，唸過的句子存起來），不用設定手機；
+ * 雲端額度用完、連不上，或使用者自己選了手機聲音時，改用手機內建的英文語音。rate < 1 是慢速
+ */
+async function enPlay(text, rate = 1) {
+  if (EN.voice) return enSpeakLocal(text, rate);
+  enUnlockAudio();
+  let url = EN.cache.get(text);
+  if (!url) {
+    try {
+      const res = await fetch(`/api/english/tts?text=${encodeURIComponent(text)}`);
+      if (!res.ok) throw new Error(String(res.status));
+      url = URL.createObjectURL(await res.blob());
+      EN.cache.set(text, url);
+    } catch {
+      return enSpeakLocal(text, rate);
+    }
+  }
+  if ("speechSynthesis" in window && (speechSynthesis.speaking || speechSynthesis.pending)) speechSynthesis.cancel();
+  EN.audio.src = url;
+  EN.audio.defaultPlaybackRate = EN.audio.playbackRate = rate < 1 ? 0.75 : 1;
+  EN.audio.play().catch(() => enSpeakLocal(text, rate));
+}
+
+/** 手機內建的英文語音（不限次數）：自動挑最自然的，排除搞怪聲音 */
+function enSpeakLocal(text, rate = 1) {
+  if (!("speechSynthesis" in window)) return;
+  EN.audio?.pause();
   // 沒在唸時呼叫 cancel，Safari 有時會把緊接著的這句吞掉
   if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -601,7 +630,7 @@ function enBind(b) {
   $("#en-remind", b)?.addEventListener("change", (e) => enSettings({ remind: e.target.checked }));
   $("#en-voice", b)?.addEventListener("change", (e) => {
     EN.voice = e.target.value;
-    store("en-voice", EN.voice);
+    store("en-phone-voice", EN.voice);
     enPlay("Hi! Could I get an iced latte with oat milk, please?");
   });
   on("[data-enreset]", async () => {

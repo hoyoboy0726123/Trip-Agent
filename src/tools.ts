@@ -380,10 +380,12 @@ async function tavilyVideos(key: string, query: string, domains: string[]) {
       body: JSON.stringify({ query, max_results: 10, search_depth: "basic", include_domains: domains }),
       signal: AbortSignal.timeout(12_000),
     });
+    if (quotaOut(res.status)) throw new SearchQuotaError();
     if (!res.ok) return [];
     const d: any = await res.json();
     return (d.results ?? []).map((r: any) => ({ url: String(r.url ?? ""), title: String(r.title ?? ""), content: String(r.content ?? ""), score: Number(r.score) || 0 }));
-  } catch {
+  } catch (e) {
+    if (e instanceof SearchQuotaError) throw e;
     return [];
   }
 }
@@ -497,7 +499,13 @@ async function findShortVideos(args: any, key: string, country: string, city: st
     .filter((p: ShortPlace) => p.name_local);
   if (!places.length) return { error: "請提供要找短片的地點或店家名稱" };
   const language = args.language === "chinese" ? "chinese" : "local";
-  const found = await Promise.all(places.map((p) => placeVideos(room, key, country, city, p, language)));
+  let found: Awaited<ReturnType<typeof placeVideos>>[];
+  try {
+    found = await Promise.all(places.map((p) => placeVideos(room, key, country, city, p, language)));
+  } catch (e) {
+    if (e instanceof SearchQuotaError) return searchOut();
+    throw e;
+  }
   // 每個地點各找到幾支：模型常把沒找的地點也寫進回答，要它照這個講
   const summary = places.map((p, i) => `${p.name_zh || p.name_local}：${found[i].length} 支`);
   const videos: { place: string; platform: string; title: string; author: string; verified: boolean }[] = [];
@@ -648,6 +656,7 @@ async function loadMap(url: string, source: string, page?: string): Promise<Rout
 async function webMapCandidates(key: string, city: string, cityEn: string) {
   if (!key) return { official: [] as { url: string; page?: string }[], other: [] as { url: string; page?: string }[] };
   const seen = new Set<string>();
+  let out = false;
   const all: { url: string; page?: string; description: string }[] = [];
   await Promise.all(
     [`${city} 地鐵 路線圖 官方`, `${cityEn || city} metro subway official route map`].map(async (query) => {
@@ -658,7 +667,10 @@ async function webMapCandidates(key: string, city: string, cityEn: string) {
           body: JSON.stringify({ query, max_results: 6, include_images: true, include_image_descriptions: true, search_depth: "basic" }),
           signal: AbortSignal.timeout(20_000),
         });
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (quotaOut(res.status)) out = true;
+          return;
+        }
         const d: any = await res.json();
         const add = (img: any, page?: string) => {
           const url = typeof img === "string" ? img : img?.url;
@@ -681,7 +693,7 @@ async function webMapCandidates(key: string, city: string, cityEn: string) {
   const mapLike = (c: { url: string; description: string }) => /map|route|路線|路线|地鐵|地下鉄|metro|subway|railway|network/i.test(`${c.description} ${c.url}`);
   const official = all.filter((c) => mapLike(c) && (OFFICIAL_HOST.test(host(c.url)) || OFFICIAL_HOST.test(host(c.page))));
   const other = all.filter((c) => mapLike(c) && !official.includes(c));
-  return { official, other };
+  return { official, other, out };
 }
 
 /** 維基共享資源的路線圖：現在的全線圖（不要歷史、規劃中的），大的優先 */
@@ -832,6 +844,8 @@ const YAHOO_AREA: [RegExp, number][] = [
   [/四國|四国|高松|松山|高知|德島|徳島/, 9],
 ];
 
+/** 找短片時搜尋額度用完：一路丟到 find_short_videos 照實說（不然只會說沒找到） */
+class SearchQuotaError extends Error {}
 /** Tavily 這個月的額度用完（432 免費額度、433 隨用隨付上限）：工具結果帶這個標記，回答會註明「沒有上網查證」 */
 export const SEARCH_OUT = "search_quota_exhausted";
 const quotaOut = (status: number) => status === 432 || status === 433;
@@ -2135,6 +2149,7 @@ export const TOOLS: Tool[] = [
       let hit: Awaited<ReturnType<typeof tryMap>> = null;
       // 是這個城市的路線圖、但圖上核對不出這段路線：還是附給大家對照
       let seenMap = null as RouteMap | null;
+      let webOut = false;
       const cached = room.cacheGet(`routemap3:${city}`, 7 * 86400_000);
       if (cached) {
         try {
@@ -2145,6 +2160,7 @@ export const TOOLS: Tool[] = [
       }
       if (!hit) {
         const [web, wiki] = await Promise.all([webMapCandidates(key, city, cityEn), wikiMapCandidates(city, cityEn)]);
+        webOut = !!web.out;
         // 每一組候選一起下載（官方網站常常擋程式下載，不用一張一張等）
         const load = (list: { url: string; page?: string }[], source: string, n: number) =>
           Promise.all(list.filter((c) => !tried.has(c.url)).slice(0, n).map((c) => (tried.add(c.url), loadMap(c.url, source, c.page))));
@@ -2165,6 +2181,8 @@ export const TOOLS: Tool[] = [
           note: "找到這個城市的路線圖，但在圖上沒能核對出這段路線：照你知道的說坐哪條線、在哪轉乘，但要清楚說明這次沒能用路線圖確認，請大家對照附圖和 Google 地圖；不要寫站數。最後附上 google_maps 連結。",
         };
       }
+      // 搜尋額度用完只能找維基共享資源的圖：照實說是額度用完，不是網路上沒有
+      if (!hit && webOut) return { found_map: false, google_maps: gmaps, [SEARCH_OUT]: true, note: "這個月的網路搜尋額度用完了，沒辦法上網找路線圖：照實說這次沒能查證，請大家看 Google 地圖（google_maps 連結）；不要寫站數。" };
       if (!hit) return { found_map: false, google_maps: gmaps, note: aiDown ? `AI 暫時不能看圖（額度或連線問題）：${miss}` : `找不到能確認這段路線的路線圖：${miss}` };
       const { m, r, confirmed } = hit;
       const host = new URL(m.url).host;

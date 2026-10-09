@@ -492,6 +492,15 @@ function verifyNudge(asker: string, question: string): string {
 }
 
 const SEARCH_OUT_NOTE = "⚠️ 這個月的網路搜尋額度用完了，上面的內容沒有經過網路查證，出發前請再自行確認。管理員可以到「設定」→ API 金鑰換一組 Tavily 金鑰。";
+/** 回答裡說「根據資料、查證過、官網寫」：要拿這次查到的資料核對（模型會把記憶或自己的印象說成查到的） */
+const CITES = /根據|資料顯示|查證|官網|官方資料|資料來源|來源[:：]|經確認|確認過|查到的/;
+function factNudge(problems: string[]): string {
+  return `（系統查核：你的回答有這些地方跟這次查到的資料不符，或資料裡其實沒寫：\n${problems.map((p) => `- ${p}`).join("\n")}\n請改正後重新完整回答成員原本的問題：以查到的資料為準；資料沒寫的就說沒查到，不要說「根據資料」；長期記憶可能寫錯，跟查到的資料不同時以查到的為準，記憶裡寫錯的那條用 forget 刪掉。成員沒看到你剛才那段回答，不用道歉，也不要提到這個檢查。）`;
+}
+
+/** 成員有提到想看影片、實際畫面（備援模型自己去找短片前檢查用） */
+const VIDEO_WANT = /短片|短影音|影片|視頻|reels?\b|shorts|youtube|\big\b|拍的|畫面|長怎樣|看看/i;
+
 const BACKUP_ROUTE_NOTE = "⚠️ 這次由備援模型回答，路線的方向和轉乘可能不準，出發前請以 Google 地圖為準。";
 
 /** 憑記憶回答的路線：回答下方放查證按鈕，按了才去找路線圖（送出的問題帶著原本的問題，放久了再按也查得對） */
@@ -2708,6 +2717,21 @@ ${recentChat || "（沒有）"}
       }
     }
     return null;
+  }
+
+  /** 回答裡引用資料的說法，拿這次查到的資料核對：回傳有問題的說法（核對不了就當沒問題，不擋回答） */
+  private async factCheck(question: string, data: string, answer: string): Promise<string[]> {
+    const j = await this.aiJson(`你是事實查核員。下面是旅遊助理這次用工具查到的資料，和它準備給成員的回答。
+只找兩種問題：
+1) contradictions：回答的說法跟查到的資料明確矛盾（資料寫 A，回答寫不是 A）。
+2) fake_citations：回答明確說是「根據資料／查證過／官網寫／資料顯示」的那件事，查到的資料裡其實沒有。
+回答裡沒說是查到的、資料也沒提到的內容（助理自己的知識或建議）不算問題，不要列出；回答跟資料一致的也不算。
+只輸出 JSON：{"contradictions": ["回答裡的哪句話 → 資料實際上怎麼寫"], "fake_citations": ["回答裡的哪句話 → 資料沒提到"]}，沒有就回空陣列。
+成員的問題：${question.slice(0, 300)}
+查到的資料：${data.slice(0, 10000)}
+準備給的回答：${answer.slice(0, 2500)}`);
+    const list = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x).slice(0, 200)).filter(Boolean) : []);
+    return [...list(j?.contradictions), ...list(j?.fake_citations)].slice(0, 5);
   }
 
   /** 只根據路線圖回答怎麼搭（check_route_map 用）；密密麻麻的路線圖只有 Gemini 看得清楚，不能用就回 null */
@@ -5066,6 +5090,11 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 # 回答規則
 - 一律使用繁體中文與台灣用語，語氣自然親切，適合手機閱讀：精簡、條列、重點加粗。不要用 LaTeX 或 $…$ 數學式。
 - 被問到你是誰、用什麼模型：你是「${AI_NAME}」，回答由 Google 的 Gemini 模型產生（額度不夠時改用 Cloudflare 上的開源模型 Gemma）；不要說自己是 Claude、ChatGPT 或其他公司的模型。
+- 先講結論。成員只打幾個字、或看起來在路上（問怎麼走、在哪裡、幾點）時，3 行內回答，不要列一堆選項；需要細節成員會再問。
+- 被糾正或被罵：簡短道歉一次就好，接著直接給正確的答案；不要連續道歉，也不要一直保證「已經記住、不會再犯」。
+- 照片裡的人不要自己猜是誰（例如說「這是哥哥」），除非傳照片的人或對話裡說了；也不要評論長相、身材。
+- 說「根據…」「查證過」「官網寫」時，那件事一定要真的出現在這次工具查到的資料裡。長期記憶和你自己的印象可能是錯的，跟查到的資料不同時以查到的為準；記憶寫錯了就用 forget 刪掉那條。
+- 問記過哪些帳、買過什麼、某天花了多少（不管怎麼問）→ 先用 find_expenses 查帳本，不要憑對話紀錄回答。
 - 營業時間、價格、新聞、天氣、交通等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
 - 工具回傳 error 代表失敗：要如實說沒有完成，不可以說已完成。
 - ${owner}說「記住…」、說了偏好、做了決定、提到重要的個人資訊 → 用 remember 記下來；只有 remember 成功後才能說「已記住」。要忘掉某件事 → forget。
@@ -5157,6 +5186,11 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 # 回答規則
 - 一律使用繁體中文與台灣用語，語氣親切，適合手機閱讀：精簡、條列、重點加粗，不要長篇大論。
 - 被問到你是誰、用什麼模型：你是「${AI_NAME}」，回答由 Google 的 Gemini 模型產生（額度不夠時改用 Cloudflare 上的開源模型 Gemma）；不要說自己是 Claude、ChatGPT 或其他公司的模型。
+- 先講結論。成員只打幾個字、或看起來在路上（問怎麼走、在哪裡、幾點）時，3 行內回答，不要列一堆選項；需要細節成員會再問。
+- 被糾正或被罵：簡短道歉一次就好，接著直接給正確的答案；不要連續道歉，也不要一直保證「已經記住、不會再犯」。
+- 照片裡的人不要自己猜是誰（例如說「這是哥哥」），除非傳照片的人或對話裡說了；也不要評論長相、身材。
+- 說「根據…」「查證過」「官網寫」時，那件事一定要真的出現在這次工具查到的資料裡。長期記憶和你自己的印象可能是錯的，跟查到的資料不同時以查到的為準；記憶寫錯了就用 forget 刪掉那條。
+- 問記過哪些帳、買過什麼、某天花了多少（不管怎麼問）→ 先用 find_expenses 查帳本，不要憑對話紀錄回答。
 - 不要用 LaTeX 或 $…$ 數學式，箭頭、乘號等直接寫 →、×、≈。
 - 訊息開頭的［名字］代表是誰說的，回答時可以稱呼對方；但你的回答本身不要用［名字］開頭。
 - 營業時間、票價、活動、交通、天氣、排隊等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
@@ -5323,6 +5357,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       const forced = new Set<string>();
       let emptyRetried = false;
       let cardNudged = false;
+      let checked = false;
       try {
         for (let step = 0; step < MAX_STEPS; step++) {
           const res = await provider.generate({
@@ -5403,6 +5438,16 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               ];
               continue;
             }
+            // 說「根據資料、查證過」的回答：拿這次查到的資料核對一次（模型會把記憶或自己的印象說成查到的）
+            if (!checked && !health && toolJson && CITES.test(res.text) && toolsUsed.some((t) => GROUNDING_TOOLS.has(t)) && step < MAX_STEPS - 1) {
+              checked = true;
+              const problems = await this.factCheck(trigger.text, toolJson, res.text);
+              if (problems.length) {
+                this.broadcast({ type: "ai_reset", id });
+                turns = [...turns, { role: "model", parts: [{ text: res.text }] }, { role: "user", parts: [{ text: factNudge(problems) }] }];
+                continue;
+              }
+            }
             finalText = res.text;
             break;
           }
@@ -5414,6 +5459,11 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             // 成員沒要求看圖：AI 自己找圖片只會拖慢、用掉額度，跳過
             if (c.name === "find_images" && !IMAGE_ASK.test(trigger.text)) {
               resultParts.push({ result: { id: c.id, name: c.name, response: { skipped: true, note: "成員沒有要求看圖片，這次不找圖片，直接用文字回答" } } });
+              continue;
+            }
+            // 備援模型常沒被要求就自己去找短片（問餐廳卻只講影片）：成員沒提到影片、上一則也沒問要不要找，就不找
+            if (c.name === "find_short_videos" && provider.id === "workers-ai" && !VIDEO_WANT.test(trigger.text) && !/影片|短片/.test([...history].reverse().find((m) => m.role === "assistant")?.text ?? "")) {
+              resultParts.push({ result: { id: c.id, name: c.name, response: { skipped: true, note: "成員沒有要求看影片，這次不找，直接回答成員的問題" } } });
               continue;
             }
             toolsUsed.push(c.name);

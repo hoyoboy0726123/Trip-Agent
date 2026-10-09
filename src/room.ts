@@ -13,6 +13,8 @@ import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
 import { findDate, isHealthTopic, labCode, normDate, redFlagText, type Flag } from "./health";
 import { HealthStore } from "./health-store";
+import { EnglishStore, EN_REMIND_HOUR } from "./english-store";
+import { audioCheckPrompt, hintPrompt, lessonPrompt, reportPrompt, rolePrompt, scenarioOf, SCENARIOS, textCheckPrompt, TOPICS, type Grade } from "./english";
 import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -620,6 +622,42 @@ function toBase64(buf: ArrayBuffer): string {
   return btoa(s);
 }
 
+/** 英語家教：要直接給使用者看的錯誤（其他錯誤只說 AI 暫時不能用） */
+class EnUserError extends Error {}
+const enStr = (v: unknown, n: number) => String(v ?? "").replace(/\s+/g, " ").trim().slice(0, n);
+/** 「更自然的說法」：原句跟建議一樣就不算 */
+function enCorrection(c: any): { you: string; better: string; zh: string; why: string } | null {
+  if (!c || typeof c !== "object") return null;
+  const x = { you: enStr(c.you, 300), better: enStr(c.better, 300), zh: enStr(c.zh, 200), why: enStr(c.why, 200) };
+  const same = (a: string, b: string) => a.toLowerCase().replace(/[^a-z0-9]+/g, "") === b.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return x.better && !same(x.you, x.better) ? x : null;
+}
+const enTips = (v: unknown) =>
+  (Array.isArray(v) ? v : []).map((t: any) => ({ word: enStr(t?.word, 40), tip: enStr(t?.tip, 200) })).filter((t) => t.word && t.tip).slice(0, 3);
+/** 跟讀時漏掉的字（Gemini 不能聽、改用 Whisper 時的粗略比對） */
+function enMissing(heard: string, target: string): string[] {
+  const words = (s: string) => s.toLowerCase().replace(/[^a-z' ]+/g, " ").split(/\s+/).filter(Boolean);
+  const got = new Set(words(heard));
+  return [...new Set(words(target).filter((w) => !got.has(w)))].slice(0, 6);
+}
+function fromBase64(b64: string): Uint8Array {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+/** 原始 PCM（16 位元單聲道）加上 WAV 檔頭，瀏覽器才能播 */
+function pcmToWav(pcm: Uint8Array, rate: number): Uint8Array {
+  const out = new Uint8Array(44 + pcm.length);
+  const v = new DataView(out.buffer);
+  const w = (o: number, s: string) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + pcm.length, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, pcm.length, true);
+  out.set(pcm, 44);
+  return out;
+}
+
 const PROVIDER_LABEL: Record<ProviderId, string> = { gemini: "Gemini", "gemini-own": "Gemini（旅程金鑰）", "workers-ai": "Workers AI" };
 
 export class TripRoom extends DurableObject<Env> implements RoomApi {
@@ -1113,6 +1151,13 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     if (memo && req.method === "POST") {
       if (!this.isPersonal()) return Response.json({ ok: false, error: "語音備忘只有個人助理可以用" }, { status: 403 });
       return memo[1] ? this.memoSegment(Number(memo[1]), url, req) : this.memoStart(req, user.name);
+    }
+
+    // 英語家教（個人助理，只給大人用）：對話練習、錄音回饋、今日一課、複習卡、示範發音
+    const english = url.pathname.match(/^\/english\/([a-z_]+)$/);
+    if (english) {
+      if (!this.isPersonal()) return Response.json({ ok: false, error: "英語家教只有個人助理可以用" }, { status: 403 });
+      return this.englishApi(english[1], req, url);
     }
 
     if (url.pathname === "/ws") {
@@ -2626,6 +2671,7 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
         await this.checkIdExpiry(now.date);
         await this.maybePersonalDiary(now);
         await this.syncEmbeddings();
+        await this.englishTick(now);
         const hour = Number(this.setting("brief_hour", "7"));
         if (this.settings().autoBrief && now.hour >= hour && now.hour < hour + 3 && this.setting("brief_sent") !== now.date) await this.postPersonalBrief(now.date);
         return;
@@ -2774,6 +2820,288 @@ ${recentChat || "（沒有）"}
 準備給的回答：${answer.slice(0, 2500)}`);
     const list = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x).slice(0, 200)).filter(Boolean) : []);
     return [...list(j?.contradictions), ...list(j?.fake_citations)].slice(0, 5);
+  }
+
+  // ================= 英語家教（個人助理，只給大人用：Gemini API 條款要求滿 18 歲） =================
+
+  private englishStore: EnglishStore | null = null;
+  private english(): EnglishStore {
+    return (this.englishStore ??= new EnglishStore(this.sql, () => this.p().timezone));
+  }
+
+  /** 英語家教用的 AI（JSON 模式）：個人金鑰的 Gemini 優先；有錄音只能給 Gemini 聽（Gemma 聽不到） */
+  private async enAi(prompt: string, audio?: { mime: string; data: string; seconds?: number }): Promise<any> {
+    let last: unknown = null;
+    for (const id of await this.chain(false)) {
+      if (audio && id === "workers-ai") continue;
+      try {
+        const parts: Part[] = audio ? [{ media: { mime: geminiMime(audio.mime), data: audio.data, seconds: audio.seconds } }, { text: prompt }] : [{ text: prompt }];
+        const r = await (await this.provider(id, 1, 15_000)).generate({ system: "你只輸出 JSON。", turns: [{ role: "user", parts }], json: true, timeoutMs: 60_000 });
+        const j = parseArgs(r.text.replace(/^\s*```(?:json)?|```\s*$/g, "").trim()) as any;
+        if (j && typeof j === "object" && Object.keys(j).length) return { ...j, _engine: id };
+        last = new Error("AI 回覆的格式不對");
+      } catch (e) {
+        this.noteQuota(e);
+        last = e;
+      }
+    }
+    throw last ?? new Error("AI 暫時不能用");
+  }
+
+  /** Gemini 不能聽錄音時（額度用完、沒有金鑰）：改用 Workers AI 的 Whisper 轉英文，只能給文法回饋 */
+  private async enTranscribe(b64: string): Promise<string> {
+    if (await this.workersAiBlocked()) throw new WorkersAiQuotaError();
+    const r = (await this.env.AI.run("@cf/openai/whisper-large-v3-turbo" as any, { audio: b64, language: "en", vad_filter: true })) as { text?: string };
+    return enStr(r?.text, 500);
+  }
+
+  private async englishState() {
+    const E = this.english();
+    const today = E.today();
+    const active = this.sql.exec("SELECT id FROM en_sessions WHERE status = 'active' ORDER BY id DESC LIMIT 1").toArray()[0];
+    return {
+      settings: E.settings(),
+      scenarios: SCENARIOS.map(({ id, icon, title, you, tutor, goals }) => ({ id, icon, title, you, tutor, goals })),
+      topics: TOPICS,
+      progress: E.progress(),
+      due: E.dueCards(),
+      lesson: E.lesson(today),
+      recent: E.recentSessions(),
+      active: active ? Number(active.id) : null,
+      hasGemini: !!(await this.keys()).gemini,
+    };
+  }
+
+  private async englishApi(name: string, req: Request, url: URL): Promise<Response> {
+    const E = this.english();
+    const ok = (d: Record<string, unknown> = {}) => Response.json({ ok: true, ...d });
+    const body: any = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+    const audioIn = () => {
+      const data = String(body.audio ?? "");
+      if (!data) return undefined;
+      const mime = String(body.mime ?? "");
+      if (!/^audio\//.test(mime) || !/^[A-Za-z0-9+/=]+$/.test(data)) throw new EnUserError("錄音格式不支援");
+      if (data.length > 1_600_000) throw new EnUserError("錄音太長了，一次請說 30 秒以內");
+      return { mime, data, seconds: Math.min(Number(body.seconds) || 0, 60) || undefined };
+    };
+    const sessionOf = (id: unknown) => {
+      const s = E.session(Number(id));
+      if (!s) throw new EnUserError("找不到這場練習");
+      const sc = scenarioOf(s.scenario);
+      if (!sc) throw new EnUserError("這個情境已經不在了");
+      return { s, sc, turns: s.turns.map(({ role, text }) => ({ role, text })) };
+    };
+    try {
+      switch (name) {
+        case "state":
+          return ok(await this.englishState());
+        case "settings":
+          E.saveSettings(body);
+          return ok(await this.englishState());
+        case "tts":
+          return this.enTts(String(url.searchParams.get("text") ?? ""));
+
+        // ---- 情境角色扮演 ----
+        case "start": {
+          const sc = scenarioOf(body.scenario);
+          if (!sc) throw new EnUserError("找不到這個情境");
+          this.sql.exec("UPDATE en_sessions SET status = 'left' WHERE status = 'active'");
+          return ok({ session: E.session(E.startSession(sc.id, E.settings().level, sc.opener)) });
+        }
+        case "session":
+          return ok({ session: sessionOf(url.searchParams.get("id") ?? body.session).s });
+        case "say": {
+          const { s, sc, turns } = sessionOf(body.session);
+          if (s.status !== "active") throw new EnUserError("這場練習已經結束了，請重新開始");
+          const audio = audioIn();
+          const typed = enStr(body.text, 500);
+          if (!audio && !typed) throw new EnUserError("請說一句話或打字");
+          let r: any;
+          let heard = typed;
+          let noPron = !audio;
+          if (audio) {
+            try {
+              r = await this.enAi(rolePrompt(sc, s.level, turns, "", true), audio);
+              heard = enStr(r.heard, 500);
+            } catch {
+              heard = await this.enTranscribe(audio.data).catch(() => "");
+              if (!heard) throw new EnUserError("AI 暫時聽不了錄音，請改用打字");
+              r = await this.enAi(rolePrompt(sc, s.level, turns, heard, false));
+            }
+            noPron = r._engine !== "gemini-own" || !r.heard;
+          } else r = await this.enAi(rolePrompt(sc, s.level, turns, typed, false));
+          if (!heard) throw new EnUserError("沒聽到英文，請再說一次");
+          const correction = enCorrection(r.correction);
+          E.addTurn(s.id, "user", heard, { correction, pronunciation: noPron ? [] : enTips(r.pronunciation), hint_zh: enStr(r.hint_zh, 300), voice: !!audio, no_pron: !!audio && noPron });
+          E.addTurn(s.id, "tutor", enStr(r.reply, 600) || "Sorry, could you say that again?");
+          const done = (Array.isArray(r.goals_done) ? r.goals_done : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0 && n < sc.goals.length);
+          E.setGoals(s.id, [...s.goals_done, ...done]);
+          // 說錯的句子自動變成複習卡
+          if (correction) E.addCard({ en: correction.better, zh: correction.zh, note: correction.why, source: "對話" });
+          E.touch();
+          return ok({ session: E.session(s.id) });
+        }
+        case "hint": {
+          const { s, sc, turns } = sessionOf(body.session);
+          const r = await this.enAi(hintPrompt(sc, s.level, turns, s.goals_done));
+          return ok({ hint_zh: enStr(r.hint_zh, 300), examples: (Array.isArray(r.examples) ? r.examples : []).map((x: unknown) => enStr(x, 200)).filter(Boolean).slice(0, 3) });
+        }
+        case "end": {
+          const { s, sc, turns } = sessionOf(body.session);
+          if (s.report) return ok({ session: s });
+          if (!turns.some((t) => t.role === "user")) {
+            E.finish(s.id, { summary_zh: "這場還沒開口就結束了，下次試著說一兩句吧！", did_well: [], better: [], phrases: [] });
+            return ok({ session: E.session(s.id) });
+          }
+          const r = await this.enAi(reportPrompt(sc, s.level, turns));
+          const report = {
+            summary_zh: enStr(r.summary_zh, 400),
+            did_well: (Array.isArray(r.did_well) ? r.did_well : []).map((x: unknown) => enStr(x, 200)).filter(Boolean).slice(0, 3),
+            better: (Array.isArray(r.better) ? r.better : []).map(enCorrection).filter(Boolean).slice(0, 3),
+            phrases: (Array.isArray(r.phrases) ? r.phrases : []).map((p: any) => ({ en: enStr(p?.en, 200), zh: enStr(p?.zh, 200) })).filter((p: any) => p.en).slice(0, 4),
+          };
+          const done = (Array.isArray(r.goals_done) ? r.goals_done : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0 && n < sc.goals.length);
+          E.setGoals(s.id, [...s.goals_done, ...done]);
+          for (const b of report.better as { better: string; zh: string; why: string }[]) E.addCard({ en: b.better, zh: b.zh, note: b.why, source: "對話回饋" });
+          E.finish(s.id, report);
+          E.touch();
+          return ok({ session: E.session(s.id) });
+        }
+
+        // ---- 今日一課 ----
+        case "lesson": {
+          const today = E.today();
+          const cur = E.lesson(today);
+          const want = TOPICS.includes(body.topic) ? String(body.topic) : "";
+          if (cur && !body.refresh && (!want || want === cur.topic)) return ok({ lesson: cur });
+          const level = E.settings().level;
+          const topic = want || TOPICS[Math.floor(Date.parse(`${today}T00:00:00Z`) / 86400_000) % TOPICS.length];
+          const r = await this.enAi(lessonPrompt(level, topic, E.recentSentences()));
+          const items = (Array.isArray(r.items) ? r.items : [])
+            .map((x: any) => ({ en: enStr(x?.en, 200), zh: enStr(x?.zh, 200), note: enStr(x?.note, 200), pattern: enStr(x?.pattern, 120) }))
+            .filter((x: any) => x.en)
+            .slice(0, 8);
+          if (items.length < 3) throw new EnUserError("這次產生的課不完整，請再按一次");
+          E.saveLesson(today, topic, level, { title_zh: enStr(r.title_zh, 60) || topic, items, task_zh: enStr(r.task_zh, 200) });
+          return ok({ lesson: E.lesson(today) });
+        }
+        case "lesson_done":
+          E.lessonDone(E.today());
+          return ok({ progress: E.progress() });
+
+        // ---- 錄一句話、打字造句 ----
+        case "check": {
+          const audio = audioIn();
+          if (!audio) throw new EnUserError("沒有收到錄音");
+          const target = enStr(body.target, 300);
+          const task = enStr(body.task, 300);
+          const level = E.settings().level;
+          let r: any;
+          try {
+            r = await this.enAi(audioCheckPrompt(level, target, task), audio);
+          } catch {
+            const heard = await this.enTranscribe(audio.data).catch(() => "");
+            if (!heard) throw new EnUserError("AI 暫時聽不了錄音，請稍後再試");
+            const t = target ? null : await this.enAi(textCheckPrompt(level, task, heard)).catch(() => null);
+            const missing = target ? enMissing(heard, target) : [];
+            r = {
+              heard, match: target ? (missing.length ? "要再練" : "大致正確") : "", missing, pronunciation: [],
+              grammar: t && !t.ok ? [{ you: heard, better: t.better, why: t.why }] : [], better: t?.better ?? "", praise_zh: t?.praise_zh ?? "", audio_ok: true, no_pron: true,
+            };
+          }
+          const result = {
+            heard: enStr(r.heard, 500),
+            match: enStr(r.match, 20),
+            missing: (Array.isArray(r.missing) ? r.missing : []).map((x: unknown) => enStr(x, 40)).filter(Boolean).slice(0, 8),
+            pronunciation: enTips(r.pronunciation),
+            grammar: (Array.isArray(r.grammar) ? r.grammar : []).map(enCorrection).filter(Boolean).slice(0, 3),
+            better: enStr(r.better, 400),
+            praise_zh: enStr(r.praise_zh, 200),
+            audio_ok: r.audio_ok !== false && !!enStr(r.heard, 10),
+            no_pron: !!r.no_pron || r._engine !== "gemini-own",
+          };
+          if (result.audio_ok) E.touch();
+          return ok({ result });
+        }
+        case "check_text": {
+          const text = enStr(body.text, 500);
+          if (!text) throw new EnUserError("請先寫一句英文");
+          const r = await this.enAi(textCheckPrompt(E.settings().level, enStr(body.task, 300), text));
+          E.touch();
+          return ok({ result: { ok: !!r.ok, better: enStr(r.better, 400), why: enStr(r.why, 300), praise_zh: enStr(r.praise_zh, 200) } });
+        }
+
+        // ---- 複習卡 ----
+        case "card_add": {
+          const id = E.addCard({ en: body.en, zh: body.zh, note: body.note, source: enStr(body.source, 20) || "收藏" });
+          return ok({ id, added: !!id });
+        }
+        case "cards":
+          return ok({ cards: E.allCards() });
+        case "review": {
+          const grade: Grade = body.grade === "good" || body.grade === "hard" ? body.grade : "again";
+          const card = E.review(Number(body.id), grade);
+          if (!card) throw new EnUserError("這張卡片已經不在了");
+          return ok({ card, progress: E.progress() });
+        }
+        case "card_delete":
+          E.deleteCard(Number(body.id));
+          return ok();
+        case "reset":
+          E.reset();
+          return ok(await this.englishState());
+      }
+      return Response.json({ ok: false, error: "沒有這個功能" }, { status: 404 });
+    } catch (e: any) {
+      if (e instanceof EnUserError) return Response.json({ ok: false, error: e.message }, { status: 400 });
+      console.error(`english ${name} failed`, e);
+      const quota = e instanceof RateLimitedError || /429|quota|額度/i.test(String(e?.message ?? e));
+      return Response.json({ ok: false, error: quota ? "今天的 AI 額度用完了，明天再練（複習卡還是可以用）" : "AI 暫時不能用，請稍後再試" }, { status: 503 });
+    }
+  }
+
+  /** 示範發音：Gemini 朗讀模型唸一次就存起來，之後重播不用額度；不能用時回 503，前端改用手機內建語音 */
+  private async enTts(text: string): Promise<Response> {
+    // 只送句子本身：加了「請慢慢唸」之類的指示，會連指示一起唸出來
+    const t = enStr(text, 300);
+    if (!/[A-Za-z]/.test(t)) return new Response("no text", { status: 400 });
+    const voice = "Kore";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${voice}|${t}`));
+    const key = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+    const wav = (data: ArrayBuffer) => new Response(data, { headers: { "content-type": "audio/wav", "cache-control": "private, max-age=86400" } });
+    const E = this.english();
+    const hit = E.audioGet(key);
+    if (hit) return wav(hit);
+    const apiKey = (await this.keys()).gemini;
+    if (!apiKey) return new Response("no key", { status: 503 });
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-lite-tts"}:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({ contents: [{ parts: [{ text: t }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }),
+    }).catch(() => null);
+    if (!res?.ok) return new Response("tts unavailable", { status: 503 });
+    const j: any = await res.json().catch(() => null);
+    const part = j?.candidates?.[0]?.content?.parts?.find((p: any) => p?.inlineData)?.inlineData;
+    if (!part?.data) return new Response("tts unavailable", { status: 503 });
+    let bytes = fromBase64(part.data);
+    const mime = String(part.mimeType ?? "");
+    if (/L16|pcm/i.test(mime)) bytes = pcmToWav(bytes, Number(mime.match(/rate=(\d+)/)?.[1]) || 24000);
+    const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    E.audioPut(key, buf);
+    return wav(buf);
+  }
+
+  /** 每天：補簽卡自動抵用；晚上 8 點還沒練英文就推播提醒（只對用過英語家教的人） */
+  private async englishTick(now: { date: string; hour: number }) {
+    if (!this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'en_days'").toArray().length) return;
+    const E = this.english();
+    E.maintain();
+    if (now.hour < EN_REMIND_HOUR || now.hour >= EN_REMIND_HOUR + 2 || !E.settings().remind || E.get("reminded") === now.date) return;
+    const p = E.progress();
+    if (p.today_done || (!p.cards_due && !p.streak)) return;
+    E.put("reminded", now.date);
+    await this.pushAll({ title: "📚 今天還沒練英文", body: [p.cards_due ? `有 ${p.cards_due} 張卡片要複習` : "", p.streak ? `已經連續 ${p.streak} 天，別斷掉！` : ""].filter(Boolean).join("，"), tag: "english" });
   }
 
   /** 只根據路線圖回答怎麼搭（check_route_map 用）；密密麻麻的路線圖只有 Gemini 看得清楚，不能用就回 null */

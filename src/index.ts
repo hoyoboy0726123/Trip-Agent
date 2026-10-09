@@ -325,6 +325,12 @@ export default {
         return room.fetch(new Request(`https://room/file/${file[1]}${url.search}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));
       }
 
+      // 英語家教（個人助理）：對話練習、錄音回饋、今日一課、複習卡、示範發音
+      const english = path.match(/^\/api\/english\/([a-z_]+)$/);
+      if (english && (req.method === "POST" || req.method === "GET")) {
+        return room.fetch(new Request(`https://room/english/${english[1]}${url.search}`, { method: req.method, headers, body: req.method === "POST" ? req.body : undefined }));
+      }
+
       // 回放錄音（<audio> 帶不了標頭：網址上的 ?room= 指定空間；Range 標頭照轉）
       const memoAudio = path.match(/^\/api\/memo\/(\d+)\/audio$/);
       if (memoAudio && req.method === "GET") return room.fetch(new Request(`https://room/memo/${memoAudio[1]}/audio${url.search}`, { headers }));

@@ -663,3 +663,47 @@ input[type="date"]::-webkit-date-and-time-value, input[type="time"]::-webkit-dat
 .messages.only-mine .msg[data-mine="0"], .messages.only-mine .unread-sep, .messages.only-mine .day-sep[data-empty="1"] { display: none; }
 .mine-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 12px; padding: 8px 12px; border-radius: 12px; background: var(--red-soft); font-size: 14px; }
 .mine-bar[hidden] { display: none; }
+
+/* ---------- 英語家教（個人助理） ---------- */
+.en-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.en-tabs button { padding: 9px 2px; font-size: 13px; position: relative; }
+.en-badge { display: inline-block; min-width: 18px; margin-left: 3px; padding: 0 5px; border-radius: 9px; background: var(--danger); color: #fff; font-size: 11px; line-height: 18px; }
+.en-scenes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.en-scene { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--ink); font: inherit; text-align: left; cursor: pointer; box-shadow: var(--shadow); }
+.en-scene-icon { font-size: 24px; }
+.en-h { margin: 14px 0 6px; font-size: 15px; }
+.en-past { width: 100%; display: flex; justify-content: space-between; gap: 8px; border: 0; background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.en-head .en-goals { list-style: none; margin: 8px 0 0; padding: 0; font-size: 14px; }
+.en-head .en-goals li.done { color: var(--muted); text-decoration: line-through; }
+.en-chat { max-height: 52vh; overflow-y: auto; padding: 4px 2px 8px; }
+.en-msg { display: flex; flex-direction: column; margin: 8px 0; }
+.en-msg.user { align-items: flex-end; }
+.en-msg.tutor { align-items: flex-start; }
+.en-bubble { max-width: 85%; padding: 9px 12px; border-radius: 16px; background: var(--ai); border: 1px solid var(--line); line-height: 1.5; }
+.en-msg.user .en-bubble { background: var(--me); color: var(--me-ink); border-color: var(--me); }
+.en-fix { max-width: 90%; margin-top: 6px; padding: 8px 10px; border-radius: 12px; background: var(--notice); color: var(--ink); font-size: 14px; line-height: 1.5; }
+.en-note { margin-top: 4px; }
+.en-play { border: 0; background: none; padding: 0 2px; font-size: 16px; cursor: pointer; color: inherit; }
+.en-actions .en-play { padding: 4px 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); font-size: 14px; }
+.en-input { display: flex; gap: 6px; align-items: flex-end; margin-top: 8px; }
+.en-input textarea { flex: 1; min-height: 40px; max-height: 120px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); font: inherit; resize: vertical; }
+.en-mic.on { background: var(--danger); border-color: var(--danger); color: #fff; }
+.en-tools { gap: 10px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.en-hint .en-ex { margin-top: 4px; }
+.en-item .en-en, .en-flash .en-en { font-size: 18px; font-weight: 700; margin-bottom: 2px; }
+.en-actions { gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.en-result { margin-top: 8px; padding: 8px 10px; border-radius: 12px; background: var(--red-soft); line-height: 1.6; }
+#en-target { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); font: inherit; box-sizing: border-box; }
+.en-bigmic { display: flex; justify-content: center; margin: 14px 0 4px; }
+.en-mic.big { padding: 14px 24px; font-size: 17px; border-radius: 30px; }
+.en-flash { text-align: center; padding: 18px 14px; }
+.en-flash .en-zh { font-size: 19px; margin: 8px 0 12px; }
+.en-grades { justify-content: center; gap: 8px; margin-top: 12px; }
+.en-streak { text-align: center; }
+.en-fire { font-size: 38px; font-weight: 800; }
+.en-week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; margin-top: 8px; text-align: center; font-size: 13px; }
+.en-week span { padding: 6px 0; border-radius: 10px; border: 1px solid var(--line); }
+.en-week span.on { background: var(--red-soft); }
+.en-week span.today { border-color: var(--red); }
+.en-list { margin: 4px 0; padding-left: 20px; }
+.en-log { margin-top: 10px; }

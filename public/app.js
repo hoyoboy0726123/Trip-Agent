@@ -1418,6 +1418,7 @@ function renderPanelInner() {
     if (S.panel === "calendar") return renderCalendarPanel(st, b);
     if (S.panel === "memo") return renderMemoPanel(st, b);
     if (S.panel === "health") return renderHealthPanel(st, b);
+    if (S.panel === "english") return renderEnglishPanel(st, b);
     if (S.panel === "iddocs") return renderIdDocsPanel(st, b);
   }
   if (S.panel === "photos") return renderPhotosPanel(b);
@@ -2347,6 +2348,7 @@ function toolCards() {
     return [
       ["calendar", "calendar", "行事曆", "行程、提醒、訂閱到手機日曆"],
       ["health", "heart", "健康管家", "血壓血糖、用藥、健檢提醒"],
+      ["english", "english", "英語家教", "情境對話、發音回饋、每日一課"],
       ["notes", "book", "知識庫", "連結、筆記、文件、照片"],
       ["memo", "mic", "語音備忘", "錄音、會議記錄自動整理"],
       ["checklist", "list", "清單", "待辦、購物"],

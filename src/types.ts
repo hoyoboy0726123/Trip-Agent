@@ -75,5 +75,7 @@ export interface Provider {
     timeoutMs?: number;
     /** Gemini 多久沒開始回應就放棄、改用備援（塞車時常常一直不回；只用在聊天，後面還有備援模型時才設） */
     firstChunkMs?: number;
+    /** 這一輪一定要呼叫其中一個工具（只有 Gemini 支援；關鍵字很明確時第一輪用） */
+    mustCall?: string[];
   }): Promise<GenerateResult>;
 }

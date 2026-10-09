@@ -160,6 +160,13 @@ const SCENARIOS = [
     },
   },
   {
+    name: "想看影片時要找短片（沒提到影片時不找）",
+    async run(t) {
+      const r = await t.ask("淺草寺有沒有人拍的短片可以看看？");
+      return [r.tools.includes("find_short_videos"), `工具：${r.tools.join("、") || "無"}`];
+    },
+  },
+  {
     name: "短問句簡短回答",
     async run(t) {
       const r = await t.ask("淺草怎麼去");

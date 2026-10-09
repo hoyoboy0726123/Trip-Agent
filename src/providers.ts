@@ -37,7 +37,7 @@ export function geminiProvider(env: Env, id: ProviderId, apiKey: string, gate?: 
   return {
     id,
     model: m,
-    async generate({ system, turns, tools, onDelta, json, timeoutMs, firstChunkMs }) {
+    async generate({ system, turns, tools, onDelta, json, timeoutMs, firstChunkMs, mustCall }) {
       if (!apiKey) throw new Error("沒有可用的 Gemini 金鑰");
       const body: Record<string, unknown> = {
         systemInstruction: { parts: [{ text: system }] },
@@ -58,6 +58,7 @@ export function geminiProvider(env: Env, id: ProviderId, apiKey: string, gate?: 
         generationConfig: json ? { responseMimeType: "application/json", temperature: 0.2 } : { temperature: 0.6 },
       };
       if (tools?.length) body.tools = [{ functionDeclarations: tools }];
+      if (tools?.length && mustCall?.length) body.toolConfig = { functionCallingConfig: { mode: "ANY", allowedFunctionNames: mustCall } };
 
       // 不自動重試：重試只會更快把 RPM/TPM 用光。失敗就冷卻，由上層改用備援模型
       if (gate) await gate.acquire(estimateTokens(system, turns, tools));

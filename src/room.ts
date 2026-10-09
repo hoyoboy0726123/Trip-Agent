@@ -411,6 +411,8 @@ function photoMatch(keyword: string, text: string): number {
 const WRITE_TOOLS = new Set(["update_checklist_item", "create_reminder", "add_checklist_items", "save_document", "save_note", "health_log", "health_meds"]);
 /** 關鍵字命中也不一定要用的工具：另外請 AI 判斷，不是就保留原本的回答（寫入類可能只是在問；「附近」可能只是在說自己在哪裡、其實在問路） */
 const JUDGED_TOOLS = new Set([...WRITE_TOOLS, "find_nearby"]);
+/** 會寫入資料的工具：要照順序一個一個跑；其他只查資料的可以一起跑 */
+const SIDE_EFFECT = /^(add_|update_|delete_|create_|save_|remember$|forget$|health_log$|health_meds$|health_profile$|id_expiry$)/;
 const JUDGE_EXAMPLES = "例如「護照大家都帶了嗎？」是在問，不是說帶了；「我們在車站附近，怎麼回飯店？」是在問路，不是要找附近的店";
 
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
@@ -498,7 +500,7 @@ function factNudge(problems: string[]): string {
   return `（系統查核：你的回答有這些地方跟這次查到的資料不符，或資料裡其實沒寫：\n${problems.map((p) => `- ${p}`).join("\n")}\n請改正後重新完整回答成員原本的問題：以查到的資料為準；資料沒寫的就說沒查到，不要說「根據資料」；長期記憶可能寫錯，跟查到的資料不同時以查到的為準，記憶裡寫錯的那條用 forget 刪掉。成員沒看到你剛才那段回答，不用道歉，也不要提到這個檢查。）`;
 }
 
-/** 成員有提到想看影片、實際畫面（備援模型自己去找短片前檢查用） */
+/** 成員有提到想看影片、實際畫面（模型自己去找短片前檢查用；「想看看」「有人拍嗎」「長怎樣」也算） */
 const VIDEO_WANT = /短片|短影音|影片|視頻|reels?\b|shorts|youtube|\big\b|拍的|畫面|長怎樣|看看/i;
 
 const BACKUP_ROUTE_NOTE = "⚠️ 這次由備援模型回答，路線的方向和轉乘可能不準，出發前請以 Google 地圖為準。";
@@ -5348,6 +5350,11 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     // 跨模型共用：前一個模型中途被限流時，下一個模型接著已完成的工具結果繼續，不會重複記帳或重複查詢
     let turns = this.buildTurns(history, trigger, photoParts);
     const onWait = (ms: number) => this.broadcast({ type: "ai_note", id, text: `Gemini 額度冷卻中，等待 ${Math.ceil(ms / 1000)} 秒…` });
+    // 關鍵字很明確的（找票券、查帳、路線圖、讀連結…）：第一輪就要它用工具，省掉「先答一次、被提醒再重來」的時間和額度。
+    // 可能只是在問的（打勾、提醒、附近）和要確認卡片的（記帳）不強迫
+    const first = requiredTool(trigger.text, [], !!trigger.photo_id, available);
+    const declared = available;
+    const firstCall = first && !JUDGED_TOOLS.has(first) && !DRAFT_TOOLS.has(first) ? [first, ...(INTENTS.find((i) => i.tool === first)?.alt ?? [])].filter((n) => declared.has(n)) : undefined;
 
     for (const pid of order) {
       const provider = await this.provider(pid, 1, FOREGROUND_MAX_WAIT, onWait);
@@ -5366,6 +5373,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             ...(photoParts.length > 1 ? { timeoutMs: 120_000 } : {}),
             // Gemini 塞車時不要乾等：後面還有備援就只等它開始回應 15 秒（附照片 30 秒）
             ...(pid !== order[order.length - 1] ? { firstChunkMs: photoParts.length ? 30_000 : 15_000 } : {}),
+            ...(step === 0 && firstCall?.length ? { mustCall: firstCall } : {}),
           });
           if (!res.calls.length) {
             // 模型偶爾偷懶：嘴上說「已加入清單」「圖片在下方」卻沒呼叫工具。提醒一次，重新回答
@@ -5455,14 +5463,17 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
           if (res.text) modelParts.push({ text: res.text });
           for (const c of res.calls) modelParts.push({ call: c });
           const resultParts: Part[] = [];
+          // 只查資料的工具一起跑（同時查天氣、找附近、搜尋不用一個等一個）；有會寫入的就照順序
+          const parallel = res.calls.length > 1 && res.calls.every((c) => !SIDE_EFFECT.test(c.name));
+          const jobs: Promise<void>[] = [];
           for (const c of res.calls) {
             // 成員沒要求看圖：AI 自己找圖片只會拖慢、用掉額度，跳過
             if (c.name === "find_images" && !IMAGE_ASK.test(trigger.text)) {
               resultParts.push({ result: { id: c.id, name: c.name, response: { skipped: true, note: "成員沒有要求看圖片，這次不找圖片，直接用文字回答" } } });
               continue;
             }
-            // 備援模型常沒被要求就自己去找短片（問餐廳卻只講影片）：成員沒提到影片、上一則也沒問要不要找，就不找
-            if (c.name === "find_short_videos" && provider.id === "workers-ai" && !VIDEO_WANT.test(trigger.text) && !/影片|短片/.test([...history].reverse().find((m) => m.role === "assistant")?.text ?? "")) {
+            // 模型常沒被要求就自己去找短片（問餐廳卻只講影片、也沒查證）：成員沒提到想看影片或畫面、上一則也沒問要不要找，就不找
+            if (c.name === "find_short_videos" && !VIDEO_WANT.test(trigger.text) && !/影片|短片/.test([...history].reverse().find((m) => m.role === "assistant")?.text ?? "")) {
               resultParts.push({ result: { id: c.id, name: c.name, response: { skipped: true, note: "成員沒有要求看影片，這次不找，直接回答成員的問題" } } });
               continue;
             }
@@ -5472,11 +5483,16 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               if (CHINESE_ASK.test(trigger.text)) c.args = { ...c.args, language: "chinese" };
               for (const p of Array.isArray(c.args.places) ? (c.args.places as any[]) : []) videoPlaces.push(String(p?.name_zh || p?.name_local || "").slice(0, 30));
             }
-            const result = await runTool(c.name, c.args, ctx);
-            lastResults[c.name] = result;
-            toolJson += JSON.stringify(result ?? "");
-            resultParts.push({ result: { id: c.id, name: c.name, response: result } });
+            const slot = resultParts.push({ result: { id: c.id, name: c.name, response: null } }) - 1;
+            const job = runTool(c.name, c.args, ctx).then((result) => {
+              lastResults[c.name] = result;
+              toolJson += JSON.stringify(result ?? "");
+              resultParts[slot] = { result: { id: c.id, name: c.name, response: result } };
+            });
+            if (parallel) jobs.push(job);
+            else await job;
           }
+          await Promise.all(jobs);
           turns = [...turns, { role: "model", parts: modelParts }, { role: "user", parts: resultParts }];
           if (step === MAX_STEPS - 1) finalText = res.text || "（查了很多資料，但還沒整理完，請再問一次更具體的問題 🙏）";
         }

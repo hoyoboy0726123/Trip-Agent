@@ -70,15 +70,22 @@ self.addEventListener("fetch", (e) => {
   // 其他 API 與 WebSocket 不快取
   if (url.pathname.startsWith("/api/") || url.pathname === "/ws") return;
 
+  const network = fetch(req).then((res) => {
+    if (res.ok) {
+      const copy = res.clone();
+      caches.open(SHELL_CACHE).then((c) => c.put(req, copy));
+    }
+    return res;
+  });
+  // 網路回來後繼續更新快取（下次打開就是新版）
+  e.waitUntil(network.catch(() => {}));
   e.respondWith(
-    fetch(req)
-      .then((res) => {
-        if (res.ok) {
-          const copy = res.clone();
-          caches.open(SHELL_CACHE).then((c) => c.put(req, copy));
-        }
-        return res;
-      })
-      .catch(async () => (await caches.match(req)) || (await caches.match("/")) || Response.error()),
+    (async () => {
+      const cached = await caches.match(req);
+      if (!cached) return network.catch(async () => (await caches.match("/")) || Response.error());
+      // 訊號差時網路常常卡住不回：3 秒內沒回就先用快取的畫面，不要一直白畫面
+      const late = new Promise((r) => setTimeout(() => r(cached), 3000));
+      return Promise.race([network.catch(() => cached), late]);
+    })(),
   );
 });

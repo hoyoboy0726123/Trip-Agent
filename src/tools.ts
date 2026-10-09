@@ -45,6 +45,10 @@ export interface RoomApi {
   reminderGet(id: number): { id: number; time: string; message: string } | null;
   itineraryDay(date: string): { title: string; detail: string; status: string } | null;
   expenseGet(id: number): ExpenseBrief | null;
+  /** 已確認的記帳卡片寫進帳本的是哪一筆 */
+  confirmedExpense(draftId: number): number | null;
+  /** 同一天、同金額、同幣別的帳 */
+  expenseSame(date: string, amount: number, currency: string): ExpenseBrief[];
   /** 品項關鍵字找帳（空字串＝最近的幾筆） */
   expenseFind(keyword: string): ExpenseBrief[];
   documentSave(title: string, note: string, photoId: string, author: string, folder?: number | null): unknown;
@@ -71,6 +75,8 @@ export interface ExpenseBrief {
   amount: number;
   currency: string;
   payer: string;
+  category?: string;
+  split_among?: string[];
 }
 
 export interface ExpenseInput {
@@ -141,6 +147,7 @@ export interface DraftInput {
 }
 
 const REPLACES_PARAM = { type: "integer", description: "修正還沒確認的卡片時，填那張卡片的編號（見系統提示「最近的確認卡片」）" };
+const EDIT_PARAM = { type: "integer", description: "要修改帳本裡已經記好的某一筆（金額、日期、付款人、分攤打錯）時，填那筆的帳目 id（用 find_expenses 查，不是卡片編號）；只填要改的欄位（沒提到的不要填，會沿用原本的），確認後直接改那一筆，不會多一筆。新增的帳不要填" };
 
 /** 住宿：模型寫「住宿」「民宿」或住宿名稱時，換成正確的目的地（有座標用座標，否則用地址） */
 function homeOr(place: string, p: TripProfile): string {
@@ -825,6 +832,36 @@ const YAHOO_AREA: [RegExp, number][] = [
   [/四國|四国|高松|松山|高知|德島|徳島/, 9],
 ];
 
+/** Tavily 這個月的額度用完（432 免費額度、433 隨用隨付上限）：工具結果帶這個標記，回答會註明「沒有上網查證」 */
+export const SEARCH_OUT = "search_quota_exhausted";
+const quotaOut = (status: number) => status === 432 || status === 433;
+const searchOut = () => ({
+  error: "這個月的網路搜尋額度用完了，這次沒辦法上網查。不要說「查不到」「不存在」或「已經沒有」：照你知道的回答，並清楚說這次沒有上網查證、資訊可能過時，請成員出發前自己再確認。",
+  [SEARCH_OUT]: true,
+});
+
+/** 記帳卡片要改帳本裡的某一筆（edit_id）：沒填的欄位沿用原本的（模型常只填改了的金額，日期就變成今天） */
+function editBase(args: Record<string, any>, room: RoomApi): { old: ExpenseBrief | null; args: Record<string, any>; error?: string } {
+  // 模型常拿「已經確認的卡片編號」填 replaces：換成那張卡片寫進帳本的那一筆，不然會多記一筆
+  const fromCard = !args.edit_id && args.replaces ? room.confirmedExpense(Number(args.replaces)) : null;
+  const editId = Number(args.edit_id) || fromCard || 0;
+  if (!editId) return { old: null, args };
+  const old = room.expenseGet(editId);
+  if (!old) return { old, args, error: `帳本裡沒有 #${editId} 這筆帳（還沒確認的卡片要用 replaces），請先用 find_expenses 查到正確的帳目 id` };
+  const given = Object.fromEntries(Object.entries(args).filter(([k, v]) => v != null && v !== "" && !(Array.isArray(v) && !v.length) && !(fromCard && k === "replaces")));
+  return { old, args: { description: old.description, amount: old.amount, date: old.date, payer: old.payer, currency: old.currency, category: old.category, split_among: old.split_among, ...given } };
+}
+
+/** 同一天已經有一樣金額的帳：提醒可能重複記帳（改帳不用） */
+function dupWarning(room: RoomApi, old: ExpenseBrief | null, date: string, amount: number, currency: string): string {
+  if (old) return "";
+  const d = room.expenseSame(date, amount, currency)[0];
+  return d ? `帳本裡 ${date} 已經有一筆一樣金額的「${d.description}」，請確認不是重複記帳` : "";
+}
+
+/** 卡片上「原本：…」：有改才顯示 */
+const was = (before: string | null | undefined, now: string): string | undefined => (before != null && before !== now ? before : undefined);
+
 // ---------------- 工具清單 ----------------
 
 export const TOOLS: Tool[] = [
@@ -850,7 +887,7 @@ export const TOOLS: Tool[] = [
         body: JSON.stringify({ query: args.query, max_results: Math.min(Number(args.max_results) || 5, 8), include_answer: "basic", search_depth: "basic" }),
         signal: AbortSignal.timeout(20_000),
       });
-      if (res.status === 432 || res.status === 433) return { error: "Tavily 本月的免費搜尋額度用完了，請管理員到 「設定」換一組金鑰" };
+      if (quotaOut(res.status)) return searchOut();
       if (!res.ok) return { error: `搜尋失敗 ${res.status}` };
       const d: any = await res.json();
       return {
@@ -911,6 +948,7 @@ export const TOOLS: Tool[] = [
       const total = Math.min(Math.max(Number(args.count) || 4, list.length), 6);
       const perQuery = Math.max(1, Math.ceil(total / list.length));
 
+      let out = false;
       // 每個關鍵字各自搜尋、各自檢查圖片能不能顯示（約三成會擋外連、不是圖片或太大）
       const groups = await Promise.all(
         list.map(async (query) => {
@@ -921,7 +959,10 @@ export const TOOLS: Tool[] = [
               body: JSON.stringify({ query, max_results: 5, include_images: true, include_image_descriptions: true, search_depth: "basic" }),
               signal: AbortSignal.timeout(20_000),
             });
-            if (!res.ok) return { query, picked: [] as { url: string; description: string; page?: string }[] };
+            if (!res.ok) {
+              if (quotaOut(res.status)) out = true;
+              return { query, picked: [] as { url: string; description: string; page?: string }[] };
+            }
             const d: any = await res.json();
             const seen = new Set<string>();
             const candidates: { url: string; description: string; page?: string }[] = [];
@@ -955,6 +996,7 @@ export const TOOLS: Tool[] = [
         results.push({ query: g.query, found: g.picked.length, descriptions: g.picked.map((p) => p.description.slice(0, 100)) });
       }
       const found = results.reduce((s, r) => s + r.found, 0);
+      if (!found && out) return searchOut();
       if (!found) return { found: 0, note: "找不到可以顯示的圖片，可以換個關鍵字（當地語言或英文）再試" };
       return {
         found,
@@ -1196,8 +1238,8 @@ export const TOOLS: Tool[] = [
       parameters: {
         type: "object",
         properties: {
-          origin: { type: "string", description: "照成員訊息裡的寫法直接複製（例如「新宿站」），不要自己翻成日文" },
-          destination: { type: "string", description: "照成員訊息裡的寫法直接複製（例如「池袋站」），不要自己翻成日文" },
+          origin: { type: "string", description: "照成員訊息裡的寫法直接複製（例如「市政府站」），不要自己翻譯成當地語言" },
+          destination: { type: "string", description: "照成員訊息裡的寫法直接複製（例如「中央車站」），不要自己翻譯成當地語言" },
           mode: { type: "string", enum: ["transit", "walking", "driving"] },
         },
         required: ["destination"],
@@ -1235,6 +1277,7 @@ export const TOOLS: Tool[] = [
           category: { type: "string", enum: PERSONAL_CATEGORIES },
           date: { type: "string", description: "日期 YYYY-MM-DD，預設今天。收據上的民國年要加 1911（民國 113 年＝2024 年）" },
           replaces: REPLACES_PARAM,
+          edit_id: EDIT_PARAM,
         },
         required: ["description", "amount"],
       },
@@ -1252,12 +1295,17 @@ export const TOOLS: Tool[] = [
           category: { type: "string", enum: ["餐飲", "交通", "門票", "購物", "住宿", "其他"] },
           date: { type: "string", description: "日期 YYYY-MM-DD，預設今天（當地時間）。收據上的民國年要加 1911（民國 113 年＝2024 年）" },
           replaces: REPLACES_PARAM,
+          edit_id: EDIT_PARAM,
         },
         required: ["description", "amount"],
       },
     }),
     async run(args, ctx) {
-      if (ctx.profile.kind === "personal") return personalExpense(args, ctx);
+      const base = editBase(args, ctx.room);
+      if (base.error) return { error: base.error };
+      args = base.args;
+      const old = base.old;
+      if (ctx.profile.kind === "personal") return personalExpense(args, ctx, old);
       const local = ctx.profile.currency;
       const currency = String(args.currency || local).toUpperCase();
       const amount = Number(args.amount);
@@ -1290,22 +1338,22 @@ export const TOOLS: Tool[] = [
         const p = ctx.profile;
         // 日期離旅程太遠（例如兩年前在台灣的收據）特別標出來，幣別也最容易在這種時候看錯；出發前幾個月先買票是正常的
         const outside = e.date < shiftDate(p.startDate, -90) || e.date > shiftDate(p.endDate, 14);
-        const warn = outside ? `日期離旅遊期間（${p.startDate}～${p.endDate.slice(5)}）很遠，請確認日期與幣別` : "";
+        const warn = [outside ? `日期離旅遊期間（${p.startDate}～${p.endDate.slice(5)}）很遠，請確認日期與幣別` : "", dupWarning(ctx.room, old, e.date, amount, currency)].filter(Boolean).join("；");
         const parts = [currency !== local ? `≈ ${money(amountLocal, local, p)}` : "", currency !== "TWD" ? `≈ NT$${twd.toLocaleString("en-US")}` : ""].filter(Boolean);
         return ctx.propose({
           kind: "add_expense",
-          payload: e,
+          payload: old ? { ...e, editId: old.id } : e,
           replaces: Number(args.replaces) || undefined,
           warning: warn || undefined,
           preview: {
-            title: "記帳確認",
-            confirm: "確認記帳",
-            summary: `${e.date} ${e.description} ${money(amount, currency, p)}（${e.payer} 付，${split.length} 人分）`,
+            title: old ? "修改帳目確認" : "記帳確認",
+            confirm: old ? "確認修改" : "確認記帳",
+            summary: `${old ? `修改帳目 #${old.id}：` : ""}${e.date} ${e.description} ${money(amount, currency, p)}（${e.payer} 付，${split.length} 人分）`,
             rows: [
-              ["日期", e.date],
-              ["項目", String(e.description)],
-              ["金額", `${money(amount, currency, p)}${parts.length || rateEstimated ? `（${parts.join("｜")}${rateEstimated ? "，匯率為估計值" : ""}）` : ""}`],
-              ["付款人", String(e.payer)],
+              ["日期", e.date, was(old?.date, e.date)],
+              ["項目", String(e.description), was(old?.description, String(e.description))],
+              ["金額", `${money(amount, currency, p)}${parts.length || rateEstimated ? `（${parts.join("｜")}${rateEstimated ? "，匯率為估計值" : ""}）` : ""}`, was(old && money(old.amount, old.currency, p), money(amount, currency, p))],
+              ["付款人", String(e.payer), was(old?.payer, String(e.payer))],
               ["分攤", `${split.join("、")}（每人約 NT$${Math.round(twd / split.length).toLocaleString("en-US")}）`],
               ["分類", e.category],
               ...(warn ? [["⚠️ 注意", warn] as [string, string]] : []),
@@ -2137,7 +2185,7 @@ export const TOOLS: Tool[] = [
     decl: {
       name: "find_chat_photos",
       description:
-        "找大家自己拍、傳到這個聊天室的照片，照片會直接顯示在回答下方。例如「第一天的照片」「昨天吃拉麵的照片」「小佑傳的照片」「我們在晴空塔的合照」。" +
+        "找大家自己拍、傳到這個聊天室的照片，照片會直接顯示在回答下方。例如「第一天的照片」「昨天吃拉麵的照片」「媽媽傳的照片」「我們在晴空塔的合照」。" +
         "要看沒去過的地方、店家、料理長什麼樣（網路圖片）才用 find_images。",
       parameters: {
         type: "object",
@@ -2411,7 +2459,7 @@ const localDateFrom = () => new Date().toISOString().slice(0, 10);
 const PERSONAL_CATEGORIES = ["餐飲", "交通", "購物", "日用品", "娛樂", "醫療", "帳單", "其他"];
 
 /** 個人助理記帳：沒有分帳，外幣換成台幣 */
-async function personalExpense(args: Record<string, any>, ctx: ToolContext) {
+async function personalExpense(args: Record<string, any>, ctx: ToolContext, old: ExpenseBrief | null = null) {
   const currency = String(args.currency || "TWD").toUpperCase();
   const amount = Number(args.amount);
   if (!Number.isFinite(amount) || amount <= 0) return { error: "金額不正確" };
@@ -2436,19 +2484,22 @@ async function personalExpense(args: Record<string, any>, ctx: ToolContext) {
     author: ctx.author,
   };
   if (!ctx.propose) return { saved: ctx.room.addExpense(e) };
+  const warn = dupWarning(ctx.room, old, e.date, amount, currency);
   return ctx.propose({
     kind: "add_expense",
-    payload: e,
+    payload: old ? { ...e, editId: old.id } : e,
     replaces: Number(args.replaces) || undefined,
+    warning: warn || undefined,
     preview: {
-      title: "記帳確認",
-      confirm: "確認記帳",
-      summary: `${e.date} ${e.description} ${money(amount, currency, p)}`,
+      title: old ? "修改帳目確認" : "記帳確認",
+      confirm: old ? "確認修改" : "確認記帳",
+      summary: `${old ? `修改帳目 #${old.id}：` : ""}${e.date} ${e.description} ${money(amount, currency, p)}`,
       rows: [
-        ["日期", e.date],
-        ["項目", String(e.description)],
-        ["金額", `${money(amount, currency, p)}${currency !== "TWD" ? `（≈ NT$${twd.toLocaleString("en-US")}${rate.estimated ? "，匯率為估計值" : ""}）` : ""}`],
+        ["日期", e.date, was(old?.date, e.date)],
+        ["項目", String(e.description), was(old?.description, String(e.description))],
+        ["金額", `${money(amount, currency, p)}${currency !== "TWD" ? `（≈ NT$${twd.toLocaleString("en-US")}${rate.estimated ? "，匯率為估計值" : ""}）` : ""}`, was(old && money(old.amount, old.currency, p), money(amount, currency, p))],
         ["分類", e.category],
+        ...(warn ? [["⚠️ 注意", warn] as [string, string]] : []),
       ],
     },
   });

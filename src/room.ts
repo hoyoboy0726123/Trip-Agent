@@ -7,7 +7,7 @@ import {
 } from "./profile";
 import { geminiProvider, isQuotaError, parseArgs, providerFor, uploadGeminiFile, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
-import { cleanRouteMap, routeMapPrompt, zhCaption, disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type EventInput, runTool, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
+import { cleanRouteMap, routeMapPrompt, zhCaption, disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type EventInput, runTool, SEARCH_OUT, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
@@ -372,7 +372,7 @@ function photoRows<T extends { photo_id: string | null; meta: string | null }>(m
 /** 一則訊息最多幾張照片（菜單好幾頁一起翻譯；再多 AI 的回答會太長、容易漏） */
 const MAX_PHOTOS = 6;
 
-/** 自己拍、傳到聊天室的照片（「第一天的照片」「我們在晴空塔的合照」「小佑傳的照片」）要翻聊天室，不是上網找 */
+/** 自己拍、傳到聊天室的照片（「第一天的照片」「我們在晴空塔的合照」「小明傳的照片」）要翻聊天室，不是上網找 */
 const OWN_PHOTO = /(我們|我的|我傳|我拍|大家|全家|家人|自己|第\s*[一二三四五六七八九十\d]+\s*天|今天|昨天|前天|那天|這幾天|\d{1,2}\s*[\/／月]\s*\d{1,2}|傳過|傳的|傳了|拍的|拍過|拍了|上傳).{0,12}(照片|相片|合照)|(照片|相片|合照).{0,8}(我們|大家|傳過|拍的|傳的)/;
 
 const PHOTO_SYNONYMS: [RegExp, string][] = [
@@ -407,6 +407,12 @@ function photoMatch(keyword: string, text: string): number {
 }
 
 
+/** 會直接寫入資料的工具（不經確認卡片）：成員可能只是在問（「護照大家都帶了嗎？」），不能只看關鍵字就硬寫 */
+const WRITE_TOOLS = new Set(["update_checklist_item", "create_reminder", "add_checklist_items", "save_document", "save_note", "health_log", "health_meds"]);
+function writeNudge(need: string): string {
+  return `（系統提醒：成員這句話可能要你用 ${need}。如果成員是要你做這件事，一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成；如果成員只是在問問題或聊天（例如「護照大家都帶了嗎？」是在問，不是說帶了），就不要呼叫，直接照原本的意思回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）`;
+}
+
 /** 這個問題一定要用到、但模型還沒呼叫的工具（沒有就回 null） */
 function requiredTool(text: string, used: string[], hasPhoto: boolean, available: Set<string>): string | null {
   for (const i of INTENTS) {
@@ -417,7 +423,10 @@ function requiredTool(text: string, used: string[], hasPhoto: boolean, available
 }
 
 function expenseBrief(r: Record<string, SqlStorageValue>) {
-  return { id: r.id as number, date: r.date as string, description: r.description as string, amount: r.amount as number, currency: r.currency as string, payer: r.payer as string };
+  return {
+    id: r.id as number, date: r.date as string, description: r.description as string, amount: r.amount as number, currency: r.currency as string, payer: r.payer as string,
+    category: r.category as string, split_among: JSON.parse((r.split_among as string) || "[]") as string[],
+  };
 }
 
 /** 挑記憶用的文字：這則訊息加上它回覆的那則（「那第一天呢？」要靠被回覆的內容才知道在問什麼） */
@@ -449,18 +458,31 @@ function routeReply(text: string): boolean {
  * 回答裡有要查證的事實（推薦的店家景點、營業時間、展覽活動、票價、樓層）：這一輪要先上網查過才能講。
  * AI 的記憶常過時（店收了、展覽結束了、雕像拆了），旅遊時照舊資訊跑一趟就白費了
  */
-const FACT_HINT = /\[📍[^\]\n]*\]\((?!https:\/\/www\.google\.com\/maps\/dir)|營業|開放時間|展覽|展出|活動期間|期間限定|門票|票價|休館|公休|開幕|閉館|拆除|樓層|\d+\s*樓/;
+const FACT_WORDS = /營業|開放時間|展覽|展出|活動期間|期間限定|門票|票價|休館|公休|開幕|閉館|拆除|樓層|\d+\s*樓/;
+/** 上網查了的工具：用了就是根據查到的資料回答（找附近只查到那幾家店，順便推薦的其他地點還是要查，靠下面比對工具結果） */
+const GROUNDING_TOOLS = new Set(["web_search", "read_webpage", "check_route_map"]);
 /** 不提供事實的工具（只產生地圖連結、找圖、找短片）：只用了這些就等於憑記憶回答 */
 const PRESENTATION_TOOLS = new Set(["plan_route", "find_images", "find_short_videos"]);
-function needsVerification(text: string, toolsUsed: string[]): boolean {
-  // 用了讀資料的工具（帳目、行程、提醒、天氣、搜尋…）就是根據資料回答，不要求查證（例如帳目裡的「門票」）
-  return FACT_HINT.test(text) && toolsUsed.every((t) => PRESENTATION_TOOLS.has(t));
+const nameKey = (s: string) => s.normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+/**
+ * 要不要先上網查證：
+ * - 上網查過（或查了附近、路線圖）就不用
+ * - 回答裡的地點（[📍…]）在行程、記憶、住宿、這次的工具結果裡都沒有：是 AI 自己推薦的，一定要查（用了天氣、帳目工具也一樣）
+ * - 營業時間、展覽、票價這類字眼：完全沒查資料時才要查（帳目裡的「門票」不算）
+ */
+function needsVerification(text: string, toolsUsed: string[], known: string): boolean {
+  if (toolsUsed.some((t) => GROUNDING_TOOLS.has(t))) return false;
+  const k = nameKey(known);
+  const pins = [...text.matchAll(/\[📍\s*([^\]\n]+)\]\((?!https:\/\/www\.google\.com\/maps\/dir)[^)\n]*\)/g)].map((m) => nameKey(m[1])).filter((n) => n.length >= 2);
+  if (pins.some((n) => !k.includes(n))) return true;
+  return FACT_WORDS.test(text) && toolsUsed.every((t) => PRESENTATION_TOOLS.has(t));
 }
 /** 要它先上網查證：帶上成員原本的問題，不然它會跑去查聊天室裡別的話題 */
 function verifyNudge(asker: string, question: string): string {
   return `（系統提醒：${asker}問：「${question.slice(0, 200)}」。你剛才的回答有店家、景點、展覽活動或營業資訊，但這一輪還沒上網查證。請針對這個問題，先用 web_search 查證你要講的內容的最新狀況（店還在不在、營業時間、展覽或活動是否還在進行），再根據查到的結果回答這個問題，並註明資料來源；查不到的就說查不到，不要憑記憶，也不要改去回答聊天室裡別的話題。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）`;
 }
 
+const SEARCH_OUT_NOTE = "⚠️ 這個月的網路搜尋額度用完了，上面的內容沒有經過網路查證，出發前請再自行確認。管理員可以到「設定」→ API 金鑰換一組 Tavily 金鑰。";
 const BACKUP_ROUTE_NOTE = "⚠️ 這次由備援模型回答，路線的方向和轉乘可能不準，出發前請以 Google 地圖為準。";
 
 /** 憑記憶回答的路線：回答下方放查證按鈕，按了才去找路線圖（送出的問題帶著原本的問題，放久了再按也查得對） */
@@ -499,14 +521,28 @@ function dropFakeCoords(text: string, known: string): string {
   );
 }
 
-/** 模型自己寫的 IG／YouTube／TikTok 網址常是編的：不是工具找到的就拿掉（連結文字留著） */
-const SOCIAL_HOST = /^https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com)\//i;
-function dropFakeVideoLinks(text: string, known: string): string {
+/**
+ * 模型自己寫的網址（IG／YouTube 影片、官網的某一頁、文章）常是編的，點開 404：
+ * 不是工具查到、成員貼的、資料裡有的就拿掉連結（文字留著）。Google 地圖連結由 fixMapLinks 另外修正
+ */
+const MAP_HOST = /^https?:\/\/(?:(?:www\.)?google\.[a-z.]+\/maps|maps\.google\.[a-z.]+|maps\.app\.goo\.gl|goo\.gl\/maps|g\.co\/kgs)/i;
+function dropFakeLinks(text: string, known: string): string {
+  const seen = (raw: string) => {
+    const url = raw.replace(/[.,;:!?。，、]+$/, "");
+    if (MAP_HOST.test(url)) return true;
+    let decoded = url;
+    try {
+      decoded = decodeURI(url);
+    } catch {}
+    const bare = (s: string) => s.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if ([url, decoded, encodeURI(decoded)].some((u) => known.includes(bare(u)))) return true;
+    // 網站首頁：資料裡出現過這個網站就算
+    const root = url.match(/^https?:\/\/([^/?#]+)\/?$/i);
+    return !!root && known.includes(root[1]);
+  };
   return text
-    .replace(/\[([^\]\n]*)\]\((https?:\/\/[^)\s]+)\)/g, (all, label: string, url: string) => (SOCIAL_HOST.test(url) && !known.includes(url) ? label : all))
-    .replace(/https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|youtube\.com|youtu\.be|tiktok\.com)\/[^\s)）\]]+/gi, (url, offset: number, all: string) =>
-      all[offset - 1] === "(" || known.includes(url) ? url : "",
-    );
+    .replace(/\[([^\]\n]*)\]\((https?:\/\/[^)\s]+)\)/g, (all, label: string, url: string) => (seen(url) ? all : label))
+    .replace(/https?:\/\/[^\s)）\]<>"'「」]+/g, (url, offset: number, all: string) => (all.slice(offset - 2, offset) === "](" || seen(url) ? url : ""));
 }
 
 /** 沒附任何圖時，拿掉「依據…路線圖」「已附在下方」這類說法（模型會學前面查證過的回答） */
@@ -2078,7 +2114,13 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     let ok = true;
     switch (r.kind) {
       case "add_expense":
-        this.addExpense(p as ExpenseInput);
+        // 改帳本裡已經有的那一筆（edit_id），不是多記一筆
+        if (p.editId) ok = this.updateExpense(Number(p.editId), p as ExpenseInput);
+        else {
+          // 記下寫進帳本的是哪一筆：之後模型拿這張卡片的編號說要改，才知道要改哪一筆
+          const saved = this.addExpense(p as ExpenseInput);
+          this.sql.exec("UPDATE drafts SET payload = ? WHERE id = ?", JSON.stringify({ ...p, createdId: saved.id }), id);
+        }
         break;
       case "update_itinerary":
         this.updateItinerary(p.date, p.fields, p.author);
@@ -2102,7 +2144,7 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
         ok = false;
     }
     this.draftSettle(id, ok ? "done" : "failed", by);
-    return ok ? null : "要刪除的資料已經不在了（可能有人先刪了，或提醒已經通知過）";
+    return ok ? null : "要修改或刪除的資料已經不在了（可能有人先刪了，或提醒已經通知過）";
   }
 
   /** 給系統提示用：最近幾天的卡片與狀態（不放進對話紀錄，免得模型模仿格式、自己寫假卡片） */
@@ -2272,6 +2314,30 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     const n = this.sql.exec("DELETE FROM expenses WHERE id = ?", id).rowsWritten;
     this.broadcastState();
     return n > 0;
+  }
+
+  /** 已確認的記帳卡片寫進帳本的是哪一筆（模型拿卡片編號說要改帳時用） */
+  confirmedExpense(draftId: number): number | null {
+    const r = this.sql.exec("SELECT kind, status, payload FROM drafts WHERE id = ?", draftId).toArray()[0];
+    if (!r || r.kind !== "add_expense" || r.status !== "done") return null;
+    const p = JSON.parse(r.payload as string);
+    return Number(p.editId || p.createdId) || null;
+  }
+
+  /** 改帳本裡已經有的一筆（記帳卡片填了 edit_id） */
+  updateExpense(id: number, e: ExpenseInput): boolean {
+    const n = this.sql.exec(
+      "UPDATE expenses SET date = ?, description = ?, amount = ?, currency = ?, amount_local = ?, amount_twd = ?, payer = ?, split_among = ?, category = ? WHERE id = ?",
+      e.date, e.description, e.amount, e.currency, e.amountLocal, e.amountTwd, e.payer, JSON.stringify(e.splitAmong), e.category, id,
+    ).rowsWritten;
+    this.broadcastState();
+    if (this.isPersonal()) this.ctx.waitUntil(this.checkBudget());
+    return n > 0;
+  }
+
+  /** 同一天、同金額、同幣別的帳（提醒可能重複記帳） */
+  expenseSame(date: string, amount: number, currency: string) {
+    return this.sql.exec("SELECT * FROM expenses WHERE date = ? AND amount = ? AND currency = ? ORDER BY id DESC LIMIT 3", date, amount, currency).toArray().map(expenseBrief);
   }
 
   expenseGet(id: number) {
@@ -2588,12 +2654,21 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     ]);
     const reminders = this.reminderList().filter((r) => String(r.time).startsWith(date));
     const todos = this.checklistGet("待辦").filter((c) => !c.done);
+    // 行程表常沒跟著改：大家在聊天室說改了安排，早報要照改過的寫
+    const recentChat = this.sql
+      .exec<MessageRow>("SELECT author, text FROM messages WHERE role = 'user' AND ts > ? AND COALESCE(meta, '') NOT LIKE '%\"health%' ORDER BY ts DESC LIMIT 40", Date.now() - 36 * 3600_000)
+      .toArray()
+      .filter((m) => m.text)
+      .reverse()
+      .map((m) => `${m.author}：${String(m.text).replace(/\s+/g, " ").slice(0, 100)}`)
+      .join("\n");
     const prompt = `請幫家庭旅遊群組寫今天（${date}）的「☀️ 早安早報」內文（標題系統會加，你不要再寫標題），繁體中文、親切、適合手機閱讀、300 字內，條列重點：
 1. 今天的行程與建議出門時間（考慮 ${travelersText(p.travelers)}）
 2. 天氣與穿著、要不要帶傘
 3. 今天的提醒與待辦
 4. 如果有地震、颱風或強風豪雨，放在最前面提醒
 5. 「網路查到的最新消息」如果顯示行程裡的店家、景點、展覽已經結束、休館或改期，放在行程前面提醒並建議替代；網路沒查到的不要自己補，也不要推薦行程以外沒查證過的店
+6. 最近的聊天如果改了今天的安排（換地點、取消、延後），照改過的寫，並提醒大家到行程頁更新行程
 資料：
 - 今天行程：${today ? `${today.title}｜${today.detail}｜${today.status}` : "沒有排行程"}
 - 天氣：${JSON.stringify(weather).slice(0, 1500)}
@@ -2601,6 +2676,8 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
 - 今天的提醒：${JSON.stringify(reminders)}
 - 未完成待辦：${JSON.stringify(todos.slice(0, 8))}
 - 網路查到的最新消息：${news ? JSON.stringify(news).slice(0, 2500) : "（今天沒有行程，沒查）"}
+- 最近一天多大家在聊天室說的話（有改今天的安排就以這裡為準）：
+${recentChat || "（沒有）"}
 - 住宿：${p.accommodation.name || p.accommodation.address}${p.accommodation.note ? `，${p.accommodation.note}` : ""}`;
     const text = await this.generateText(this.systemPrompt(), prompt, false, 1);
     this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
@@ -2851,7 +2928,7 @@ score：當${personal ? "生活" : "旅遊"}日記插圖的價值，大部分照
 - 寫成當下發生的事，不要寫「傳了照片」「在群組問」「拍下了」這類描述，也不要描述照片的構圖或表情細節（例如「直視鏡頭」）。照片只是插圖，不要為了用照片硬寫內容。
 - 最後一段做個溫暖的小結，可以帶到對明天的期待。
 - 長短跟著資料走：對話和照片多的日子寫 6–9 段、每段 150–220 字、全文 900–1500 字；資料少就寫短一點，不要用想像的畫面或情節湊字數。絕對不要編造資料裡沒有的地點、事件或對話。
-- 旅伴（AI）的回答只是建議或解答，不代表家人真的去了，要以家人說的話、照片和記帳為準。不要寫花了多少錢，不要提到 AI、手機或群組。
+- 旅伴（AI）的回答只是建議或解答，不代表家人真的去了，要以家人說的話、照片和記帳為準。原本行程裡的地點，對話、照片、記帳都沒提到去過的，不要寫成去過；家人說沒去成、改去別處的，照實寫。不要寫花了多少錢，不要提到 AI、手機或群組。
 - 家人的稱呼照對話裡的用法，不要自己取名字。照片清單不會寫照片裡是誰：傳照片的人通常是拍照的人，不一定在照片裡。內文和照片說明提到照片裡的人，只有附言或對話說清楚是誰才寫名字，不然寫「孩子們」「小傢伙」「大家」，不要猜。
 
 【照片】
@@ -4979,6 +5056,7 @@ ${mems}
 ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}
 # 回答規則
 - 一律使用繁體中文與台灣用語，語氣自然親切，適合手機閱讀：精簡、條列、重點加粗。不要用 LaTeX 或 $…$ 數學式。
+- 被問到你是誰、用什麼模型：你是「${AI_NAME}」，回答由 Google 的 Gemini 模型產生（額度不夠時改用 Cloudflare 上的開源模型 Gemma）；不要說自己是 Claude、ChatGPT 或其他公司的模型。
 - 營業時間、價格、新聞、天氣、交通等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
 - 工具回傳 error 代表失敗：要如實說沒有完成，不可以說已完成。
 - ${owner}說「記住…」、說了偏好、做了決定、提到重要的個人資訊 → 用 remember 記下來；只有 remember 成功後才能說「已記住」。要忘掉某件事 → forget。
@@ -5069,16 +5147,17 @@ ${mems}
 ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以前聊過、和這次問題相關的內容（依時間排序）\n${recall}\n` : ""}${locs ? `\n# 成員最近位置\n${locs}\n` : ""}${translations ? `\n# 最近在翻譯頁翻過的句子（成員問「剛剛跟店員說了什麼」時參考）\n${translations}\n` : ""}${cards ? `\n# 最近的確認卡片（等待確認的還沒寫入；要修改就重新呼叫同一個工具，replaces 填編號）\n${cards}\n` : ""}
 # 回答規則
 - 一律使用繁體中文與台灣用語，語氣親切，適合手機閱讀：精簡、條列、重點加粗，不要長篇大論。
+- 被問到你是誰、用什麼模型：你是「${AI_NAME}」，回答由 Google 的 Gemini 模型產生（額度不夠時改用 Cloudflare 上的開源模型 Gemma）；不要說自己是 Claude、ChatGPT 或其他公司的模型。
 - 不要用 LaTeX 或 $…$ 數學式，箭頭、乘號等直接寫 →、×、≈。
 - 訊息開頭的［名字］代表是誰說的，回答時可以稱呼對方；但你的回答本身不要用［名字］開頭。
 - 營業時間、票價、活動、交通、天氣、排隊等「會變動的資訊」一定要用工具查，並附上來源連結；查不到就說不確定，絕不編造。
 - 工具回傳 error 代表失敗：要如實告訴成員沒有完成，不可以說已完成。記帳前確認分攤對象是否符合成員說的人數。
-- 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。
+- 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。已經記進帳本的帳要改（金額、日期、付款人、分攤打錯）：先用 find_expenses 找到那筆的帳目 id，再呼叫 add_expense，edit_id 填那筆 id，只填要改的欄位（沒提到的不要填，會沿用原本的），確認後直接改那一筆；不要另外新增一筆。
 - 提到 ${p.currency} 價格時附上約合台幣（用 convert_currency）。
 - 問路、問地鐵電車怎麼搭：照你知道的回答坐哪條線、往哪個方向、在哪轉乘（不要寫站數），最後用 plan_route 附 Google 地圖連結，提醒即時班次和月台以 Google 地圖為準；必要時用 web_search 補充轉乘與票價。成員問坐幾站、或要你查證／確認路線時，才用 check_route_map（官方路線圖優先），照它回傳的 routes 回答、寫出依據的路線圖（圖會附在回答下方）；呼叫時把你認為的搭法填在 legs 讓它核對；它沒找到可靠的圖，就說沒查到可以查證的路線圖，請大家看 Google 地圖。沒有用 check_route_map 時，不要說「依據路線圖」或「路線圖附在下方」。成員自己傳路線圖、時刻表或車站照片來問時，照照片上清楚看得到的內容回答。
 - 提供店家、景點、展覽、活動、營業時間、票價、規定這類資訊（包括規劃行程時推薦的地點）之前，一定先用 web_search 查證最新狀況（店還在不在、有沒有營業、展覽或活動是否還在進行），不要憑記憶；優先採用官方網站（營運公司、政府、景點官網），找不到官方的才用其他網站，並註明來源；查不到就說查不到。
 - 住宿的位置寫成 [📍住宿](map)（系統會換成正確位置）；要帶路回住宿就用 plan_route，destination 填「住宿」。不要自己用住宿名稱或地址搜尋，常會跑到別的地方。
-- 地圖連結：工具回傳的連結可以直接用（find_nearby 給的是那家店的座標，照抄，不要改成店名搜尋，連鎖店用店名會跑到別家分店）；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結（地點名稱用日文或英文的正式名稱，連鎖店要加分店名，例如 [📍ドン・キホーテ 池袋駅西口店](map)）。不要自己寫 Google 地圖網址，絕對不要編 maps.app.goo.gl 短網址，也不要用自己記得的地址或座標當連結（記錯一個字就會指到別的地方）。
+- 地圖連結：工具回傳的連結可以直接用（find_nearby 給的是那家店的座標，照抄，不要改成店名搜尋，連鎖店用店名會跑到別家分店）；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結（地點名稱用當地語言（${p.language}）或英文的正式名稱，連鎖店要加分店名，例如 [📍店名 ○○站前店](map)）。不要自己寫 Google 地圖網址，絕對不要編 maps.app.goo.gl 短網址，也不要用自己記得的地址或座標當連結（記錯一個字就會指到別的地方）。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
 - 每次有人問「附近」都要重新呼叫工具查詢，不可以沿用之前的回答。
 - 要看「大家自己拍、傳到聊天室的照片」（第一天的照片、我們在某地的合照、某人傳的照片、昨天吃的拉麵）→ find_chat_photos（「第一天」「昨天」換算成日期，內容寫進 keyword），照片會顯示在回答下方，不是網路圖片；沒找到就照實說，不要拿網路圖片代替。
@@ -5090,7 +5169,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 收到收據照片（或說「記帳這張收據」）：讀出店名、日期、總金額、幣別與主要品項，用 add_expense 產生記帳卡片（description 寫「店名：品項」），付款人預設是發問者。幣別要看清楚：當地收據是 ${p.currency}，台灣收據是 TWD（NT$、民國年、統一發票）；民國年要加 1911（113 年＝2024 年）。若可能達退稅門檻，順便提醒。
 - 只有成員明確說「加入／加到清單」時才用 add_checklist_items。只是說想買、要帶、問推薦，都不可以自動加入清單；只有成員提到想買或要帶東西時，才在回答最後問一句要不要加進清單，其他話題（例如記帳、問路）不要問。買到了、帶了、辦好了 → update_checklist_item；問清單 → get_checklist。
 - 要求「幾點提醒」→ create_reminder（時間用當地時間 YYYY-MM-DD HH:mm）。
-- 一次收到好幾張照片（例如菜單好幾頁）：當成同一份資料一起整理，不要一張一張分開回答。菜單：依類別分組，每道寫中文翻譯（原文）和價格（當地幣別附約合台幣，例如「900 円（約 NT$190）」），標出推薦、辣、生食、含酒精、適合小孩的；看不清楚的照實說。
+- 一次收到好幾張照片（例如菜單好幾頁）：當成同一份資料一起整理，不要一張一張分開回答。菜單：依類別分組，每道寫中文翻譯（原文）和價格（當地幣別附約合台幣，例如「${p.currencySymbol}○○（約 NT$○○）」），標出推薦、辣、生食、含酒精、適合小孩的；看不清楚的照實說。
 - 傳照片說要「存起來／存成票券」→ save_document（說要放哪個資料夾，例如「存到機票」，就填 folder）；問「給我看○○的票／訂位」→ find_documents（關鍵字也可以是資料夾名稱）。
 - 有人傳「🆘」走散求助：先安撫，用 get_member_locations 看大家在哪，建議就近約在明顯地標或車站出口集合，提醒可找工作人員幫忙${p.emergency ? `、緊急電話 ${p.emergency}` : ""}。
 - 有人說「我付了／花了…」→ 用 add_expense 產生記帳卡片；問「花多少、怎麼分」→ expense_summary。只有成員說付了、花了、要記帳，或傳收據時才記帳；問「怎麼儲值、怎麼買票、要多少錢」是在問做法或價格，直接回答，不要問金額、不要產生記帳卡片。
@@ -5202,6 +5281,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     const history = this.recentMessages(HISTORY_WINDOW).filter((m) => health || !healthMessage(m));
     if (!health) await this.prepareMemoryQuery(memoryText(trigger));
     const system = health ? this.healthPrompt() : this.systemPrompt(trigger, history[0]?.ts ?? trigger.ts);
+    // 行程、記憶、住宿這些資料裡有的地點，不用再上網查證
+    const knownFacts = system.split("# 回答規則")[0];
     const images: AttachedImage[] = [];
     // 這次工具回傳的內容：檢查回答裡的影片網址是不是工具找到的
     let toolJson = "";
@@ -5218,7 +5299,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
     });
     // 成員像是在修改剛才還沒確認的卡片（「打錯了，是 3500」）
     const fixing = /改成|改為|改一下|打錯|寫錯|記錯|不對|應該是|更正|修正/.test(trigger.text)
-      ? this.sql.exec("SELECT id, kind, preview FROM drafts WHERE status = 'pending' AND ts > ? ORDER BY id DESC LIMIT 1", Date.now() - 30 * 60_000).toArray()[0]
+      ? this.sql.exec("SELECT id, kind, preview FROM drafts WHERE (status = 'pending' OR (status = 'done' AND kind = 'add_expense')) AND ts > ? ORDER BY id DESC LIMIT 1", Date.now() - 30 * 60_000).toArray()[0]
       : undefined;
     let lastError = "";
     // 跨模型共用：前一個模型中途被限流時，下一個模型接著已完成的工具結果繼續，不會重複記帳或重複查詢
@@ -5250,7 +5331,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             // 回答裡有搭車步驟卻沒用 plan_route：要它用工具產生 Google 導航連結（模型自己手寫的網址常把站名編碼錯，例如「新木巴駅」）
             if (!need && available.has("plan_route") && routeAnswer(res.text) && !toolsUsed.includes("plan_route") && !toolsUsed.includes("check_route_map")) need = "plan_route";
             // 回答裡有店家景點、營業、展覽活動資訊，這一輪卻沒上網查：先查證再講（看照片回答的、健康管家不算）
-            if (!need && !health && available.has("web_search") && !trigger.photo_id && needsVerification(res.text, toolsUsed)) need = "web_search";
+            if (!need && !health && available.has("web_search") && !trigger.photo_id && needsVerification(res.text, toolsUsed, knownFacts + toolJson)) need = "web_search";
             // 要寫入資料的工具：AI 正在反問成員（日期不在旅遊期間、金額看不清…）就讓它問，不要蓋掉硬寫
             if (need && DRAFT_TOOLS.has(need) && isAskingBack(res.text)) need = null;
             if (need && !nudged.has(need) && step < MAX_STEPS - 1) {
@@ -5258,8 +5339,9 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               this.broadcast({ type: "ai_reset", id });
               turns = [
                 ...turns,
-                { role: "model", parts: [{ text: res.text || "（略）" }] },
-                { role: "user", parts: [{ text: need === "web_search" ? verifyNudge(trigger.author, trigger.text) : `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
+                // 要查證時拿掉還沒查證的草稿：留著的話模型常照抄
+                { role: "model", parts: [{ text: (need !== "web_search" && res.text) || "（略）" }] },
+                { role: "user", parts: [{ text: need === "web_search" ? verifyNudge(trigger.author, trigger.text) : WRITE_TOOLS.has(need) ? writeNudge(need) : `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
               ];
               continue;
             }
@@ -5268,6 +5350,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               forced.add(need);
               const note = await this.forceTool(need, provider, history, trigger, user, id, ctx, toolsUsed, image, lastResults, res.text);
               if (note) {
+                toolJson += note;
                 this.broadcast({ type: "ai_reset", id });
                 turns = [...turns, { role: "model", parts: [{ text: res.text || "（略）" }] }, { role: "user", parts: [{ text: note }] }];
                 continue;
@@ -5278,8 +5361,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               cardNudged = true;
               this.broadcast({ type: "ai_reset", id });
               const hint = fixing
-                ? `成員可能是要修改還沒確認的卡片 #${fixing.id}（${JSON.parse(fixing.preview as string).summary}）：是的話，請重新呼叫 ${fixing.kind}，所有欄位填修改後的完整內容，replaces 填 ${fixing.id}；不是的話就照原本的意思回答。`
-                : "你說下方有確認卡片，但你沒有呼叫任何工具，成員看不到卡片。記帳 → add_expense；改行程 → update_itinerary；刪帳 → delete_expense；刪提醒 → delete_reminder；修改還沒確認的卡片要填 replaces。請現在呼叫，再簡短說明。";
+                ? `成員可能是要修改卡片 #${fixing.id}（${JSON.parse(fixing.preview as string).summary}）：是的話，請重新呼叫 ${fixing.kind}，所有欄位填修改後的完整內容，replaces 填 ${fixing.id}；不是的話就照原本的意思回答。`
+                : "你說下方有確認卡片，但你沒有呼叫任何工具，成員看不到卡片。記帳 → add_expense；改行程 → update_itinerary；刪帳 → delete_expense；刪提醒 → delete_reminder；改已經記進帳本的帳 → add_expense 填 edit_id；修改還沒確認的卡片要填 replaces。請現在呼叫，再簡短說明。";
               turns = [
                 ...turns,
                 { role: "model", parts: [{ text: res.text || "（略）" }] },
@@ -5287,8 +5370,21 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               ];
               continue;
             }
+            // 提醒過還是沒產生卡片，而成員像是在改剛才的卡片：系統代為呼叫，replaces 填那張卡片（已確認的記帳卡片會改帳本裡那一筆）
+            if (!drafts.length && cardNudged && fixing && !forced.has(String(fixing.kind)) && step < MAX_STEPS - 1) {
+              forced.add(String(fixing.kind));
+              const hint = `先判斷成員是不是在修改卡片 #${fixing.id}（${JSON.parse(fixing.preview as string).summary}）：不是的話只輸出 {"_skip": true}；是的話 replaces 填 ${fixing.id}，只填成員要改的欄位（例如金額），沒提到的欄位不要填，會沿用原本的。`;
+              const note = await this.forceTool(String(fixing.kind), provider, history, trigger, user, id, ctx, toolsUsed, image, lastResults, "", hint);
+              if (note) {
+                toolJson += note;
+                this.broadcast({ type: "ai_reset", id });
+                turns = [...turns, { role: "model", parts: [{ text: res.text || "（略）" }] }, { role: "user", parts: [{ text: note }] }];
+                continue;
+              }
+            }
             // 查完工具後偶爾一個字都不回（以為剛才那段被收回的回答已經講過了），再請它回一次
-            if (!res.text.trim() && !emptyRetried && toolsUsed.length && step < MAX_STEPS - 1) {
+            // 只吐出 HTML 標籤（實測 Gemma 會只回「</table>」）也算沒回答
+            if (!res.text.replace(/<\/?[a-z][^>]*>/gi, "").trim() && !emptyRetried && toolsUsed.length && step < MAX_STEPS - 1) {
               emptyRetried = true;
               turns = [
                 ...turns,
@@ -5343,7 +5439,9 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
                   (!images.some((im) => im.video) || images.some((im) => im.video && !zhCaption(im.caption)))
                 ? chineseButton(videoPlaces)
                 : null;
-        finalText = dropFakeVideoLinks(finalText, toolJson + images.map((im) => im.page ?? "").join(" "));
+        finalText = dropFakeLinks(finalText, [toolJson, ...images.map((im) => im.page ?? ""), system, trigger.text, ...history.map((m) => m.text)].join(" "));
+        // 這個月的搜尋額度用完：回答沒有查證過，要讓大家知道（不然會以為查過了）
+        if (toolJson.includes(SEARCH_OUT) && !/沒有經過網路查證/.test(finalText)) finalText = `${finalText.trim()}\n\n${SEARCH_OUT_NOTE}`;
         finalText = dropFakeCoords(finalText, toolJson);
         if (!finalText.trim()) finalText = images.length ? "幫你找到這些圖片 👇（網路圖片，僅供參考）" : "嗯…我沒有想到好的回答，可以換個方式問我嗎？";
         const row = this.insertMessage({
@@ -5386,7 +5484,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
    */
   private async forceTool(
     need: string, provider: Provider, history: MessageRow[], trigger: MessageRow, user: Attachment,
-    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null, lastResults: Record<string, unknown> = {}, draft = "",
+    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null, lastResults: Record<string, unknown> = {}, draft = "", hint = "",
   ): Promise<string | null> {
     const p = this.p();
     let args: Record<string, unknown>;
@@ -5436,14 +5534,15 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       args = { category };
     } else {
       // 其他工具：請模型用 JSON 模式（很穩定）照工具規格產生參數，收據照片也一起給它看
-      const decl = toolDecls(p).find((d) => d.name === need);
+      // 健康管家的工具不在一般工具清單裡（找不到規格就沒記成，AI 卻說記好了）
+      const decl = [...toolDecls(p), ...healthToolDecls(p)].find((d) => d.name === need);
       if (!decl) return null;
       const now = zoned(Date.now(), p.timezone);
       try {
         const parts: Part[] = [{
           text: `成員（${user.name}）說：「${trigger.text}」${need === "find_short_videos" || need === "plan_route" ? `\n上一則 AI 回答：\n${([...history].reverse().find((m) => m.role === "assistant" && m.id !== id)?.text ?? "").slice(0, 1500)}` : ""}${need === "web_search" && draft ? `\n你剛才準備回答的內容（要查證裡面的店家、景點、活動是否還在、資訊是否正確，產生查證用的搜尋關鍵字）：\n${draft.slice(0, 1200)}` : ""}
 現在是當地時間 ${now.date}（${now.weekday}）${now.time}。${p.kind === "personal" ? "" : `旅程 ${p.startDate} 到 ${p.endDate}（第一天＝${p.startDate}）。`}旅伴名單：${this.members().join("、") || user.name}。當地貨幣 ${p.currency}。
-請產生呼叫工具「${need}」要用的參數。
+請產生呼叫工具「${need}」要用的參數。${WRITE_TOOLS.has(need) ? '\n先判斷成員是要你做這件事，還是只是在問問題或聊天（例如「護照大家都帶了嗎？」是在問，不是說帶了）：只是在問就只輸出 {"_skip": true}。' : ""}${hint ? `\n${hint}` : ""}
 工具說明：${decl.description}
 參數格式（JSON Schema）：${JSON.stringify(decl.parameters)}
 只輸出參數的 JSON 物件，不要任何其他文字。`,
@@ -5455,6 +5554,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
         return null;
       }
       if (!Object.keys(args).length) return null;
+      if (args._skip) return null;
     }
     toolsUsed.push(need);
     this.broadcast({ type: "ai_tool", id, name: need, label: toolLabel(need), args });

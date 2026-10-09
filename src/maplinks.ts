@@ -18,7 +18,8 @@ const MAP_REF = /^map(?::|$)/i;
 /** 查詢字裡的座標（找附近工具給的「店名 緯度,經度」） */
 const COORDS = /(-?\d{1,3}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})/;
 /** 看起來是模型自己寫的地址 */
-const ADDRESS = /〒|\d+\s*丁目|\d+\s*番地|\d+-\d+-\d+|[都道府県].{1,8}[区市町村郡].{0,10}\d/;
+const ADDRESS =
+  /〒|\d+\s*丁目|\d+\s*番地|\d+-\d+-\d+|[都道府県].{1,8}[区市町村郡].{0,10}\d|\d+\s*[號号]|[路街].{0,6}\d+\s*巷|\d+\s*(?:번길|로|길)\s*\d|\b\d{1,5}\s+[A-Z][\w'.]*(?:\s+[A-Z][\w'.]*)*\s+(?:Street|St|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b|ซอย|ถนน.{0,20}\d/;
 /** 連結文字只是在說「這是地圖」，不是地點名稱 */
 const GENERIC = /^(google\s*)?(地圖|maps?|導航|連結|位置|地點|路線|link|here|這裡|點這裡|點此|開啟|查看|打開|看|點我|按這裡|請點)+$/i;
 /** 粗體小標（「為什麼必去」「位置」）不是地點名稱 */
@@ -93,9 +94,9 @@ function decodeQuery(query: string): { text: string; ok: boolean } {
   }
 }
 
-/** 模型手動編碼寫壞的痕跡：替換字元、殘留的 %XX、混進其他語系的文字 */
+/** 模型手動編碼寫壞的痕跡：替換字元、殘留的 %XX、中日韓地名裡混進阿拉伯、印度文字（只有這些文字的是當地正常地名） */
 function looksBroken(s: string, decodedOk = true): boolean {
-  return (!decodedOk && s.includes("%")) || s.includes("�") || /%[0-9A-Fa-f]{1,2}/.test(s) || /[֐-ࣿऀ-෿]/.test(s);
+  return (!decodedOk && s.includes("%")) || s.includes("�") || /%[0-9A-Fa-f]{1,2}/.test(s) || (/[֐-ࣿऀ-෿]/.test(s) && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(s));
 }
 
 const searchUrl = (text: string) => MAP_SEARCH + encodeURIComponent(text);

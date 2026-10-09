@@ -112,6 +112,14 @@ export class EnglishStore {
   addCard(c: { en: unknown; zh: unknown; note?: unknown; source?: unknown }): number | null {
     const en = str(c.en, 300);
     if (en.length < 2) return null;
+    // 幾乎一樣的句子（一句包含另一句，例如對話中的修正和結束時的回饋）不重複加
+    const key = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const k = key(en);
+    const near = this.sql.exec("SELECT en FROM en_cards ORDER BY id DESC LIMIT 300").toArray().some((r) => {
+      const o = key(String(r.en));
+      return o === k || (k.length >= 12 && o.includes(k)) || (o.length >= 12 && k.includes(o));
+    });
+    if (near) return null;
     const row = this.sql
       .exec("INSERT INTO en_cards (ts, en, zh, note, source, step, due) VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(en) DO NOTHING RETURNING id", Date.now(), en, str(c.zh, 300), str(c.note, 300), str(c.source, 40), shiftDate(this.today(), 1))
       .toArray()[0];

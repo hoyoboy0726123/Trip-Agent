@@ -14,7 +14,7 @@ import { renderDiaryPage } from "./diary-page";
 import { findDate, isHealthTopic, labCode, normDate, redFlagText, type Flag } from "./health";
 import { HealthStore } from "./health-store";
 import { EnglishStore, EN_REMIND_HOUR } from "./english-store";
-import { audioCheckPrompt, hintPrompt, lessonPrompt, reportPrompt, rolePrompt, scenarioOf, SCENARIOS, textCheckPrompt, TOPICS, type Grade } from "./english";
+import { audioCheckPrompt, hintPrompt, lessonPrompt, reportPrompt, rolePrompt, scenarioOf, SCENARIOS, shadowPrompt, textCheckPrompt, TOPICS, type Grade } from "./english";
 import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -2998,7 +2998,8 @@ ${recentChat || "（沒有）"}
           const level = E.settings().level;
           let r: any;
           try {
-            r = await this.enAi(audioCheckPrompt(level, target, task), audio);
+            // 跟讀不給 AI 看目標句（它會自動補完漏掉的字），漏字由下面程式比對
+            r = await this.enAi(target ? shadowPrompt(level) : audioCheckPrompt(level, "", task), audio);
           } catch {
             const heard = await this.enTranscribe(audio.data).catch(() => "");
             if (!heard) throw new EnUserError("AI 暫時聽不了錄音，請稍後再試");
@@ -3020,6 +3021,13 @@ ${recentChat || "（沒有）"}
             audio_ok: r.audio_ok !== false && !!enStr(r.heard, 10),
             no_pron: !!r.no_pron || r._engine !== "gemini-own",
           };
+          // 跟讀：逐字比對 AI 聽到的跟目標句，照漏掉幾個字給評語
+          if (target && result.heard) {
+            result.missing = enMissing(result.heard, target);
+            result.match = !result.missing.length ? "很接近" : result.missing.length >= 2 ? "要再練" : "大致正確";
+            result.grammar = [];
+            result.better = "";
+          }
           if (result.audio_ok) E.touch();
           return ok({ result });
         }

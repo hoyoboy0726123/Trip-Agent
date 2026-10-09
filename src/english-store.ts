@@ -11,8 +11,6 @@ const str = (v: unknown, n: number) => String(v ?? "").replace(/\s+/g, " ").trim
 export const EN_REMIND_HOUR = 20;
 /** 補簽卡最多存幾張（Speak 的做法：最多 2 張，自動抵用） */
 const MAX_FREEZES = 2;
-/** 朗讀音檔最多留幾句（一句約 100–250KB） */
-const MAX_AUDIO = 300;
 /** 查過的單字最多留幾筆 */
 const MAX_WORDS = 500;
 
@@ -37,6 +35,7 @@ export class EnglishStore {
       CREATE TABLE IF NOT EXISTS en_cards (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, en TEXT UNIQUE, zh TEXT, note TEXT, source TEXT, step INTEGER DEFAULT 0, due TEXT, reps INTEGER DEFAULT 0, lapses INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_lessons (date TEXT PRIMARY KEY, ts INTEGER, topic TEXT, level TEXT, data TEXT, done INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_days (date TEXT PRIMARY KEY, practice INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0);
+      -- en_audio：舊版的 Gemini 朗讀快取（已停用，改用手機語音），清除紀錄時一起清掉
       CREATE TABLE IF NOT EXISTS en_audio (key TEXT PRIMARY KEY, ts INTEGER, data BLOB);
       CREATE TABLE IF NOT EXISTS en_words (key TEXT PRIMARY KEY, ts INTEGER, data TEXT);
     `);
@@ -280,21 +279,9 @@ export class EnglishStore {
     };
   }
 
-  // ---------- 朗讀音檔快取 ----------
-
-  audioGet(key: string): ArrayBuffer | null {
-    const r = this.sql.exec("SELECT data FROM en_audio WHERE key = ?", key).toArray()[0];
-    return r ? (r.data as ArrayBuffer) : null;
-  }
-
-  audioPut(key: string, data: ArrayBuffer) {
-    this.sql.exec("INSERT INTO en_audio (key, ts, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts, data = excluded.data", key, Date.now(), data);
-    this.sql.exec("DELETE FROM en_audio WHERE key NOT IN (SELECT key FROM en_audio ORDER BY ts DESC LIMIT ?)", MAX_AUDIO);
-  }
-
   /** 清除所有英語練習紀錄（設定保留） */
   reset() {
-    for (const t of ["en_sessions", "en_turns", "en_cards", "en_lessons", "en_days", "en_audio"]) this.sql.exec(`DELETE FROM ${t}`);
+    for (const t of ["en_sessions", "en_turns", "en_cards", "en_lessons", "en_days", "en_audio", "en_words"]) this.sql.exec(`DELETE FROM ${t}`);
     for (const k of ["freezes", "freeze_mark", "freeze_used", "maintained", "reminded"]) this.sql.exec("DELETE FROM en_kv WHERE key = ?", k);
   }
 }

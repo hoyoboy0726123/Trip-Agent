@@ -6,7 +6,7 @@ ICONS.english = '<path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/
 
 const EN = {
   tab: "talk", state: null, loading: false, loadedAt: 0, session: null, busy: false, rec: null, hint: null,
-  results: {}, reveal: false, cards: null, draft: "", taskDraft: "", target: "", audio: null, cache: new Map(),
+  results: {}, reveal: false, cards: null, draft: "", taskDraft: "", target: "", voice: store("en-voice") || "",
   autoPlay: store("en-autoplay") !== 0,
   liveMode: store("en-live") === 1,
 };
@@ -256,6 +256,8 @@ function enMe() {
     <div class="card"><h3>設定</h3>
       <label class="row between small"><span>程度</span><select id="en-level">${EN_LEVELS.map(([v, t]) => `<option value="${v}" ${s.level === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
       <label class="row between small"><span>每週目標（天）</span><select id="en-goal">${[3, 4, 5, 6, 7].map((n) => `<option ${s.weekGoal === n ? "selected" : ""}>${n}</option>`).join("")}</select></label>
+      <label class="row between small"><span>朗讀聲音</span><span class="row" style="gap:6px"><select id="en-voice">${enVoiceOptions()}</select><button type="button" class="en-play" data-enplay="Hi! Could I get an iced latte with oat milk, please?">🔊 試聽</button></span></label>
+      <p class="small muted">朗讀用手機內建的英文語音（不限次數）。想要更自然：iPhone「設定 → 輔助使用 → 朗讀內容 → 聲音 → 英文」下載有「進階」或「加強版」的聲音（例如 Ava、Zoe、Evan），再回來這裡選。</p>
       <label class="row between small"><span>晚上 8 點還沒練就通知我</span><input type="checkbox" id="en-remind" ${s.remind ? "checked" : ""} /></label>
       <p class="small muted">要收到通知，先到「設定 → 手機通知」開啟。</p>
       <button type="button" class="btn small danger" data-enreset>清除英語練習紀錄</button>
@@ -270,45 +272,52 @@ function enScroll() {
   if (c) c.scrollTop = c.scrollHeight;
 }
 
-/** iPhone 只有在手指點的當下才能開始播放：先在點擊時解鎖同一個播放器，AI 回覆後才能自動朗讀 */
+/** iPhone 的朗讀要先在手指點的當下講過一次（無聲），AI 回覆完才能自動朗讀 */
 function enUnlockAudio() {
-  EN.audio ??= new Audio();
-  if (EN.unlocked) return;
+  if (EN.unlocked || !("speechSynthesis" in window)) return;
   EN.unlocked = true;
-  EN.audio.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-  EN.audio.play().catch(() => {});
-}
-
-function enSpeakLocal(text, rate = 0.95) {
-  if (!("speechSynthesis" in window)) return;
-  speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = "en-US";
-  u.rate = rate;
-  const list = typeof voices !== "undefined" && voices.length ? voices : speechSynthesis.getVoices();
-  const v = list.find((x) => /^en[-_]US/i.test(x.lang)) || list.find((x) => /^en/i.test(x.lang));
-  if (v) u.voice = v;
+  const u = new SpeechSynthesisUtterance(" ");
+  u.volume = 0;
   speechSynthesis.speak(u);
 }
 
-/** 示範發音：先用 Gemini 唸好存起來的音檔（自然的真人聲），不能用時改用手機內建語音 */
-async function enPlay(text, rate = 1) {
-  EN.audio ??= new Audio();
-  let url = EN.cache.get(text);
-  if (!url) {
-    try {
-      const res = await fetch(`/api/english/tts?text=${encodeURIComponent(text)}`);
-      if (!res.ok) throw new Error(String(res.status));
-      url = URL.createObjectURL(await res.blob());
-      EN.cache.set(text, url);
-    } catch {
-      return enSpeakLocal(text, rate < 1 ? 0.7 : 0.95);
-    }
-  }
-  EN.audio.src = url;
-  EN.audio.playbackRate = rate;
-  EN.audio.play().catch(() => enSpeakLocal(text, rate < 1 ? 0.7 : 0.95));
+// iPhone 的搞怪聲音和老式電子聲（Albert、Bad News、Eddy、Fred…）排在清單前面，不能拿來當示範發音
+const EN_ODD_VOICES = /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley|fred|junior|kathy|ralph)\b/i;
+const EN_GOOD_VOICES = /\b(samantha|ava|allison|susan|zoe|evan|nathan|joelle|noelle|nicky|tom|alex|aaron|daniel|karen|moira|tessa|serena|aria|jenny|guy|google us english|google uk english female)\b/i;
+
+/** 手機上的英文聲音，越自然的排越前面：下載的進階／加強版、雲端自然語音 > 常見好聽的 > 美式 > 其他 */
+function enVoices() {
+  if (!("speechSynthesis" in window)) return [];
+  const all = speechSynthesis.getVoices().filter((v) => /^en[-_]/i.test(v.lang) && !EN_ODD_VOICES.test(v.name));
+  const score = (v) =>
+    (/premium|進階|高品質/i.test(v.name) ? 50 : 0) + (/enhanced|加強|natural|neural|online/i.test(v.name) ? 30 : 0) + (EN_GOOD_VOICES.test(v.name) ? 20 : 0) + (/^en[-_]US/i.test(v.lang) ? 10 : 0) + (v.localService ? 1 : 0);
+  return all.sort((a, b) => score(b) - score(a));
 }
+
+function enVoiceOptions() {
+  const list = enVoices();
+  if (!list.length) return `<option value="">手機沒有英文語音</option>`;
+  const label = (v) => `${v.name}（${v.lang.replace("_", "-")}）`;
+  return `<option value="">自動：${escapeHtml(label(list[0]))}</option>${list.map((v) => `<option value="${escapeHtml(v.name)}" ${EN.voice === v.name ? "selected" : ""}>${escapeHtml(label(v))}</option>`).join("")}`;
+}
+
+/** 示範發音：手機內建的英文語音（不限次數、馬上出聲、每句都同一個聲音）；rate < 1 是慢速 */
+function enPlay(text, rate = 1) {
+  if (!("speechSynthesis" in window)) return alert("這個瀏覽器不能朗讀");
+  // 沒在唸時呼叫 cancel，Safari 有時會把緊接著的這句吞掉
+  if (speechSynthesis.speaking || speechSynthesis.pending) speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  // 留住參照：Chrome 會把沒人參照的語句回收，唸到一半就斷
+  EN.utter = u;
+  const list = enVoices();
+  const v = list.find((x) => x.name === EN.voice) || list[0];
+  u.lang = v?.lang.replace("_", "-") || "en-US";
+  if (v) u.voice = v;
+  u.rate = rate < 1 ? 0.7 : 0.95;
+  speechSynthesis.speak(u);
+}
+// 聲音清單是慢慢載入的：載好時進度頁要重畫，選單才有東西
+if ("speechSynthesis" in window) speechSynthesis.addEventListener?.("voiceschanged", () => S.panel === "english" && EN.tab === "me" && renderPanel());
 
 function enAfterPractice() {
   if (EN.state) EN.state.progress.today_done = true;
@@ -590,6 +599,11 @@ function enBind(b) {
   $("#en-level", b)?.addEventListener("change", (e) => enSettings({ level: e.target.value }));
   $("#en-goal", b)?.addEventListener("change", (e) => enSettings({ weekGoal: Number(e.target.value) }));
   $("#en-remind", b)?.addEventListener("change", (e) => enSettings({ remind: e.target.checked }));
+  $("#en-voice", b)?.addEventListener("change", (e) => {
+    EN.voice = e.target.value;
+    store("en-voice", EN.voice);
+    enPlay("Hi! Could I get an iced latte with oat milk, please?");
+  });
   on("[data-enreset]", async () => {
     if (!confirm("清除所有英語練習紀錄（對話、複習卡、連續天數）？清除後無法復原。")) return;
     const r = await api("/api/english/reset", {});

@@ -19,7 +19,6 @@ export interface Env {
   /** 寫旅遊日記用的模型（比較會寫長文、照格式；一天一篇，額度跟聊天分開） */
   GEMINI_WRITER_MODEL?: string;
   /** 英語家教示範發音用的朗讀模型（預設 gemini-3.8-flash-lite-tts） */
-  GEMINI_TTS_MODEL?: string;
   /** 英語家教即時語音對話用的模型（預設 gemini-3.8-live） */
   GEMINI_LIVE_MODEL?: string;
   GEMINI_RPM?: string;

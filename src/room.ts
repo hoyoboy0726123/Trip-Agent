@@ -640,23 +640,6 @@ function enMissing(heard: string, target: string): string[] {
   const got = new Set(words(heard));
   return [...new Set(words(target).filter((w) => !got.has(w)))].slice(0, 6);
 }
-function fromBase64(b64: string): Uint8Array {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
-/** 原始 PCM（16 位元單聲道）加上 WAV 檔頭，瀏覽器才能播 */
-function pcmToWav(pcm: Uint8Array, rate: number): Uint8Array {
-  const out = new Uint8Array(44 + pcm.length);
-  const v = new DataView(out.buffer);
-  const w = (o: number, s: string) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
-  w(0, "RIFF"); v.setUint32(4, 36 + pcm.length, true); w(8, "WAVE"); w(12, "fmt ");
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true);
-  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, pcm.length, true);
-  out.set(pcm, 44);
-  return out;
-}
 
 const PROVIDER_LABEL: Record<ProviderId, string> = { gemini: "Gemini", "gemini-own": "Gemini（旅程金鑰）", "workers-ai": "Workers AI" };
 
@@ -2899,8 +2882,6 @@ ${recentChat || "（沒有）"}
         case "settings":
           E.saveSettings(body);
           return ok(await this.englishState());
-        case "tts":
-          return this.enTts(String(url.searchParams.get("text") ?? ""));
 
         // ---- 情境角色扮演 ----
         case "start": {
@@ -3148,38 +3129,6 @@ ${recentChat || "（沒有）"}
     E.finish(id, report);
     E.touch();
     return E.session(id);
-  }
-
-  /** 示範發音：Gemini 朗讀模型唸一次就存起來，之後重播不用額度；不能用時回 503，前端改用手機內建語音 */
-  private async enTts(text: string): Promise<Response> {
-    // 只送句子本身：加了「請慢慢唸」之類的指示，會連指示一起唸出來
-    const t = enStr(text, 300);
-    if (!/[A-Za-z]/.test(t)) return new Response("no text", { status: 400 });
-    const voice = "Kore";
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${voice}|${t}`));
-    const key = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
-    const wav = (data: ArrayBuffer) => new Response(data, { headers: { "content-type": "audio/wav", "cache-control": "private, max-age=86400" } });
-    const E = this.english();
-    const hit = E.audioGet(key);
-    if (hit) return wav(hit);
-    const apiKey = (await this.keys()).gemini;
-    if (!apiKey) return new Response("no key", { status: 503 });
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${this.env.GEMINI_TTS_MODEL || "gemini-3.8-flash-lite-tts"}:generateContent`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-      signal: AbortSignal.timeout(30_000),
-      body: JSON.stringify({ contents: [{ parts: [{ text: t }] }], generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } } }),
-    }).catch(() => null);
-    if (!res?.ok) return new Response("tts unavailable", { status: 503 });
-    const j: any = await res.json().catch(() => null);
-    const part = j?.candidates?.[0]?.content?.parts?.find((p: any) => p?.inlineData)?.inlineData;
-    if (!part?.data) return new Response("tts unavailable", { status: 503 });
-    let bytes = fromBase64(part.data);
-    const mime = String(part.mimeType ?? "");
-    if (/L16|pcm/i.test(mime)) bytes = pcmToWav(bytes, Number(mime.match(/rate=(\d+)/)?.[1]) || 24000);
-    const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-    E.audioPut(key, buf);
-    return wav(buf);
   }
 
   /** 每天：補簽卡自動抵用；晚上 8 點還沒練英文就推播提醒（只對用過英語家教的人） */

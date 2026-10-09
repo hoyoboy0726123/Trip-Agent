@@ -441,6 +441,18 @@ function routeAnswer(text: string): boolean {
 function routeReply(text: string): boolean {
   return routeAnswer(text) || /google\.com\/maps\/dir\/[^)\s]*travelmode=transit/.test(text);
 }
+/**
+ * 回答裡有要查證的事實（推薦的店家景點、營業時間、展覽活動、票價、樓層）：這一輪要先上網查過才能講。
+ * AI 的記憶常過時（店收了、展覽結束了、雕像拆了），旅遊時照舊資訊跑一趟就白費了
+ */
+const FACT_HINT = /\[📍[^\]\n]*\]\((?!https:\/\/www\.google\.com\/maps\/dir)|營業|開放時間|展覽|展出|活動期間|期間限定|門票|票價|休館|公休|開幕|閉館|拆除|樓層|\d+\s*樓/;
+const GROUNDING_TOOLS = new Set(["web_search", "read_webpage", "find_nearby", "check_route_map"]);
+function needsVerification(text: string, toolsUsed: string[]): boolean {
+  return FACT_HINT.test(text) && !toolsUsed.some((t) => GROUNDING_TOOLS.has(t));
+}
+const VERIFY_NUDGE =
+  "（系統提醒：你剛才的回答有店家、景點、展覽活動或營業資訊，但這一輪還沒上網查證。請先用 web_search 查證最新狀況（店還在不在、營業時間、展覽或活動是否還在進行），再根據查到的結果回答，並註明資料來源；查不到的就說查不到，不要憑記憶。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）";
+
 const BACKUP_ROUTE_NOTE = "⚠️ 這次由備援模型回答，路線的方向和轉乘可能不準，出發前請以 Google 地圖為準。";
 
 /** 憑記憶回答的路線：回答下方放查證按鈕，按了才去找路線圖（送出的問題帶著原本的問題，放久了再按也查得對） */
@@ -2538,7 +2550,13 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     this.setSetting("brief_sent", date);
     const today = this.itinerary().find((d) => d.date === date);
     const ctx = await this.toolCtx(AI_NAME);
-    const [weather, alerts] = await Promise.all([runTool("get_weather", { days: 2 }, ctx), disasterAlerts(p).catch(() => ({}))]);
+    // 今天行程的景點有沒有休館、展覽結束、活動：先上網查，早報才不會照記憶推薦已經沒有的東西
+    const newsQuery = today ? `${today.title} ${today.detail} 最新消息 營業 休館 展覽 活動`.slice(0, 200) : "";
+    const [weather, alerts, news] = await Promise.all([
+      runTool("get_weather", { days: 2 }, ctx),
+      disasterAlerts(p).catch(() => ({})),
+      newsQuery ? runTool("web_search", { query: newsQuery, max_results: 5 }, ctx) : Promise.resolve(null),
+    ]);
     const reminders = this.reminderList().filter((r) => String(r.time).startsWith(date));
     const todos = this.checklistGet("待辦").filter((c) => !c.done);
     const prompt = `請幫家庭旅遊群組寫今天（${date}）的「☀️ 早安早報」內文（標題系統會加，你不要再寫標題），繁體中文、親切、適合手機閱讀、300 字內，條列重點：
@@ -2546,12 +2564,14 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
 2. 天氣與穿著、要不要帶傘
 3. 今天的提醒與待辦
 4. 如果有地震、颱風或強風豪雨，放在最前面提醒
+5. 「網路查到的最新消息」如果顯示行程裡的店家、景點、展覽已經結束、休館或改期，放在行程前面提醒並建議替代；網路沒查到的不要自己補，也不要推薦行程以外沒查證過的店
 資料：
 - 今天行程：${today ? `${today.title}｜${today.detail}｜${today.status}` : "沒有排行程"}
 - 天氣：${JSON.stringify(weather).slice(0, 1500)}
 - 警報：${JSON.stringify(alerts).slice(0, 1500)}
 - 今天的提醒：${JSON.stringify(reminders)}
 - 未完成待辦：${JSON.stringify(todos.slice(0, 8))}
+- 網路查到的最新消息：${news ? JSON.stringify(news).slice(0, 2500) : "（今天沒有行程，沒查）"}
 - 住宿：${p.accommodation.name || p.accommodation.address}${p.accommodation.note ? `，${p.accommodation.note}` : ""}`;
     const text = await this.generateText(this.systemPrompt(), prompt, false, 1);
     this.postAiMessage(`☀️ **早安！${date.slice(5).replace("-", "/")} 早報**\n\n${text}`, { kind: "brief" });
@@ -4936,7 +4956,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 問以前說過的事：先看「長期記憶」和「以前聊過」，不夠再用 search_history。
 - 「幾點提醒我…」→ create_reminder（時間用 ${p.timezone} 的 YYYY-MM-DD HH:mm）；問有哪些提醒 → list_reminders。
 - 待辦、購物：明確說「加到待辦／購物清單」才用 add_checklist_items（list 填「待辦」或「購物」）；做完、買了 → update_checklist_item；問清單 → get_checklist。只是隨口提到要做的事，就在回答最後問一句要不要加進待辦。
-- 天氣 → get_weather；附近有什麼 → find_nearby（near 留空會用${owner}的位置，沒有位置就用住的地方）；怎麼去 → plan_route（照你知道的說坐哪條線、在哪轉乘，不寫站數）；問幾站或要查證路線才用 check_route_map（官方路線圖優先，照圖回答、附圖）；匯率 → convert_currency。
+- 天氣 → get_weather；附近有什麼 → find_nearby（near 留空會用${owner}的位置，沒有位置就用住的地方）；怎麼去 → plan_route（照你知道的說坐哪條線、在哪轉乘，不寫站數）；問幾站或要查證路線才用 check_route_map（官方路線圖優先，照圖回答、附圖）；匯率 → convert_currency。提供店家、景點、活動、營業時間這類資訊前，一定先用 web_search 查證最新狀況，不要憑記憶，並註明來源。
 - 地圖連結：工具回傳的連結可以直接用；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結。不要自己寫 Google 地圖網址或短網址，也不要用自己記得的地址或座標當連結。
 - 要看自己傳過的照片（上週拍的、某天的照片、拉麵的照片）→ find_chat_photos（日期換算好，內容寫進 keyword），照片會顯示在回答下方；沒找到就照實說，不要拿網路圖片代替。
 - 要看網路上的照片、圖片時用 find_images（圖片會顯示在回答下方），並說明是網路圖片、僅供參考；沒有要求就不要找圖片。
@@ -5027,7 +5047,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 記帳（add_expense）、修改行程（update_itinerary）、刪除帳目或提醒：工具只會在你的回答下方產生確認卡片，要等成員按「確認」才會寫入。呼叫後用一兩句話說明你看到的內容（照片上的店名、日期、金額…）和準備寫入的內容，請成員核對卡片；絕對不要說「已記好／已更新／已刪除」。資料有疑問（日期不在旅遊期間、金額或幣別看不清楚、不確定誰付的）就先直接問成員，等成員回答再呼叫工具。成員要修改還沒確認的卡片，就重新呼叫同一個工具並在 replaces 填舊卡片編號。卡片只能靠呼叫工具產生，不要在回答裡自己寫卡片內容。還沒確認的卡片不用刪，請成員直接按卡片上的「取消」。
 - 提到 ${p.currency} 價格時附上約合台幣（用 convert_currency）。
 - 問路、問地鐵電車怎麼搭：照你知道的回答坐哪條線、往哪個方向、在哪轉乘（不要寫站數），最後用 plan_route 附 Google 地圖連結，提醒即時班次和月台以 Google 地圖為準；必要時用 web_search 補充轉乘與票價。成員問坐幾站、或要你查證／確認路線時，才用 check_route_map（官方路線圖優先），照它回傳的 routes 回答、寫出依據的路線圖（圖會附在回答下方）；呼叫時把你認為的搭法填在 legs 讓它核對；它沒找到可靠的圖，就說沒查到可以查證的路線圖，請大家看 Google 地圖。沒有用 check_route_map 時，不要說「依據路線圖」或「路線圖附在下方」。成員自己傳路線圖、時刻表或車站照片來問時，照照片上清楚看得到的內容回答。
-- 用 web_search 查交通、票價、營業時間、規定時，優先採用官方網站（營運公司、政府、景點官網）的資料，找不到官方的才用其他網站，並註明來源。
+- 提供店家、景點、展覽、活動、營業時間、票價、規定這類資訊（包括規劃行程時推薦的地點）之前，一定先用 web_search 查證最新狀況（店還在不在、有沒有營業、展覽或活動是否還在進行），不要憑記憶；優先採用官方網站（營運公司、政府、景點官網），找不到官方的才用其他網站，並註明來源；查不到就說查不到。
 - 住宿的位置寫成 [📍住宿](map)（系統會換成正確位置）；要帶路回住宿就用 plan_route，destination 填「住宿」。不要自己用住宿名稱或地址搜尋，常會跑到別的地方。
 - 地圖連結：工具回傳的連結可以直接用（find_nearby 給的是那家店的座標，照抄，不要改成店名搜尋，連鎖店用店名會跑到別家分店）；其他地點一律寫成 [📍地點名稱](map)，系統會自動換成 Google 地圖搜尋連結（地點名稱用日文或英文的正式名稱，連鎖店要加分店名，例如 [📍ドン・キホーテ 池袋駅西口店](map)）。不要自己寫 Google 地圖網址，絕對不要編 maps.app.goo.gl 短網址，也不要用自己記得的地址或座標當連結（記錯一個字就會指到別的地方）。
 - 成員在哪裡，一律以「成員最近位置」或訊息裡附的地名為準，絕對不要自己猜地名；以前聊天裡說過的位置可能已經過時，不要沿用。
@@ -5200,6 +5220,8 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
             if (!need && available.has("find_short_videos") && !toolsUsed.includes("find_short_videos") && VIDEO_CLAIM.test(res.text)) need = "find_short_videos";
             // 回答裡有搭車步驟卻沒用 plan_route：要它用工具產生 Google 導航連結（模型自己手寫的網址常把站名編碼錯，例如「新木巴駅」）
             if (!need && available.has("plan_route") && routeAnswer(res.text) && !toolsUsed.includes("plan_route") && !toolsUsed.includes("check_route_map")) need = "plan_route";
+            // 回答裡有店家景點、營業、展覽活動資訊，這一輪卻沒上網查：先查證再講（看照片回答的、健康管家不算）
+            if (!need && !health && available.has("web_search") && !trigger.photo_id && needsVerification(res.text, toolsUsed)) need = "web_search";
             // 要寫入資料的工具：AI 正在反問成員（日期不在旅遊期間、金額看不清…）就讓它問，不要蓋掉硬寫
             if (need && DRAFT_TOOLS.has(need) && isAskingBack(res.text)) need = null;
             if (need && !nudged.has(need) && step < MAX_STEPS - 1) {
@@ -5208,14 +5230,14 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
               turns = [
                 ...turns,
                 { role: "model", parts: [{ text: res.text || "（略）" }] },
-                { role: "user", parts: [{ text: `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
+                { role: "user", parts: [{ text: need === "web_search" ? VERIFY_NUDGE : `（系統提醒：你還沒有呼叫 ${need}，這件事一定要呼叫 ${need} 才算完成，沒有呼叫就不能說已完成。請現在呼叫，再根據結果完整回答。成員沒看到你剛才那段回答，不用道歉，也不要提到這個提醒。）` }] },
               ];
               continue;
             }
             // 提醒過還是不呼叫：系統自己執行工具，再請模型根據結果回答
             if (need && !forced.has(need) && step < MAX_STEPS - 1) {
               forced.add(need);
-              const note = await this.forceTool(need, provider, history, trigger, user, id, ctx, toolsUsed, image, lastResults);
+              const note = await this.forceTool(need, provider, history, trigger, user, id, ctx, toolsUsed, image, lastResults, res.text);
               if (note) {
                 this.broadcast({ type: "ai_reset", id });
                 turns = [...turns, { role: "model", parts: [{ text: res.text || "（略）" }] }, { role: "user", parts: [{ text: note }] }];
@@ -5335,7 +5357,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
    */
   private async forceTool(
     need: string, provider: Provider, history: MessageRow[], trigger: MessageRow, user: Attachment,
-    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null, lastResults: Record<string, unknown> = {},
+    id: string, ctx: ToolContext, toolsUsed: string[], image: Part | null, lastResults: Record<string, unknown> = {}, draft = "",
   ): Promise<string | null> {
     const p = this.p();
     let args: Record<string, unknown>;
@@ -5390,7 +5412,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
       const now = zoned(Date.now(), p.timezone);
       try {
         const parts: Part[] = [{
-          text: `成員（${user.name}）說：「${trigger.text}」${need === "find_short_videos" || need === "plan_route" ? `\n上一則 AI 回答：\n${([...history].reverse().find((m) => m.role === "assistant" && m.id !== id)?.text ?? "").slice(0, 1500)}` : ""}
+          text: `成員（${user.name}）說：「${trigger.text}」${need === "find_short_videos" || need === "plan_route" ? `\n上一則 AI 回答：\n${([...history].reverse().find((m) => m.role === "assistant" && m.id !== id)?.text ?? "").slice(0, 1500)}` : ""}${need === "web_search" && draft ? `\n你剛才準備回答的內容（要查證裡面的店家、景點、活動是否還在、資訊是否正確，產生查證用的搜尋關鍵字）：\n${draft.slice(0, 1200)}` : ""}
 現在是當地時間 ${now.date}（${now.weekday}）${now.time}。${p.kind === "personal" ? "" : `旅程 ${p.startDate} 到 ${p.endDate}（第一天＝${p.startDate}）。`}旅伴名單：${this.members().join("、") || user.name}。當地貨幣 ${p.currency}。
 請產生呼叫工具「${need}」要用的參數。
 工具說明：${decl.description}

@@ -13,6 +13,8 @@ export const EN_REMIND_HOUR = 20;
 const MAX_FREEZES = 2;
 /** 朗讀音檔最多留幾句（一句約 100–250KB） */
 const MAX_AUDIO = 300;
+/** 查過的單字最多留幾筆 */
+const MAX_WORDS = 500;
 
 export interface EnCard {
   id: number;
@@ -36,6 +38,7 @@ export class EnglishStore {
       CREATE TABLE IF NOT EXISTS en_lessons (date TEXT PRIMARY KEY, ts INTEGER, topic TEXT, level TEXT, data TEXT, done INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_days (date TEXT PRIMARY KEY, practice INTEGER DEFAULT 0, frozen INTEGER DEFAULT 0);
       CREATE TABLE IF NOT EXISTS en_audio (key TEXT PRIMARY KEY, ts INTEGER, data BLOB);
+      CREATE TABLE IF NOT EXISTS en_words (key TEXT PRIMARY KEY, ts INTEGER, data TEXT);
     `);
   }
 
@@ -66,9 +69,10 @@ export class EnglishStore {
 
   // ---------- 對話練習 ----------
 
+  /** opener 空字串＝即時語音（第一句由 AI 說，結束後整段逐字稿再存進來） */
   startSession(scenario: string, level: EnLevel, opener: string): number {
     const id = this.sql.exec("INSERT INTO en_sessions (ts, scenario, level) VALUES (?, ?, ?) RETURNING id", Date.now(), scenario, level).one().id as number;
-    this.addTurn(id, "tutor", opener);
+    if (opener) this.addTurn(id, "tutor", opener);
     return id;
   }
 
@@ -106,6 +110,18 @@ export class EnglishStore {
       .map((r) => ({ id: Number(r.id), ts: Number(r.ts), scenario: String(r.scenario), status: String(r.status), goals_done: JSON.parse(String(r.goals_done || "[]")), said: Number(r.said) }));
   }
 
+  // ---------- 點單字 ----------
+
+  wordGet(key: string): unknown {
+    const r = this.sql.exec("SELECT data FROM en_words WHERE key = ?", key).toArray()[0];
+    return r ? JSON.parse(String(r.data)) : null;
+  }
+
+  wordPut(key: string, data: unknown) {
+    this.sql.exec("INSERT INTO en_words (key, ts, data) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET ts = excluded.ts, data = excluded.data", key, Date.now(), JSON.stringify(data));
+    this.sql.exec("DELETE FROM en_words WHERE key NOT IN (SELECT key FROM en_words ORDER BY ts DESC LIMIT ?)", MAX_WORDS);
+  }
+
   // ---------- 複習卡 ----------
 
   /** 新卡片明天開始複習；同一句英文已經有就不重複加（回 null） */
@@ -117,7 +133,8 @@ export class EnglishStore {
     const k = key(en);
     const near = this.sql.exec("SELECT en FROM en_cards ORDER BY id DESC LIMIT 300").toArray().some((r) => {
       const o = key(String(r.en));
-      return o === k || (k.length >= 12 && o.includes(k)) || (o.length >= 12 && k.includes(o));
+      // 只比句子：單字卡（例如 latte）不會因為某句話裡有這個字就被當成重複
+      return o === k || (k.length >= 12 && k.includes(" ") && o.includes(k)) || (o.length >= 12 && o.includes(" ") && k.includes(o));
     });
     if (near) return null;
     const row = this.sql

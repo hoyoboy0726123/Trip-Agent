@@ -20,6 +20,8 @@ export interface Env {
   GEMINI_WRITER_MODEL?: string;
   /** 英語家教示範發音用的朗讀模型（預設 gemini-3.8-flash-lite-tts） */
   GEMINI_TTS_MODEL?: string;
+  /** 英語家教即時語音對話用的模型（預設 gemini-3.8-live） */
+  GEMINI_LIVE_MODEL?: string;
   GEMINI_RPM?: string;
   GEMINI_TPM?: string;
   GEMINI_RPD?: string;

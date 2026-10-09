@@ -707,3 +707,23 @@ input[type="date"]::-webkit-date-and-time-value, input[type="time"]::-webkit-dat
 .en-week span.today { border-color: var(--red); }
 .en-list { margin: 4px 0; padding-left: 20px; }
 .en-log { margin-top: 10px; }
+
+/* 英語家教：即時語音 */
+.en-mode { margin-bottom: 8px; }
+.en-live-status { text-align: center; font-weight: 700; padding: 8px; margin: 6px 0; border-radius: 12px; background: var(--card); border: 1px solid var(--line); }
+.en-live-now { opacity: .7; }
+.en-live-btns { justify-content: center; gap: 10px; margin-top: 8px; }
+
+/* 英語家教：點單字 */
+.en-w { border-radius: 4px; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.en-w.on { background: var(--red); color: #fff; }
+@media (hover: hover) { .en-w:hover { background: var(--red-soft); } .en-w.on:hover { background: var(--red); } }
+.en-taphint { margin-top: 4px; }
+.en-sheet-wrap { position: fixed; top: 0; left: 0; right: 0; bottom: calc(51px + var(--tabbar-pad)); z-index: 5; }
+.en-sheet-bg { position: absolute; inset: 0; background: rgba(0,0,0,.35); }
+.en-sheet { position: absolute; left: 0; right: 0; bottom: 0; max-width: 680px; margin: 0 auto; max-height: 75%; overflow-y: auto; display: grid; gap: 10px; padding: 18px 18px 20px; background: var(--card); color: var(--ink); border-radius: 20px 20px 0 0; box-shadow: 0 -6px 24px rgba(0,0,0,.25); }
+.en-sheet-word { font-size: 28px; }
+.en-sheet-zh { font-size: 20px; font-weight: 700; }
+.en-sheet-pron { font-size: 19px; }
+.en-sheet-x { border: 0; background: transparent; color: var(--ink); font-size: 20px; padding: 4px 8px; cursor: pointer; }
+.en-sheet-more { display: grid; gap: 8px; border-top: 1px solid var(--line); padding-top: 10px; }

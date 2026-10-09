@@ -14,7 +14,7 @@ import { renderDiaryPage } from "./diary-page";
 import { findDate, isHealthTopic, labCode, normDate, redFlagText, type Flag } from "./health";
 import { HealthStore } from "./health-store";
 import { EnglishStore, EN_REMIND_HOUR } from "./english-store";
-import { audioCheckPrompt, hintPrompt, lessonPrompt, reportPrompt, rolePrompt, scenarioOf, SCENARIOS, shadowPrompt, textCheckPrompt, TOPICS, type Grade } from "./english";
+import { audioCheckPrompt, hintPrompt, lessonPrompt, livePrompt, reportPrompt, rolePrompt, scenarioOf, SCENARIOS, shadowPrompt, textCheckPrompt, TOPICS, wordPrompt, type Grade, type Scenario } from "./english";
 import { chunkText, cleanMarkdown, DOC_MIME, extOf, FILE_KEEP_BYTES, FILE_MAX_BYTES, looksScanned, pptxText, TEXT_EXT } from "./docs";
 import { detectFrom, translate, type Lang } from "./translate";
 import type { Env, Part, Provider, ProviderId, SessionUser, Turn } from "./types";
@@ -2862,6 +2862,7 @@ ${recentChat || "（沒有）"}
     return {
       settings: E.settings(),
       scenarios: SCENARIOS.map(({ id, icon, title, you, tutor, goals }) => ({ id, icon, title, you, tutor, goals })),
+      liveModel: this.env.GEMINI_LIVE_MODEL || "gemini-3.8-live",
       topics: TOPICS,
       progress: E.progress(),
       due: E.dueCards(),
@@ -2949,23 +2950,56 @@ ${recentChat || "（沒有）"}
         case "end": {
           const { s, sc, turns } = sessionOf(body.session);
           if (s.report) return ok({ session: s });
-          if (!turns.some((t) => t.role === "user")) {
-            E.finish(s.id, { summary_zh: "這場還沒開口就結束了，下次試著說一兩句吧！", did_well: [], better: [], phrases: [] });
-            return ok({ session: E.session(s.id) });
-          }
-          const r = await this.enAi(reportPrompt(sc, s.level, turns));
-          const report = {
-            summary_zh: enStr(r.summary_zh, 400),
-            did_well: (Array.isArray(r.did_well) ? r.did_well : []).map((x: unknown) => enStr(x, 200)).filter(Boolean).slice(0, 3),
-            better: (Array.isArray(r.better) ? r.better : []).map(enCorrection).filter(Boolean).slice(0, 3),
-            phrases: (Array.isArray(r.phrases) ? r.phrases : []).map((p: any) => ({ en: enStr(p?.en, 200), zh: enStr(p?.zh, 200) })).filter((p: any) => p.en).slice(0, 4),
+          return ok({ session: await this.enFinish(s.id, s.goals_done, s.level, sc, turns) });
+        }
+
+        // ---- 即時語音對話（Gemini Live）：伺服器只發臨時權杖，手機直接連 Google ----
+        case "live_start": {
+          const sc = scenarioOf(body.scenario);
+          if (!sc) throw new EnUserError("找不到這個情境");
+          const apiKey = (await this.keys()).gemini;
+          if (!apiKey) throw new EnUserError("即時語音要用你自己的 Gemini 金鑰：先到「設定 → API 金鑰」填上");
+          const level = E.settings().level;
+          const model = this.env.GEMINI_LIVE_MODEL || "gemini-3.8-live";
+          // 角色、聲音、逐字稿都鎖在權杖裡：手機改不了設定，也拿不到提示詞和金鑰
+          const setup = {
+            model: `models/${model}`,
+            generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: sc.voice } } } },
+            systemInstruction: { parts: [{ text: livePrompt(sc, level) }] },
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
           };
-          const done = (Array.isArray(r.goals_done) ? r.goals_done : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0 && n < sc.goals.length);
-          E.setGoals(s.id, [...s.goals_done, ...done]);
-          for (const b of report.better as { better: string; zh: string; why: string }[]) E.addCard({ en: b.better, zh: b.zh, note: b.why, source: "對話回饋" });
-          E.finish(s.id, report);
-          E.touch();
-          return ok({ session: E.session(s.id) });
+          const now = Date.now();
+          const res = await fetch("https://generativelanguage.googleapis.com/v1beta/auth_tokens", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+            signal: AbortSignal.timeout(15_000),
+            body: JSON.stringify({ uses: 1, expireTime: new Date(now + 15 * 60_000).toISOString(), newSessionExpireTime: new Date(now + 2 * 60_000).toISOString(), bidiGenerateContentSetup: setup }),
+          }).catch(() => null);
+          const tok: any = res ? await res.json().catch(() => null) : null;
+          if (!res?.ok || !tok?.name) {
+            console.error("live token failed", res?.status, JSON.stringify(tok?.error ?? tok).slice(0, 300));
+            throw new EnUserError(res?.status === 429 ? "即時語音今天的額度用完了，請改用打字或錄音練習" : "即時語音暫時連不上，請改用打字或錄音練習");
+          }
+          this.sql.exec("UPDATE en_sessions SET status = 'left' WHERE status = 'active'");
+          const id = E.startSession(sc.id, level, "");
+          return ok({
+            session: E.session(id),
+            model: `models/${model}`,
+            url: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(tok.name)}`,
+            maxSeconds: 600,
+          });
+        }
+        case "live_end": {
+          const { s, sc } = sessionOf(body.session);
+          if (s.report) return ok({ session: s });
+          // 手機傳回來的逐字稿（AI 語音轉的字和學習者說的話）
+          const said = (Array.isArray(body.turns) ? body.turns : [])
+            .map((t: any) => ({ role: t?.role === "user" ? "user" : "tutor", text: enStr(t?.text, 500) }) as { role: "user" | "tutor"; text: string })
+            .filter((t: { text: string }) => t.text)
+            .slice(0, 80);
+          for (const t of said) E.addTurn(s.id, t.role, t.text, t.role === "user" ? { voice: true, live: true } : undefined);
+          return ok({ session: await this.enFinish(s.id, s.goals_done, s.level, sc, said) });
         }
 
         // ---- 今日一課 ----
@@ -3040,6 +3074,32 @@ ${recentChat || "（沒有）"}
         }
 
         // ---- 複習卡 ----
+        // ---- 點單字：同一句話裡的同一個字查過就存起來，再點不用額度 ----
+        case "word": {
+          const word = enStr(body.word, 40).replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "");
+          if (!/^[A-Za-z][A-Za-z'’-]*$/.test(word)) throw new EnUserError("只能查英文單字");
+          const sentence = enStr(body.sentence, 300);
+          const level = E.settings().level;
+          const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${level}|${word.toLowerCase()}|${sentence}`));
+          const key = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+          const hit = E.wordGet(key);
+          if (hit) return ok({ word: hit });
+          const r = await this.enAi(wordPrompt(level, word, sentence));
+          const w = {
+            word: enStr(r.word, 60) || word,
+            pos: enStr(r.pos, 20),
+            zh: enStr(r.zh, 60),
+            ipa: enStr(r.ipa, 60),
+            syllables: enStr(r.syllables, 60),
+            explain_zh: enStr(r.explain_zh, 400),
+            forms: enStr(r.forms, 80),
+            examples: (Array.isArray(r.examples) ? r.examples : []).map((x: any) => ({ en: enStr(x?.en, 200), zh: enStr(x?.zh, 200) })).filter((x: any) => x.en).slice(0, 3),
+            collocations: (Array.isArray(r.collocations) ? r.collocations : []).map((x: unknown) => enStr(x, 60)).filter(Boolean).slice(0, 3),
+          };
+          if (!w.zh) throw new EnUserError("這個字暫時查不到，請再點一次");
+          E.wordPut(key, w);
+          return ok({ word: w });
+        }
         case "card_add": {
           const id = E.addCard({ en: body.en, zh: body.zh, note: body.note, source: enStr(body.source, 20) || "收藏" });
           return ok({ id, added: !!id });
@@ -3066,6 +3126,28 @@ ${recentChat || "（沒有）"}
       const quota = e instanceof RateLimitedError || /429|quota|額度/i.test(String(e?.message ?? e));
       return Response.json({ ok: false, error: quota ? "今天的 AI 額度用完了，明天再練（複習卡還是可以用）" : "AI 暫時不能用，請稍後再試" }, { status: 503 });
     }
+  }
+
+  /** 結束一場練習：產生回饋卡（做得好的、更自然的說法、實用片語），更自然的說法加入複習卡 */
+  private async enFinish(id: number, goalsDone: number[], level: Parameters<typeof reportPrompt>[1], sc: Scenario, turns: { role: "user" | "tutor"; text: string }[]) {
+    const E = this.english();
+    if (!turns.some((t) => t.role === "user")) {
+      E.finish(id, { summary_zh: "這場還沒開口就結束了，下次試著說一兩句吧！", did_well: [], better: [], phrases: [] });
+      return E.session(id);
+    }
+    const r = await this.enAi(reportPrompt(sc, level, turns));
+    const report = {
+      summary_zh: enStr(r.summary_zh, 400),
+      did_well: (Array.isArray(r.did_well) ? r.did_well : []).map((x: unknown) => enStr(x, 200)).filter(Boolean).slice(0, 3),
+      better: (Array.isArray(r.better) ? r.better : []).map(enCorrection).filter(Boolean).slice(0, 3),
+      phrases: (Array.isArray(r.phrases) ? r.phrases : []).map((p: any) => ({ en: enStr(p?.en, 200), zh: enStr(p?.zh, 200) })).filter((p: any) => p.en).slice(0, 4),
+    };
+    const done = (Array.isArray(r.goals_done) ? r.goals_done : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0 && n < sc.goals.length);
+    E.setGoals(id, [...goalsDone, ...done]);
+    for (const b of report.better as { better: string; zh: string; why: string }[]) E.addCard({ en: b.better, zh: b.zh, note: b.why, source: "對話回饋" });
+    E.finish(id, report);
+    E.touch();
+    return E.session(id);
   }
 
   /** 示範發音：Gemini 朗讀模型唸一次就存起來，之後重播不用額度；不能用時回 503，前端改用手機內建語音 */

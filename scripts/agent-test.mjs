@@ -25,7 +25,7 @@ const keep = setInterval(() => {}, 1000);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 一個測試旅程：建立、等初始化、啟用，回傳問答與動作的小工具 */
-async function trip({ country = "日本", city = "東京", lat = 35.7331, lon = 139.6979 } = {}) {
+async function trip({ country = "日本", city = "東京", lat = 35.6812, lon = 139.7671 } = {}) {
   const res = await fetch(`${BASE}/api/rooms`, {
     method: "POST",
     headers: { "content-type": "application/json", "cf-connecting-ip": `10.9.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}` },

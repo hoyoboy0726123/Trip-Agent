@@ -774,6 +774,9 @@ const PHOTON: Record<string, { q: string; tags: string[] }> = {
   shopping: { q: "shop", tags: ["shop:department_store", "shop:mall", "shop:variety_store"] },
   park: { q: "park", tags: ["leisure:park", "leisure:playground"] },
   hospital: { q: "hospital", tags: ["amenity:hospital", "amenity:clinic"] },
+  police: { q: "police", tags: ["amenity:police"] },
+  laundry: { q: "laundry", tags: ["shop:laundry", "shop:dry_cleaning"] },
+  baby_care: { q: "nursing room", tags: ["amenity:toilets"] },
 };
 
 async function photonNearby(category: string, lat: number, lon: number, radius: number, keyword: string): Promise<any[]> {
@@ -816,6 +819,122 @@ const CUISINE: [RegExp, RegExp][] = [
   [/甜點|スイーツ|ケーキ|蛋糕|dessert|cake/i, /cake|dessert|confectionery/],
 ];
 
+// ---------------- 營業時間（OpenStreetMap opening_hours）與國定假日 ----------------
+
+const OH_DAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+type OhRule = { days: Set<number> | null; ph: boolean; ranges: [number, number][] | null };
+
+/**
+ * OpenStreetMap 登記的營業時間，現在有沒有開。看得懂常見寫法：
+ * 「Mo-Fr 09:00-18:00; Sa,Su 10:00-17:00; PH off」「24/7」「11:00-14:00,17:00-22:00」、跨夜「18:00-02:00」；
+ * 看不懂的（月份、第幾週、日出日落、註解）回 null，不亂猜
+ */
+export function openNow(oh: string, day: number, minutes: number, holiday: boolean): boolean | null {
+  const text = oh.trim();
+  if (/^24\/7$/.test(text)) return true;
+  const DAY = "(?:Mo|Tu|We|Th|Fr|Sa|Su|PH)(?:-(?:Mo|Tu|We|Th|Fr|Sa|Su))?";
+  const ruleRe = new RegExp(`^((?:${DAY})(?:\\s*,\\s*${DAY})*)?\\s*(.*)$`);
+  const rules: OhRule[] = [];
+  for (const raw of text.split(";").map((s) => s.trim()).filter(Boolean)) {
+    const m = raw.match(ruleRe);
+    if (!m) return null;
+    const [, sel, rest] = m;
+    let days: Set<number> | null = null;
+    let ph = false;
+    if (sel) {
+      days = new Set();
+      for (const part of sel.split(/\s*,\s*/)) {
+        if (part === "PH") {
+          ph = true;
+          continue;
+        }
+        const [a, b] = part.split("-");
+        const s = OH_DAYS.indexOf(a), e = OH_DAYS.indexOf(b ?? a);
+        for (let i = s; ; i = (i + 1) % 7) {
+          days.add(i);
+          if (i === e) break;
+        }
+      }
+    }
+    const t = rest.trim();
+    let ranges: [number, number][] | null = null;
+    if (!/^(off|closed)$/i.test(t)) {
+      if (!t) return null;
+      ranges = [];
+      for (const r of t.split(/\s*,\s*/)) {
+        const x = r.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\+?$/);
+        if (!x) return null;
+        ranges.push([Number(x[1]) * 60 + Number(x[2]), Number(x[3]) * 60 + Number(x[4])]);
+      }
+    }
+    rules.push({ days, ph, ranges });
+  }
+  if (!rules.length) return null;
+  // 後面的規則蓋過前面的（例如「Mo-Su 10:00-20:00; Tu off」）；國定假日看寫了 PH 的那條
+  const forDay = (d: number, isPh: boolean) => {
+    let hit: OhRule | undefined;
+    for (const r of rules) if ((!r.days && !r.ph) || r.days?.has(d) || (isPh && r.ph)) hit = r;
+    return hit;
+  };
+  if (forDay(day, holiday)?.ranges?.some(([s, e]) => (e > s ? minutes >= s && minutes < e : minutes >= s))) return true;
+  // 前一天開到半夜（例如 18:00-02:00）
+  return !!forDay((day + 6) % 7, false)?.ranges?.some(([s, e]) => e <= s && minutes < e);
+}
+
+/** 旅遊地現在是星期幾、幾點幾分、哪一天（營業時間用） */
+function localClock(tz: string): { day: number; minutes: number; date: string } {
+  const f = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" })
+      .formatToParts(new Date())
+      .map((x) => [x.type, x.value]),
+  );
+  return { day: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(f.weekday), minutes: Number(f.hour) * 60 + Number(f.minute), date: `${f.year}-${f.month}-${f.day}` };
+}
+
+/** 當地國定假日（Nager.Date，一年查一次存起來；查不到就當沒有） */
+export async function holidaysOf(room: RoomApi, countryCode: string, year: string): Promise<{ date: string; name: string }[]> {
+  if (!/^[A-Za-z]{2}$/.test(countryCode)) return [];
+  const key = `holidays:${countryCode.toUpperCase()}:${year}`;
+  const hit = room.cacheGet(key, 30 * 86400_000);
+  if (hit) return JSON.parse(hit);
+  try {
+    const d = await getJSON(`https://date.nager.at/api/v3/PublicHolidays/${year}/${countryCode.toUpperCase()}`, undefined, 8_000);
+    const list = (Array.isArray(d) ? d : []).map((h: any) => ({ date: String(h.date), name: String(h.localName || h.name) }));
+    room.cacheSet(key, JSON.stringify(list));
+    return list;
+  } catch {
+    return [];
+  }
+}
+
+// ---------------- 外交部旅遊警示 ----------------
+
+/** 外交部緊急聯絡中心（來源：外交部領事事務局各辦事處頁面，專供急難求助） */
+export const TAIWAN_EMERGENCY = "外交部緊急聯絡中心（24 小時，專供急難求助）：+886-3-398-2629、+886-3-383-4849（在台灣撥 0800-085-095）";
+
+/** 外交部領事事務局的旅遊警示（灰色提醒／黃色注意／橙色避免前往／紅色儘速離境）：一天抓一次，回這個國家各地區的等級；抓不到回 null */
+export async function travelWarning(room: RoomApi, country: string): Promise<{ area: string; level: string; url: string }[] | null> {
+  let rows: { country: string; area: string; level: string; url: string }[];
+  const hit = room.cacheGet("boca_warnings", 86400_000);
+  if (hit) rows = JSON.parse(hit);
+  else {
+    try {
+      const res = await fetch("https://www.boca.gov.tw/sp-trwa-list-1.html", { headers: { "user-agent": UA }, signal: AbortSignal.timeout(12_000) });
+      if (!res.ok) return null;
+      const html = await res.text();
+      rows = [...html.matchAll(/<a href="(\/sp-trwa-content-[^"]+)"[^>]*>([^<]+)<\/a>\s*<\/td>\s*<td data-title="國家地區">([^<]*)<\/td>\s*<td data-title="最新警示分級">\s*(?:<span[^>]*><\/span>)?([^<]+)<\/td>/g)].map((m) => ({
+        country: m[2].trim(), area: m[3].trim(), level: m[4].trim(), url: `https://www.boca.gov.tw${m[1]}`,
+      }));
+      if (!rows.length) return null;
+      room.cacheSet("boca_warnings", JSON.stringify(rows));
+    } catch {
+      return null;
+    }
+  }
+  const name = country.trim();
+  return rows.filter((r) => name && (r.country.split(/\s+/)[0] === name || r.country.startsWith(name))).map(({ area, level, url }) => ({ area, level, url }));
+}
+
 // ---------------- 附近地點（OpenStreetMap Overpass） ----------------
 
 const NEARBY: Record<string, string> = {
@@ -831,6 +950,10 @@ const NEARBY: Record<string, string> = {
   shopping: `nw(around:{r},{lat},{lon})["shop"~"^(department_store|mall|variety_store|toys|electronics|clothes)$"];`,
   park: `nw(around:{r},{lat},{lon})["leisure"~"^(park|playground)$"];`,
   hospital: `nw(around:{r},{lat},{lon})["amenity"~"^(hospital|clinic)$"];`,
+  police: `nw(around:{r},{lat},{lon})["amenity"="police"];`,
+  laundry: `nw(around:{r},{lat},{lon})["shop"~"^(laundry|dry_cleaning)$"];`,
+  // 尿布台、哺乳室（OpenStreetMap 標在廁所或商場上）
+  baby_care: `nw(around:{r},{lat},{lon})["changing_table"="yes"];nw(around:{r},{lat},{lon})["baby_feeding"~"^(yes|room)$"];`,
 };
 
 // Yahoo!路線 運行情報的地區（只有日本）
@@ -1055,7 +1178,7 @@ export const TOOLS: Tool[] = [
     label: "🌤 查天氣",
     decl: {
       name: "get_weather",
-      description: "查詢天氣預報（未來最多 14 天）與目前天氣。沒給地點就查住宿附近。",
+      description: "查詢天氣預報（未來最多 14 天）、目前天氣、接下來 2 小時每 15 分鐘的降雨（問「等一下會不會下雨」看 next_2_hours）、日出日落。沒給地點就查住宿附近。",
       parameters: {
         type: "object",
         properties: {
@@ -1074,11 +1197,18 @@ export const TOOLS: Tool[] = [
       const days = Math.min(Math.max(Number(args.days) || 7, 1), 14);
       const d = await getJSON(
         `https://api.open-meteo.com/v1/forecast?latitude=${loc.lat}&longitude=${loc.lon}&timezone=${encodeURIComponent(profile.timezone)}&forecast_days=${days}` +
-          `&current=temperature_2m,apparent_temperature,weather_code,precipitation&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max`,
+          `&current=temperature_2m,apparent_temperature,weather_code,precipitation&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,uv_index_max,sunrise,sunset` +
+          `&minutely_15=precipitation&forecast_minutely_15=8`,
       );
+      // 接下來 2 小時每 15 分鐘的降雨（「等一下會不會下雨」）
+      const soon = (d.minutely_15?.time ?? []).map((t: string, i: number) => ({ time: String(t).slice(11, 16), mm: Number(d.minutely_15.precipitation?.[i] ?? 0) }));
+      const wet = soon.filter((x: { mm: number }) => x.mm >= 0.1);
       return {
         place: loc.name,
         now: d.current && { temp: d.current.temperature_2m, feels: d.current.apparent_temperature, weather: WEATHER[d.current.weather_code] ?? d.current.weather_code },
+        next_2_hours: soon.length
+          ? { summary: wet.length ? `約 ${wet[0].time} 開始有雨（每 15 分鐘最多 ${Math.max(...wet.map((x: { mm: number }) => x.mm))} mm）` : "接下來 2 小時應該不會下雨", every_15_min: soon }
+          : undefined,
         daily: (d.daily?.time ?? []).map((date: string, i: number) => ({
           date,
           weather: WEATHER[d.daily.weather_code[i]] ?? d.daily.weather_code[i],
@@ -1086,6 +1216,8 @@ export const TOOLS: Tool[] = [
           min: d.daily.temperature_2m_min[i],
           rain_chance: d.daily.precipitation_probability_max[i],
           uv: d.daily.uv_index_max[i],
+          sunrise: String(d.daily.sunrise?.[i] ?? "").slice(11, 16),
+          sunset: String(d.daily.sunset?.[i] ?? "").slice(11, 16),
         })),
         source: "Open-Meteo",
       };
@@ -1167,7 +1299,7 @@ export const TOOLS: Tool[] = [
     label: "🗺 找附近",
     decl: (p) => ({
       name: "find_nearby",
-      description: "找實際距離最近的地點（餐廳、咖啡、便利商店、藥妝、超市、廁所、ATM／換匯、置物櫃、車站、購物、公園、醫院），依距離排序並附步行分鐘。問「我附近」時 near 一定留空，系統會自動用發問者的 GPS 位置。",
+      description: "找實際距離最近的地點（餐廳、咖啡、便利商店、藥妝、超市、廁所、ATM／換匯、置物櫃、車站、購物、公園、醫院、警察局、洗衣店、尿布台／哺乳室），依距離排序並附步行分鐘；有登記營業時間的會標出現在有沒有營業（open_now）、輪椅能不能進（wheelchair）。問「我附近」時 near 一定留空，系統會自動用發問者的 GPS 位置。",
       parameters: {
         type: "object",
         properties: {
@@ -1175,6 +1307,7 @@ export const TOOLS: Tool[] = [
           keyword: { type: "string", description: `店名或料理類型（${p.language}、英文或中文）` },
           near: { type: "string", description: `只有要查「別的地方」附近才填，用${p.language}或英文地名。問「我附近」請留空` },
           radius_m: { type: "integer", description: "搜尋半徑公尺，預設 600，最大 2000" },
+          open_now: { type: "boolean", description: "只要現在有營業的（成員問「現在還有開的」時填 true）" },
         },
         required: ["category"],
       },
@@ -1214,6 +1347,14 @@ export const TOOLS: Tool[] = [
         elements = await photonNearby(args.category, center.lat, center.lon, r, kw);
         source += "（Photon）";
       }
+      // 現在有沒有營業：用 OpenStreetMap 登記的營業時間推算（國定假日看 PH 規則）
+      const clock = localClock(profile.timezone);
+      const holiday = elements.some((e: any) => e.tags?.opening_hours) && (await holidaysOf(room, profile.countryCode, clock.date.slice(0, 4))).some((h) => h.date === clock.date);
+      const openText = (oh?: string) => {
+        if (!oh) return undefined;
+        const o = openNow(oh, clock.day, clock.minutes, holiday);
+        return o === null ? "營業時間寫法看不懂，請查官網" : o ? "營業中" : "現在沒開";
+      };
       const all = elements
         .map((e: any) => {
           const lat = e.lat ?? e.center?.lat, lon = e.lon ?? e.center?.lon;
@@ -1225,6 +1366,9 @@ export const TOOLS: Tool[] = [
             name_en: t["name:en"],
             cuisine: t.cuisine,
             opening_hours: t.opening_hours,
+            open_now: openText(t.opening_hours),
+            wheelchair: t.wheelchair,
+            changing_table: t.changing_table,
             distance_m: distance,
             walk_min: Math.max(1, Math.round(distance / 80)),
             // 只給座標：店名一起放進搜尋字，模型抄網址時最常把日文編碼抄壞；座標也不會跑到連鎖店的別家分店
@@ -1244,11 +1388,17 @@ export const TOOLS: Tool[] = [
         note = [note, `半徑 ${r} 公尺內沒有符合「${kw}」的店家資料，以下是附近所有結果；可加大 radius_m 再找，或用 web_search 補充`].filter(Boolean).join("；");
         places = all;
       }
+      if (args.open_now) {
+        const open = places.filter((p: any) => p.open_now === "營業中");
+        if (open.length) places = open;
+        else note = [note, "找不到確定現在有營業的（很多店沒有登記營業時間），以下是全部結果"].filter(Boolean).join("；");
+      }
       return {
         center: center.label,
         center_coords: `${center.lat.toFixed(5)},${center.lon.toFixed(5)}`,
         radius_m: r,
         note: note || undefined,
+        ...(places.some((p: any) => p.open_now) ? { open_now_note: `營業中／現在沒開是用 OpenStreetMap 登記的營業時間推算${holiday ? "（今天是國定假日）" : ""}，可能過時，要確定請查官網` } : {}),
         places: places.slice(0, 12),
         source,
         tip: "結果依實際距離排序；評價與排隊狀況可再用 web_search 查 Google 評論",
@@ -1919,11 +2069,11 @@ export const TOOLS: Tool[] = [
     label: "🆘 災害警報",
     decl: {
       name: "disaster_alerts",
-      description: "查旅遊地附近的地震、颱風／熱帶氣旋、洪水、火山等災害，以及未來幾天的強風豪雨。問「有地震嗎」「颱風會不會影響行程」時使用。",
+      description: "查旅遊地附近的地震、颱風／熱帶氣旋、洪水、火山等災害、未來幾天的強風豪雨，以及外交部對這個國家的旅遊警示等級和緊急聯絡電話。問「有地震嗎」「颱風會不會影響行程」「那裡安全嗎」時使用。",
       parameters: { type: "object", properties: {} },
     },
-    async run(_args, { profile }) {
-      return disasterAlerts(profile);
+    async run(_args, { profile, room }) {
+      return disasterAlerts(profile, room);
     },
   },
   {
@@ -2258,7 +2408,7 @@ export const TOOLS: Tool[] = [
 
 // ---------------- 災害警報（全球：USGS 地震、GDACS 災害、Open-Meteo 強風豪雨） ----------------
 
-export async function disasterAlerts(p: TripProfile) {
+export async function disasterAlerts(p: TripProfile, room?: RoomApi) {
   const home = homeOf(p);
   const out: Record<string, unknown> = {};
   const since = Date.now() - 48 * 3600_000;
@@ -2327,7 +2477,12 @@ export async function disasterAlerts(p: TripProfile) {
     })(),
   ]);
   out.emergency = p.emergency;
-  out.source = "USGS 地震資料、GDACS 全球災害警報、Open-Meteo";
+  out.taiwan_emergency = TAIWAN_EMERGENCY;
+  if (room) {
+    const w = await travelWarning(room, p.country).catch(() => null);
+    out.travel_warning = w === null ? "暫時查不到" : w.length ? w : "外交部沒有對這個國家發布旅遊警示";
+  }
+  out.source = "USGS 地震資料、GDACS 全球災害警報、Open-Meteo、外交部領事事務局";
   return out;
 }
 

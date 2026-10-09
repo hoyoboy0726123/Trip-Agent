@@ -7,7 +7,7 @@ import {
 } from "./profile";
 import { geminiProvider, isQuotaError, parseArgs, providerFor, uploadGeminiFile, WorkersAiQuotaError, type GeminiGate } from "./providers";
 import { acquireWith, GeminiLimiter, limitsFrom, RateLimitedError } from "./ratelimit";
-import { cleanRouteMap, routeMapPrompt, zhCaption, disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type EventInput, runTool, SEARCH_OUT, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
+import { cleanRouteMap, routeMapPrompt, zhCaption, disasterAlerts, DRAFT_TOOLS, healthToolDecls, homeOf, reverseArea, type EventInput, runTool, SEARCH_OUT, holidaysOf, toolDecls, toolLabel, type AttachedImage, type DraftInput, type ExpenseInput, type RoomApi, type ToolContext } from "./tools";
 import { fixMapLinks, type MapFixOptions } from "./maplinks";
 import { sendPush, type PushPayload, type VapidKeys } from "./push";
 import { renderDiaryPage } from "./diary-page";
@@ -341,7 +341,9 @@ const INTENTS: { tool: string; test: (text: string, hasPhoto: boolean) => boolea
   // 只在明確說要加進清單時才算；「想買…幫我推薦」這類只是詢問，不能自動加
   { tool: "add_checklist_items", test: (t) => /(加入|加到|加進|放進|放到|列入|記到|記進|寫進|存進).{0,8}(清單|待辦)|清單.{0,4}(加|新增|放)/.test(t) },
   { tool: "taxi_fare", test: (t) => /(計程車|taxi|叫車|的士).{0,20}(多少|費用|車資|多久|錢|價)/i.test(t) || /車資/.test(t) },
-  { tool: "disaster_alerts", test: (t) => /地震|颱風|海嘯|警報|豪雨|火山|洪水/.test(t) },
+  { tool: "disaster_alerts", test: (t) => /地震|颱風|海嘯|警報|豪雨|火山|洪水|旅遊警示|旅外警示|外交部.{0,10}(警示|警告)|(國家|那裡|當地).{0,6}(安不安全|安全嗎|治安)/.test(t) },
+  // 問天氣、會不會下雨：要查（模型會說「我幫你查了一下」卻沒查）
+  { tool: "get_weather", test: (t) => /(會不會|要不要|有沒有).{0,6}(下雨|帶傘|颳風)|天氣(怎麼樣|如何|好嗎|預報)|幾度|冷不冷|熱不熱|降雨|帶傘/.test(t) },
   { tool: "train_status", test: (t) => /延誤|停駛|誤點|停開|運行狀況|電車.{0,6}(正常|狀況)/.test(t) },
   { tool: "find_nearby", test: (t) => /附近|周邊|周圍|旁邊有什麼/.test(t), alt: ["web_search"] },
   // 貼了連結：先讀內容（FB／IG 影片也看得到）
@@ -677,6 +679,8 @@ export class TripRoom extends DurableObject<Env> implements RoomApi {
     if (!this.sql.exec("PRAGMA table_info(documents)").toArray().some((c) => c.name === "folder_id")) this.sql.exec("ALTER TABLE documents ADD COLUMN folder_id INTEGER");
     // 個人助理：手機推播訂閱；記憶 v2（狀態、來源、到期日、被哪一條取代）
     this.sql.exec("CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, p256dh TEXT, auth TEXT, ts INTEGER, ua TEXT)");
+    // 誰的裝置：有人按求助時不用通知他自己
+    if (!this.sql.exec("PRAGMA table_info(push_subs)").toArray().some((c) => c.name === "name")) this.sql.exec("ALTER TABLE push_subs ADD COLUMN name TEXT");
     // 個人助理知識庫：貼連結（文章、FB／IG 影片）或筆記，AI 整理成標題＋重點＋標籤
     this.sql.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, author TEXT, title TEXT, summary TEXT, content TEXT, url TEXT, tags TEXT, thumb TEXT)");
     if (!this.sql.exec("PRAGMA table_info(notes)").toArray().some((c) => c.name === "inbox")) this.sql.exec("ALTER TABLE notes ADD COLUMN inbox INTEGER DEFAULT 0");
@@ -1070,8 +1074,8 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
       // 只接受正牌推播服務的網址，伺服器才不會被拿來對任意網址發請求
       if (!PUSH_HOSTS.test(endpoint) || !/^[\w-]{40,120}$/.test(p256dh) || !/^[\w-]{10,40}$/.test(auth)) return Response.json({ ok: false, error: "通知訂閱資料不正確" }, { status: 400 });
       this.sql.exec(
-        "INSERT INTO push_subs VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, ts = excluded.ts",
-        endpoint, p256dh, auth, Date.now(), String(req.headers.get("user-agent") ?? "").slice(0, 200),
+        "INSERT INTO push_subs (endpoint, p256dh, auth, ts, ua, name) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth, ts = excluded.ts, name = excluded.name",
+        endpoint, p256dh, auth, Date.now(), String(req.headers.get("user-agent") ?? "").slice(0, 200), user.name,
       );
       // 每個空間最多 10 台裝置，太舊的拿掉
       this.sql.exec("DELETE FROM push_subs WHERE endpoint NOT IN (SELECT endpoint FROM push_subs ORDER BY ts DESC LIMIT 10)");
@@ -1259,6 +1263,8 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
           meta: reply || photoIds.length > 1 ? JSON.stringify({ ...(reply ? { reply } : {}), ...(photoIds.length > 1 ? { photos: photoIds } : {}) }) : null,
         });
         this.broadcast({ type: "message", message: this.publicMessage(row) });
+        // 求助：沒開著 App 的家人手機也要知道
+        if (text.startsWith("🆘") && !this.isPersonal()) this.ctx.waitUntil(this.pushAll({ title: `🆘 ${user.name} 需要幫忙`, body: text.slice(0, 120), tag: "sos" }, user.name));
         if (this.shouldReply(text, !!photoId, quoted?.role === "assistant")) {
           const job = this.queue.then(() => this.runAgent(row, user));
           this.queue = job.catch(() => {});
@@ -1320,6 +1326,7 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
   private shouldReply(text: string, hasPhoto: boolean, toAi = false): boolean {
     if (!text && !hasPhoto) return false; // 單純分享位置不打擾 AI
     if (toAi) return true; // 回覆 AI 的訊息＝在問 AI，「只回 @AI」模式也要回答
+    if (text.startsWith("🆘")) return true; // 求助（走散、證件不見）一定要回，「只回 @AI」模式也一樣
     if (this.isPersonal()) return true; // 個人助理只有本人，每則都回
     if (this.settings().replyMode === "all") return true;
     return /@(ai|AI|旅伴|助理|小幫手)/.test(text) || text.startsWith("/ai") || (hasPhoto && /@/.test(text));
@@ -1654,6 +1661,9 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
       case "brief_now":
         if (this.isPersonal()) await this.postPersonalBrief(this.today());
         else await this.postMorningBrief(this.today());
+        break;
+      case "evening_now":
+        if (!this.isPersonal()) await this.postEveningCheck(this.today(), true);
         break;
       case "diary_now": {
         if (!this.isPersonal()) {
@@ -2624,6 +2634,8 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
       const inTrip = now.date >= p.startDate && now.date <= p.endDate;
       const s = this.settings();
       if (inTrip && s.autoBrief && now.hour >= 7 && now.hour < 11 && this.setting("brief_sent") !== now.date) await this.postMorningBrief(now.date);
+      // 前一晚檢查明天的行程（休館、國定假日、下雨），有要注意的才發
+      if (inTrip && s.autoBrief && now.hour >= 20 && now.hour < 23 && now.date < p.endDate && this.setting("evening_sent") !== now.date) await this.postEveningCheck(now.date);
       if (inTrip && s.autoDiary && now.hour >= 22 && this.setting("diary_sent") !== now.date) await this.writeDiary(now.date);
       // 警報從出發前一天開始
       const alertStart = new Date(Date.parse(p.startDate + "T00:00:00Z") - 86400_000).toISOString().slice(0, 10);
@@ -2655,9 +2667,37 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     for (const r of due) {
       this.sql.exec("UPDATE reminders SET sent = 1 WHERE id = ?", r.id);
       this.postAiMessage(`⏰ **提醒**：${r.message}\n\n（${r.author} 設定的提醒）`, { kind: "reminder" });
-      if (this.isPersonal()) this.ctx.waitUntil(this.pushAll({ title: "⏰ 提醒", body: String(r.message), tag: `reminder-${r.id}` }));
+      this.ctx.waitUntil(this.pushAll({ title: "⏰ 提醒", body: String(r.message), tag: `reminder-${r.id}` }));
     }
     if (due.length) this.broadcastState();
+  }
+
+  /** 前一晚檢查明天的行程：景點店家休館、國定假日、活動結束、下雨。有要注意的才發，沒事不打擾 */
+  async postEveningCheck(date: string, force = false) {
+    this.setSetting("evening_sent", date);
+    const p = this.p();
+    const tomorrow = new Date(Date.parse(date + "T00:00:00Z") + 86400_000).toISOString().slice(0, 10);
+    const plan = this.itinerary().find((d) => d.date === tomorrow);
+    if (!plan || !`${plan.title ?? ""}${plan.detail ?? ""}`.trim()) return force ? this.postAiMessage(`🌙 明天（${tomorrow.slice(5).replace("-", "/")}）還沒有排行程，沒有要檢查的。`, { kind: "evening" }) : undefined;
+    const ctx = await this.toolCtx(AI_NAME);
+    const [news, weather, holidays] = await Promise.all([
+      runTool("web_search", { query: `${plan.title} ${plan.detail ?? ""} 休館 公休 臨時休業 最新消息`.slice(0, 200), max_results: 5 }, ctx),
+      runTool("get_weather", { days: 2 }, ctx),
+      holidaysOf(this, p.countryCode, tomorrow.slice(0, 4)),
+    ]);
+    const holiday = holidays.find((h) => h.date === tomorrow);
+    const prompt = `明天（${tomorrow}）的行程：${plan.title}｜${plan.detail ?? ""}
+請檢查明天出門前要先知道的事：景點或店家休館、公休、臨時休業、展覽或活動已經結束、國定假日人潮、會下雨要準備的。
+- 只根據下面的資料，資料沒提到的不要自己猜。
+- 有要注意的：寫成給家人的提醒，條列、150 字內，建議怎麼調整，附上資料來源連結。
+- 都沒問題：只回「OK」兩個字。
+國定假日：${holiday ? `${holiday.name}（國定假日：熱門景點人多，部分店家公休或改時間）` : "不是國定假日"}
+天氣：${JSON.stringify(weather).slice(0, 1500)}
+網路查到的最新消息：${JSON.stringify(news).slice(0, 2500)}`;
+    const text = (await this.generateText(this.systemPrompt(), prompt, false, 1)).trim();
+    if (!text || /^OK[。.!！]?$/i.test(text)) return force ? this.postAiMessage(`🌙 明天（${tomorrow.slice(5).replace("-", "/")}）的行程檢查過了，沒有查到休館或要特別注意的事。`, { kind: "evening" }) : undefined;
+    this.postAiMessage(`🌙 **明天（${tomorrow.slice(5).replace("-", "/")}）出門前要知道的事**\n\n${text}`, { kind: "evening" });
+    this.ctx.waitUntil(this.pushAll({ title: "🌙 明天出門前要知道的事", body: pushText(text), tag: "evening" }));
   }
 
   async postMorningBrief(date: string) {
@@ -2669,7 +2709,7 @@ ${mems.map((m) => `#${m.id}［${m.category}］${m.content}`).join("\n")}`;
     const newsQuery = today ? `${today.title} ${today.detail} 最新消息 營業 休館 展覽 活動`.slice(0, 200) : "";
     const [weather, alerts, news] = await Promise.all([
       runTool("get_weather", { days: 2 }, ctx),
-      disasterAlerts(p).catch(() => ({})),
+      disasterAlerts(p, this).catch(() => ({})),
       newsQuery ? runTool("web_search", { query: newsQuery, max_results: 5 }, ctx) : Promise.resolve(null),
     ]);
     const reminders = this.reminderList().filter((r) => String(r.time).startsWith(date));
@@ -3031,7 +3071,7 @@ ${transcript || "（今天群組沒什麼對話）"}`;
   /** 附近的大地震、影響這個國家的颱風／洪水／火山、隔天強風豪雨：有新狀況才在群組發通知 */
   private async pollAlerts(date: string) {
     const p = this.p();
-    const a: any = await disasterAlerts(p);
+    const a: any = await disasterAlerts(p, this);
     const seen: string[] = JSON.parse(this.setting("alerts_seen", "[]"));
     const first = !this.setting("alerts_initialized");
     const notes: string[] = [];
@@ -3050,6 +3090,13 @@ ${transcript || "（今天群組沒什麼對話）"}`;
       const kind: Record<string, string> = { TC: "🌀 颱風／熱帶氣旋", FL: "🌊 洪水", VO: "🌋 火山", WF: "🔥 野火", DR: "🏜 乾旱" };
       if (!first && serious) notes.push(`${kind[d.type] ?? "⚠️ 災害"}：${d.name}（警戒等級 ${d.alert}${d.distance_km != null ? `，距離約 ${d.distance_km} 公里` : ""}），可以問我「會不會影響行程」。`);
     }
+    // 外交部旅遊警示升到黃色以上
+    for (const w of Array.isArray(a.travel_warning) ? a.travel_warning : []) {
+      const key = `boca:${w.area}:${w.level}`;
+      if (seen.includes(key)) continue;
+      seen.push(key);
+      if (!first && /黃色|橙色|紅色/.test(w.level)) notes.push(`🛂 **外交部旅遊警示**：${w.area}「${w.level}」，詳情見 [外交部領事事務局](${w.url})`);
+    }
     for (const d of (Array.isArray(a.forecast) ? a.forecast : []).filter((x: any) => x.severe && x.date >= date).slice(0, 2)) {
       const key = `wx:${d.date}`;
       if (seen.includes(key)) continue;
@@ -3058,7 +3105,10 @@ ${transcript || "（今天群組沒什麼對話）"}`;
     }
     this.setSetting("alerts_seen", JSON.stringify(seen.slice(-300)));
     this.setSetting("alerts_initialized", "1");
-    if (notes.length) this.postAiMessage(`⚠️ **警報通知**\n\n${notes.join("\n\n")}${p.emergency ? `\n\n緊急電話：${p.emergency}` : ""}`, { kind: "alert" });
+    if (notes.length) {
+      this.postAiMessage(`⚠️ **警報通知**\n\n${notes.join("\n\n")}${p.emergency ? `\n\n緊急電話：${p.emergency}` : ""}`, { kind: "alert" });
+      this.ctx.waitUntil(this.pushAll({ title: "⚠️ 警報通知", body: pushText(notes.join("\n")), tag: "alert" }));
+    }
   }
 
   /** 旅遊日記網頁（成員版／分享版）：封面＋每天一章，可以列印成 PDF */
@@ -4945,10 +4995,9 @@ ${transcript || "（沒什麼對話）"}`;
     return this.vapidCache;
   }
 
-  /** 推播到這個空間所有開啟通知的裝置（目前只有個人助理用）；失效的訂閱順便刪掉 */
-  private async pushAll(payload: Omit<PushPayload, "url"> & { url?: string }) {
-    if (!this.isPersonal()) return;
-    const subs = this.sql.exec("SELECT * FROM push_subs").toArray();
+  /** 推播到這個空間所有開啟通知的裝置（except：不用通知的人，例如按求助的本人）；失效的訂閱順便刪掉 */
+  private async pushAll(payload: Omit<PushPayload, "url"> & { url?: string }, except?: string) {
+    const subs = this.sql.exec("SELECT * FROM push_subs").toArray().filter((s) => !except || s.name !== except);
     if (!subs.length) return;
     const keys = await this.vapidKeys();
     const subject = this.setting("push_subject") || "https://trip-agent.app";
@@ -5217,6 +5266,7 @@ ${summary ? `\n# 更早的對話摘要\n${summary}\n` : ""}${recall ? `\n# 以�
 - 一次收到好幾張照片（例如菜單好幾頁）：當成同一份資料一起整理，不要一張一張分開回答。菜單：依類別分組，每道寫中文翻譯（原文）和價格（當地幣別附約合台幣，例如「${p.currencySymbol}○○（約 NT$○○）」），標出推薦、辣、生食、含酒精、適合小孩的；看不清楚的照實說。
 - 傳照片說要「存起來／存成票券」→ save_document（說要放哪個資料夾，例如「存到機票」，就填 folder）；問「給我看○○的票／訂位」→ find_documents（關鍵字也可以是資料夾名稱）。
 - 有人傳「🆘」走散求助：先安撫，用 get_member_locations 看大家在哪，建議就近約在明顯地標或車站出口集合，提醒可找工作人員幫忙${p.emergency ? `、緊急電話 ${p.emergency}` : ""}。
+- 有人說護照、錢包、手機或證件不見了（或傳「🆘 我的護照或錢包不見了」）：先安撫一句，再給步驟：1) find_nearby（category police）找最近的警察局，去報案拿遺失證明；2) web_search 查駐${p.country}的台北代表處急難救助電話與補發護照（或入國證明書）的方法，附官方連結；3) 用${p.language}寫一兩句可以直接給警察或店員看的話（附中文意思）；4) 信用卡請馬上打發卡銀行掛失；5) 緊急電話${p.emergency ? ` ${p.emergency}` : ""}，外交部緊急聯絡中心 +886-3-398-2629（24 小時）。
 - 有人說「我付了／花了…」→ 用 add_expense 產生記帳卡片；問「花多少、怎麼分」→ expense_summary。只有成員說付了、花了、要記帳，或傳收據時才記帳；問「怎麼儲值、怎麼買票、要多少錢」是在問做法或價格，直接回答，不要問金額、不要產生記帳卡片。
 - 成員做了決定、說了偏好、訂了東西 → 主動用 remember 記下來；行程要改就用 update_itinerary 產生修改卡片。只有 remember 成功後才能說「已記住」。
 - 收到照片：辨識菜單、商品、看板、車票並翻譯說明；商品可以查價比價。

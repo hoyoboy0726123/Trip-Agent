@@ -8,6 +8,8 @@
 //   KEYS=path/to/file.env                       測試旅程用的 GEMINI_API_KEY、TAVILY_API_KEY（預設讀 .dev.vars）
 // 要測 Gemini（正式站主要用的模型）：wrangler dev 也要有 GEMINI_API_KEY，不然會先用 Workers AI。
 // AI 的回答每次不一樣，偶爾一題沒過先重跑；同一題一直沒過才是真的壞了。
+// ⚠️ 額度：跑一次全部約用 60–100 次 Gemini。請用另一把「測試專用」的 Gemini 金鑰（KEYS 檔和 wrangler dev 都用它），
+//    不要用正式站那把；跑完把 wrangler dev 關掉（測試旅程留在本機，開著會繼續在背景跑排程）。
 
 import fs from "node:fs";
 
@@ -39,9 +41,11 @@ async function trip({ country = "日本", city = "東京", lat = 35.7331, lon = 
   const ws = new WebSocket(`${BASE.replace("http", "ws")}/ws`, { headers: { cookie: res.headers.get("set-cookie").split(";")[0] } });
   const listeners = new Set();
   let state = null;
+  const messages = [];
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.state) state = m.state;
+    if (m.type === "message") messages.push(m.message);
     for (const f of listeners) f(m);
   };
   const wait = (pred, ms = 300_000) =>
@@ -61,6 +65,8 @@ async function trip({ country = "日本", city = "東京", lat = 35.7331, lon = 
     return r;
   };
   await act({ action: "activate", profile: {} });
+  // 測試旅程不要在背景自己發早報、寫日記、查警報（會一直用掉 AI 額度）
+  await act({ action: "settings", autoBrief: false, autoDiary: false, autoAlerts: false });
   const fresh = async () => {
     const r = wait((m) => m.type === "state");
     ws.send(JSON.stringify({ type: "get_state" }));
@@ -76,7 +82,7 @@ async function trip({ country = "日本", city = "東京", lat = 35.7331, lon = 
     listeners.delete(f);
     return { text: m.text, tools, drafts: m.drafts ?? [], provider: m.meta?.provider };
   };
-  return { ask, act, state: fresh, close: () => ws.close() };
+  return { ask, act, state: fresh, messages, close: () => ws.close() };
 }
 
 const has = (list, names) => names.some((n) => list.includes(n));
@@ -179,7 +185,8 @@ const SCENARIOS = [
       await t.ask("從池袋去上野要搭哪條線？");
       const r = await t.ask("你剛剛講錯了啦，害我們走錯路");
       const n = (r.text.match(/抱歉|對不起|不好意思|很遺憾/g) ?? []).length;
-      return [n <= 1 && !/保證|一定會記住|不會再犯/.test(r.text), `道歉 ${n} 次｜${r.text.slice(0, 80)}`];
+      // 一句話裡「很抱歉…對不起」算一次；連道好幾次或一直保證才算沒過
+      return [n <= 2 && !/保證|一定會記住|不會再犯/.test(r.text), `道歉 ${n} 次｜${r.text.slice(0, 80)}`];
     },
   },
   {
@@ -204,13 +211,66 @@ const SCENARIOS = [
       return [!bad.length, `連結 ${urls.length} 個${bad.length ? `，打不開：${bad.join("、")}` : ""}｜工具：${r.tools.join("、") || "無"}`];
     },
   },
+  {
+    name: "等一下會不會下雨",
+    async run(t) {
+      const r = await t.ask("等一下會不會下雨？");
+      return [r.tools.includes("get_weather") && /雨/.test(r.text), `工具：${r.tools.join("、") || "無"}｜${r.text.slice(0, 60)}`];
+    },
+  },
+  {
+    name: "找附近的警察局",
+    async run(t) {
+      const r = await t.ask("池袋站附近的警察局在哪？");
+      return [r.tools.includes("find_nearby") && /警|交番|police/i.test(r.text), `工具：${r.tools.join("、") || "無"}｜${r.text.slice(0, 60)}`];
+    },
+  },
+  {
+    name: "現在還有開的店",
+    async run(t) {
+      const r = await t.ask("池袋站附近現在還有開的咖啡店嗎？");
+      return [has(r.tools, ["find_nearby", "web_search"]), `工具：${r.tools.join("、") || "無"}｜${r.text.slice(0, 80)}`];
+    },
+  },
+  {
+    name: "外交部旅遊警示",
+    async run(t) {
+      const r = await t.ask("外交部對日本有發布旅遊警示嗎？");
+      return [/灰色|第一級|警示/.test(r.text) && has(r.tools, ["disaster_alerts", "web_search"]), `工具：${r.tools.join("、") || "無"}｜${r.text.slice(0, 80)}`];
+    },
+  },
+  {
+    name: "護照錢包不見了：給求助步驟",
+    async run(t) {
+      const r = await t.ask("🆘 我的護照或錢包不見了，請幫忙！");
+      const ok = /警察|派出所|交番/.test(r.text) && /代表處|398-2629|外交部/.test(r.text);
+      return [ok, `工具：${r.tools.join("、") || "無"}｜${r.text.slice(0, 100)}`];
+    },
+  },
+  {
+    name: "前一晚檢查明天的行程",
+    async run(t) {
+      const today = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Tokyo" }).format(new Date());
+      const tomorrow = new Date(Date.parse(today + "T00:00:00Z") + 86400_000).toISOString().slice(0, 10);
+      await t.act({ action: "update_itinerary", date: tomorrow, title: "上野動物園、阿美橫町", detail: "早上上野動物園，下午逛阿美橫町" });
+      const before = t.messages.length;
+      await t.act({ action: "evening_now" });
+      const m = t.messages.slice(before).find((x) => (typeof x.meta === "string" ? JSON.parse(x.meta) : x.meta ?? {}).kind === "evening" || /明天/.test(x.text));
+      return [!!m, m ? m.text.replace(/\s+/g, " ").slice(0, 120) : "沒有發出明天的檢查"];
+    },
+  },
 ];
 
 const picked = SCENARIOS.filter((s) => !filters.length || filters.some((f) => s.name.includes(f)));
 console.log(`跑 ${picked.length} 個情境（${BASE}）\n`);
 let pass = 0;
-const t = await trip();
-for (const s of picked) {
+// 同一個聊天室對話越積越多會影響後面的回答：每 7 題換一個新的測試旅程
+let t = null;
+for (const [i, s] of picked.entries()) {
+  if (i % 7 === 0) {
+    t?.close();
+    t = await trip();
+  }
   const t0 = Date.now();
   try {
     const [ok, note] = await s.run(t);
@@ -220,7 +280,7 @@ for (const s of picked) {
     console.log(`❌ ${s.name}：${e.message}`);
   }
 }
-t.close();
+t?.close();
 console.log(`\n${pass}/${picked.length} 通過`);
 clearInterval(keep);
 process.exit(pass === picked.length ? 0 : 1);

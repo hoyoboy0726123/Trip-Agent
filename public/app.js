@@ -2217,6 +2217,11 @@ function renderSettingsPanel(st, b) {
       <div>回覆方式：<b>${s.replyMode === "mention" ? "只回覆 @AI 的訊息" : "每則訊息都回覆"}</b></div>
       <div>網路搜尋：${s.tavily ? "✅ Tavily" : "⚠️ 未設定"}｜自己的 Gemini：${s.gemini ? "✅" : "未設定"}</div>
     </div>
+    <div class="card"><h3>🔔 手機通知</h3>
+      <div class="small muted" id="push-state">檢查中…</div>
+      <div class="row" style="gap:6px;margin-top:8px;flex-wrap:wrap"><button class="btn" id="push-on">開啟這支手機的通知</button><button class="btn small" id="push-test">傳一則測試</button><button class="btn small" id="push-off">關閉</button></div>
+      <div class="small muted" style="margin-top:6px">提醒時間到、地震颱風警報、家人按求助、前一晚的明天行程提醒會通知你（App 沒開著也收得到）。</div>
+    </div>
     ${S.me.admin ? `
     <div class="card"><h3>管理員設定</h3>
       <div class="stack">
@@ -2229,11 +2234,12 @@ function renderSettingsPanel(st, b) {
         <label><input type="radio" name="mode" value="mention" ${s.replyMode === "mention" ? "checked" : ""} />只回 @AI</label>
       </div>
       <div class="small muted" style="margin-top:10px">自動通知（旅程期間，當地時間）</div>
-      <label class="row between small"><span>☀️ 每天 07:00 早報</span><input type="checkbox" data-auto="autoBrief" ${s.autoBrief ? "checked" : ""} /></label>
+      <label class="row between small"><span>☀️ 每天 07:00 早報、20:00 檢查明天的行程</span><input type="checkbox" data-auto="autoBrief" ${s.autoBrief ? "checked" : ""} /></label>
       <label class="row between small"><span>📔 每天 22:00 旅遊日記</span><input type="checkbox" data-auto="autoDiary" ${s.autoDiary ? "checked" : ""} /></label>
       <label class="row between small"><span>🆘 地震、颱風、強風豪雨通知</span><input type="checkbox" data-auto="autoAlerts" ${s.autoAlerts ? "checked" : ""} /></label>
       <div class="row" style="gap:6px;margin-top:6px">
         <button class="btn small" id="brief-now">現在發一次早報</button>
+        <button class="btn small" id="evening-now">檢查明天的行程</button>
         <button class="btn small" id="diary-now">現在寫今天的日記</button>
       </div>
     </div>
@@ -2266,6 +2272,17 @@ function renderSettingsPanel(st, b) {
     await fetch("/api/logout", { method: "POST" });
     location.reload();
   });
+  const refreshPush = () => pushStatusText().then((t) => { const el = $("#push-state", b); if (el) el.textContent = t; });
+  refreshPush();
+  $("#push-on", b).addEventListener("click", async () => {
+    await enablePush();
+    setTimeout(refreshPush, 800);
+  });
+  $("#push-off", b).addEventListener("click", async () => {
+    await disablePush();
+    setTimeout(refreshPush, 800);
+  });
+  $("#push-test", b).addEventListener("click", () => action({ action: "push_test" }));
   $("#copy-link", b).addEventListener("click", async (e) => {
     try {
       await navigator.clipboard.writeText(link);
@@ -2285,6 +2302,11 @@ function renderSettingsPanel(st, b) {
   $("#brief-now", b)?.addEventListener("click", (e) => {
     e.target.textContent = "產生中…";
     action({ action: "brief_now" });
+    els.panel.close();
+  });
+  $("#evening-now", b)?.addEventListener("click", (e) => {
+    e.target.textContent = "檢查中…";
+    action({ action: "evening_now" });
     els.panel.close();
   });
   $("#diary-now", b)?.addEventListener("click", (e) => {
@@ -3013,6 +3035,7 @@ function renderMapPanel(st, b) {
       <button class="btn" id="map-share" style="flex:1">📍 更新我的位置</button>
       <button class="btn danger sos-btn" id="map-sos" style="flex:1">🆘 我走散了</button>
     </div>
+    <button class="btn" id="map-lost" style="width:100%;margin-top:8px">🛂 護照、錢包或手機不見了</button>
     <p class="small muted">打開這一頁時，每個家人的手機會自動回報一次位置：開著 App 的人幾秒內就會更新，沒開的人下次打開 App 時補報。</p>
     <p class="small muted">按「🆘 我走散了」會把你的位置傳到群組，全家手機都會收到提醒，AI 也會幫忙安排集合地點。</p>`;
   bindBack(b);
@@ -3038,6 +3061,14 @@ function renderMapPanel(st, b) {
       loc = await getPosition();
     } catch {}
     wsSend({ type: "send", text: "🆘 我跟大家走散了，請幫忙！", location: loc });
+    els.panel.close();
+  });
+  $("#map-lost").addEventListener("click", async () => {
+    let loc = null;
+    try {
+      loc = await getPosition();
+    } catch {}
+    wsSend({ type: "send", text: "🆘 我的護照或錢包不見了，請幫忙！", location: loc });
     els.panel.close();
   });
   loadLeaflet()
@@ -3096,7 +3127,7 @@ function flashNote(text) {
 function showSos(msg) {
   navigator.vibrate?.([300, 150, 300, 150, 600]);
   const banner = $("#sos-banner");
-  banner.innerHTML = `🆘 <b>${escapeHtml(msg.author)}</b> 走散了！點這裡看位置`;
+  banner.innerHTML = `🆘 <b>${escapeHtml(msg.author)}</b> ${/走散/.test(msg.text) ? "走散了！點這裡看位置" : "需要幫忙！點這裡看位置"}`;
   banner.hidden = false;
   banner.onclick = () => {
     banner.hidden = true;
